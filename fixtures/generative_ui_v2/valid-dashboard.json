@@ -1,0 +1,42 @@
+{
+  "schema": "loopdy.generative_ui",
+  "version": 2,
+  "component": "dashboard",
+  "title": "Fixture dashboard",
+  "data": {
+    "description": "One fixture metric and one bounded chart.",
+    "metrics": [
+      {
+        "id": "requests",
+        "label": "Requests",
+        "value_text": "120",
+        "status": "positive",
+        "status_label": "On target"
+      }
+    ],
+    "charts": [
+      {
+        "chart_type": "bar",
+        "description": "Requests by day.",
+        "x_axis": { "label": "Day", "kind": "category" },
+        "y_axis": { "label": "Requests" },
+        "series": [
+          {
+            "id": "requests",
+            "label": "Requests",
+            "semantic": "positive",
+            "status_label": "On target",
+            "points": [{ "x": "Monday", "y": 120 }]
+          }
+        ]
+      }
+    ]
+  },
+  "provenance": {
+    "source_name": "Fixture Analytics",
+    "source_timestamp": "2026-08-21T23:55:00Z",
+    "retrieved_at": "2026-08-21T23:56:00Z",
+    "cache_status": "cached",
+    "age_seconds": 300
+  }
+}

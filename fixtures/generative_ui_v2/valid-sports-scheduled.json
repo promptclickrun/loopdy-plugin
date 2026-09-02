@@ -1,0 +1,22 @@
+{
+  "schema": "loopdy.generative_ui",
+  "version": 2,
+  "component": "sports_game",
+  "title": "Fixture game",
+  "data": {
+    "league": "nfl",
+    "status": "scheduled",
+    "start_at": "2026-08-23T00:00:00Z",
+    "teams": [
+      { "id": "home", "name": "Home Team", "abbreviation": "HOM", "home": true, "score": null },
+      { "id": "away", "name": "Away Team", "abbreviation": "AWY", "home": false, "score": null }
+    ]
+  },
+  "provenance": {
+    "source_name": "Fixture Sports Service",
+    "source_timestamp": "2026-08-21T23:55:00Z",
+    "retrieved_at": "2026-08-21T23:56:00Z",
+    "cache_status": "cached",
+    "age_seconds": 300
+  }
+}

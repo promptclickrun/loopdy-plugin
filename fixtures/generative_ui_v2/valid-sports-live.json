@@ -1,0 +1,25 @@
+{
+  "schema": "loopdy.generative_ui",
+  "version": 2,
+  "component": "sports_game",
+  "title": "Fixture live game",
+  "data": {
+    "league": "nba",
+    "status": "live",
+    "start_at": "2026-08-21T23:00:00Z",
+    "period_label": "Q3",
+    "clock": "04:12",
+    "teams": [
+      { "id": "away", "name": "Away Team", "abbreviation": "AWY", "home": false, "score": 71 },
+      { "id": "home", "name": "Home Team", "abbreviation": "HOM", "home": true, "score": 74 }
+    ],
+    "highlights": ["Home Team leads by three"]
+  },
+  "provenance": {
+    "source_name": "Fixture Sports Service",
+    "source_timestamp": "2026-08-21T23:55:00Z",
+    "retrieved_at": "2026-08-21T23:56:00Z",
+    "cache_status": "live",
+    "age_seconds": 300
+  }
+}

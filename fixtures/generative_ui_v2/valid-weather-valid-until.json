@@ -1,0 +1,39 @@
+{
+  "schema": "loopdy.generative_ui",
+  "version": 2,
+  "component": "weather_forecast",
+  "title": "Kansas City forecast",
+  "data": {
+    "location": "Kansas City, MO",
+    "timezone": "America/Chicago",
+    "units": "us",
+    "current": {
+      "condition_code": "clear",
+      "condition_label": "Clear",
+      "temperature": 79,
+      "humidity_percent": 43,
+      "wind_speed": 8,
+      "wind_direction": "SW"
+    },
+    "periods": [
+      {
+        "id": "tonight",
+        "label": "Tonight",
+        "start_at": "2026-08-22T00:00:00Z",
+        "end_at": "2026-08-22T12:00:00Z",
+        "condition_code": "clear",
+        "condition_label": "Clear",
+        "low": 66,
+        "precipitation_percent": 5
+      }
+    ]
+  },
+  "provenance": {
+    "source_name": "Fixture Weather Service",
+    "source_timestamp": "2026-08-21T23:55:00Z",
+    "retrieved_at": "2026-08-21T23:56:00Z",
+    "valid_until": "2026-08-22T01:00:00Z",
+    "cache_status": "live",
+    "age_seconds": 300
+  }
+}

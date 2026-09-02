@@ -1,0 +1,28 @@
+{
+  "schema": "loopdy.generative_ui",
+  "version": 2,
+  "component": "stock_quote",
+  "title": "Fixture Corp",
+  "data": {
+    "symbol": "FIX",
+    "exchange": "NYSE",
+    "company_name": "Fixture Corp",
+    "currency": "USD",
+    "market_status": "open",
+    "price": 125.5,
+    "change": 1.25,
+    "change_percent": 1.006,
+    "previous_close": 124.25,
+    "session_open": 124.5,
+    "day_high": 126,
+    "day_low": 123.75,
+    "volume": 1200000
+  },
+  "provenance": {
+    "source_name": "Fixture Market Service",
+    "source_timestamp": "2026-08-21T23:55:00Z",
+    "retrieved_at": "2026-08-21T23:56:00Z",
+    "cache_status": "live",
+    "age_seconds": 300
+  }
+}

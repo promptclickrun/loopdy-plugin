@@ -1,0 +1,81 @@
+{
+  "fixed_created_at": "2026-08-22T00:00:00Z",
+  "fixtures": [
+    {
+      "accepted": true,
+      "code": "ok",
+      "component": "weather_forecast",
+      "file": "valid-weather.json"
+    },
+    {
+      "accepted": true,
+      "code": "ok",
+      "component": "weather_forecast",
+      "file": "valid-weather-valid-until.json"
+    },
+    {
+      "accepted": true,
+      "code": "ok",
+      "component": "sports_game",
+      "file": "valid-sports-scheduled.json"
+    },
+    {
+      "accepted": true,
+      "code": "ok",
+      "component": "sports_game",
+      "file": "valid-sports-live.json"
+    },
+    { "accepted": true, "code": "ok", "component": "stock_quote", "file": "valid-stock.json" },
+    { "accepted": true, "code": "ok", "component": "chart", "file": "valid-chart.json" },
+    { "accepted": true, "code": "ok", "component": "dashboard", "file": "valid-dashboard.json" },
+    { "accepted": true, "code": "ok", "component": "form", "file": "valid-form.json" },
+    {
+      "accepted": false,
+      "code": "unsupported_version",
+      "component": "stock_quote",
+      "file": "invalid-unsupported-version.json"
+    },
+    {
+      "accepted": false,
+      "code": "forbidden_field",
+      "component": "stock_quote",
+      "file": "invalid-forbidden-key.json"
+    },
+    {
+      "accepted": false,
+      "code": "invalid_order",
+      "component": "weather_forecast",
+      "file": "invalid-weather-order.json"
+    },
+    {
+      "accepted": false,
+      "code": "invalid_value",
+      "component": "sports_game",
+      "file": "invalid-sports-home.json"
+    },
+    {
+      "accepted": false,
+      "code": "invalid_value",
+      "component": "stock_quote",
+      "file": "invalid-stock-symbol.json"
+    },
+    {
+      "accepted": false,
+      "code": "limit_exceeded",
+      "component": "chart",
+      "file": "invalid-chart-limit.json"
+    },
+    {
+      "accepted": false,
+      "code": "limit_exceeded",
+      "component": "dashboard",
+      "file": "invalid-dashboard-limit.json"
+    },
+    {
+      "accepted": false,
+      "code": "invalid_value",
+      "component": "form",
+      "file": "invalid-form-secret-field.json"
+    }
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "schema": "loopdy.generative_ui",
+  "version": 2,
+  "component": "chart",
+  "title": "Fixture trend",
+  "data": {
+    "chart_type": "line",
+    "description": "Fixture values increase across two days.",
+    "x_axis": { "label": "Day", "kind": "time" },
+    "y_axis": { "label": "Value", "unit": "points", "min": 0, "max": 20 },
+    "series": [
+      {
+        "id": "fixture",
+        "label": "Fixture",
+        "semantic": "primary",
+        "status_label": "Increasing",
+        "points": [
+          { "x": "2026-08-20T00:00:00Z", "y": 10 },
+          { "x": "2026-08-21T00:00:00Z", "y": 12 }
+        ]
+      }
+    ]
+  },
+  "provenance": {
+    "source_name": "Fixture Analytics",
+    "source_timestamp": "2026-08-21T23:55:00Z",
+    "retrieved_at": "2026-08-21T23:56:00Z",
+    "cache_status": "historical",
+    "age_seconds": 300
+  }
+}

@@ -1,0 +1,126 @@
+{
+  "component": "dashboard",
+  "data": {
+    "charts": [
+      {
+        "chart_type": "bar",
+        "description": "Requests by day.",
+        "series": [
+          {
+            "id": "requests",
+            "label": "Requests",
+            "points": [{ "x": "Monday", "y": 120 }],
+            "semantic": "positive",
+            "status_label": "On target"
+          }
+        ],
+        "x_axis": { "kind": "category", "label": "Day" },
+        "y_axis": { "label": "Requests" }
+      }
+    ],
+    "description": "One fixture metric and one bounded chart.",
+    "metrics": [
+      {
+        "id": "metric-0",
+        "label": "Metric 0",
+        "status": "positive",
+        "status_label": "On target",
+        "value_text": "120"
+      },
+      {
+        "id": "metric-1",
+        "label": "Metric 1",
+        "status": "positive",
+        "status_label": "On target",
+        "value_text": "120"
+      },
+      {
+        "id": "metric-2",
+        "label": "Metric 2",
+        "status": "positive",
+        "status_label": "On target",
+        "value_text": "120"
+      },
+      {
+        "id": "metric-3",
+        "label": "Metric 3",
+        "status": "positive",
+        "status_label": "On target",
+        "value_text": "120"
+      },
+      {
+        "id": "metric-4",
+        "label": "Metric 4",
+        "status": "positive",
+        "status_label": "On target",
+        "value_text": "120"
+      },
+      {
+        "id": "metric-5",
+        "label": "Metric 5",
+        "status": "positive",
+        "status_label": "On target",
+        "value_text": "120"
+      },
+      {
+        "id": "metric-6",
+        "label": "Metric 6",
+        "status": "positive",
+        "status_label": "On target",
+        "value_text": "120"
+      },
+      {
+        "id": "metric-7",
+        "label": "Metric 7",
+        "status": "positive",
+        "status_label": "On target",
+        "value_text": "120"
+      },
+      {
+        "id": "metric-8",
+        "label": "Metric 8",
+        "status": "positive",
+        "status_label": "On target",
+        "value_text": "120"
+      },
+      {
+        "id": "metric-9",
+        "label": "Metric 9",
+        "status": "positive",
+        "status_label": "On target",
+        "value_text": "120"
+      },
+      {
+        "id": "metric-10",
+        "label": "Metric 10",
+        "status": "positive",
+        "status_label": "On target",
+        "value_text": "120"
+      },
+      {
+        "id": "metric-11",
+        "label": "Metric 11",
+        "status": "positive",
+        "status_label": "On target",
+        "value_text": "120"
+      },
+      {
+        "id": "metric-12",
+        "label": "Metric 12",
+        "status": "positive",
+        "status_label": "On target",
+        "value_text": "120"
+      }
+    ]
+  },
+  "provenance": {
+    "age_seconds": 300,
+    "cache_status": "cached",
+    "retrieved_at": "2026-08-21T23:56:00Z",
+    "source_name": "Fixture Analytics",
+    "source_timestamp": "2026-08-21T23:55:00Z"
+  },
+  "schema": "loopdy.generative_ui",
+  "title": "Fixture dashboard",
+  "version": 2
+}

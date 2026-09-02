@@ -1,0 +1,53 @@
+manifest_version: 1
+name: loopdy
+label: Loopdy
+kind: platform
+version: "2.2.11"
+license: Apache-2.0
+description: >
+  Native Hermes platform for encrypted Loopdy Link chat and workspace controls,
+  proactive notifications, approvals, verified device identity, and native Generative UI renderers.
+  Delivers proactive notifications through Expo, Apple, or an encrypted relay while keeping
+  authoritative event details on the authenticated Hermes host.
+author: Loopdy contributors
+optional_env:
+  - LOOPDY_HOME_TARGET
+  - LOOPDY_WORKSPACE_GIT_CONFIG
+  - LOOPDY_APNS_TEAM_ID
+  - LOOPDY_APNS_KEY_ID
+  - LOOPDY_APNS_TOPIC
+  - LOOPDY_APNS_ENVIRONMENT
+  - LOOPDY_APNS_KEY_PATH
+  - LOOPDY_LINK_BASE_URL
+  - LOOPDY_LINK_DEVICE_ID
+  - LOOPDY_LINK_AUTHORIZATION_EPOCH
+  - LOOPDY_LINK_SIGNING_PRIVATE_KEY
+  - LOOPDY_LINK_AGREEMENT_PRIVATE_KEY
+  - LOOPDY_LINK_ACCOUNT_KEY
+provides_hooks:
+  - pre_llm_call
+  - post_llm_call
+  - pre_tool_call
+  - post_tool_call
+  - on_session_end
+  - subagent_start
+  - subagent_stop
+  - kanban_task_claimed
+  - kanban_task_completed
+  - kanban_task_blocked
+provides_tools:
+  - loopdy_render_summary
+  - loopdy_render_metrics
+  - loopdy_render_list
+  - loopdy_render_timeline
+  - loopdy_render_weather_forecast
+  - loopdy_render_sports_game
+  - loopdy_render_stock_quote
+  - loopdy_render_chart
+  - loopdy_render_dashboard
+  - loopdy_render_form
+  - loopdy_await_form_response
+platforms:
+  - linux
+  - macos
+  - windows

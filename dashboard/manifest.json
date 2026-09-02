@@ -1,0 +1,14 @@
+{
+  "name": "loopdy",
+  "label": "Loopdy",
+  "description": "Authenticated local push providers, device settings, event inbox, and approvals for Loopdy.",
+  "icon": "MessageSquare",
+  "version": "2.1.0",
+  "tab": {
+    "path": "/loopdy",
+    "position": "end",
+    "hidden": true
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}

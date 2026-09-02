@@ -1,0 +1,91 @@
+{
+  "component": "chart",
+  "data": {
+    "chart_type": "line",
+    "description": "Fixture values increase across two days.",
+    "series": [
+      {
+        "id": "series-0",
+        "label": "Series 0",
+        "points": [
+          { "x": "2026-08-20T00:00:00Z", "y": 10 },
+          { "x": "2026-08-21T00:00:00Z", "y": 12 }
+        ],
+        "semantic": "primary",
+        "status_label": "Increasing"
+      },
+      {
+        "id": "series-1",
+        "label": "Series 1",
+        "points": [
+          { "x": "2026-08-20T00:00:00Z", "y": 10 },
+          { "x": "2026-08-21T00:00:00Z", "y": 12 }
+        ],
+        "semantic": "primary",
+        "status_label": "Increasing"
+      },
+      {
+        "id": "series-2",
+        "label": "Series 2",
+        "points": [
+          { "x": "2026-08-20T00:00:00Z", "y": 10 },
+          { "x": "2026-08-21T00:00:00Z", "y": 12 }
+        ],
+        "semantic": "primary",
+        "status_label": "Increasing"
+      },
+      {
+        "id": "series-3",
+        "label": "Series 3",
+        "points": [
+          { "x": "2026-08-20T00:00:00Z", "y": 10 },
+          { "x": "2026-08-21T00:00:00Z", "y": 12 }
+        ],
+        "semantic": "primary",
+        "status_label": "Increasing"
+      },
+      {
+        "id": "series-4",
+        "label": "Series 4",
+        "points": [
+          { "x": "2026-08-20T00:00:00Z", "y": 10 },
+          { "x": "2026-08-21T00:00:00Z", "y": 12 }
+        ],
+        "semantic": "primary",
+        "status_label": "Increasing"
+      },
+      {
+        "id": "series-5",
+        "label": "Series 5",
+        "points": [
+          { "x": "2026-08-20T00:00:00Z", "y": 10 },
+          { "x": "2026-08-21T00:00:00Z", "y": 12 }
+        ],
+        "semantic": "primary",
+        "status_label": "Increasing"
+      },
+      {
+        "id": "series-6",
+        "label": "Series 6",
+        "points": [
+          { "x": "2026-08-20T00:00:00Z", "y": 10 },
+          { "x": "2026-08-21T00:00:00Z", "y": 12 }
+        ],
+        "semantic": "primary",
+        "status_label": "Increasing"
+      }
+    ],
+    "x_axis": { "kind": "time", "label": "Day" },
+    "y_axis": { "label": "Value", "max": 20, "min": 0, "unit": "points" }
+  },
+  "provenance": {
+    "age_seconds": 300,
+    "cache_status": "historical",
+    "retrieved_at": "2026-08-21T23:56:00Z",
+    "source_name": "Fixture Analytics",
+    "source_timestamp": "2026-08-21T23:55:00Z"
+  },
+  "schema": "loopdy.generative_ui",
+  "title": "Fixture trend",
+  "version": 2
+}

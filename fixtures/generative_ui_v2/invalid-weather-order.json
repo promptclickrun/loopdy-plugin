@@ -1,0 +1,48 @@
+{
+  "component": "weather_forecast",
+  "data": {
+    "current": {
+      "condition_code": "clear",
+      "condition_label": "Clear",
+      "humidity_percent": 43,
+      "temperature": 79,
+      "wind_direction": "SW",
+      "wind_speed": 8
+    },
+    "location": "Kansas City, MO",
+    "periods": [
+      {
+        "condition_code": "clear",
+        "condition_label": "Clear",
+        "end_at": "2026-08-22T12:00:00Z",
+        "id": "tonight",
+        "label": "Tonight",
+        "low": 66,
+        "precipitation_percent": 5,
+        "start_at": "2026-08-22T00:00:00Z"
+      },
+      {
+        "condition_code": "clear",
+        "condition_label": "Clear",
+        "end_at": "2026-08-21T18:00:00Z",
+        "id": "earlier",
+        "label": "Tonight",
+        "low": 66,
+        "precipitation_percent": 5,
+        "start_at": "2026-08-21T12:00:00Z"
+      }
+    ],
+    "timezone": "America/Chicago",
+    "units": "us"
+  },
+  "provenance": {
+    "age_seconds": 300,
+    "cache_status": "live",
+    "retrieved_at": "2026-08-21T23:56:00Z",
+    "source_name": "Fixture Weather Service",
+    "source_timestamp": "2026-08-21T23:55:00Z"
+  },
+  "schema": "loopdy.generative_ui",
+  "title": "Kansas City forecast",
+  "version": 2
+}

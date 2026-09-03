@@ -1,0 +1,60 @@
+{
+  "schema": "loopdy.card",
+  "version": 1,
+  "title": "Bitcoin",
+  "spoken_summary": "Bitcoin's latest public spot price is shown in US dollars.",
+  "importance": "important",
+  "data_sources": [
+    {
+      "id": "coinbase",
+      "request": {
+        "method": "GET",
+        "url": "https://api.coinbase.com/v2/prices/BTC-USD/spot"
+      },
+      "response": { "format": "json", "root": "/data" },
+      "refresh": {
+        "minimum_interval_seconds": 60,
+        "stale_after_seconds": 180,
+        "expires_at": "2026-09-03T12:00:00Z"
+      }
+    }
+  ],
+  "root": "card",
+  "elements": {
+    "card": {
+      "type": "card",
+      "props": { "title": "Bitcoin", "subtitle": "BTC-USD spot" },
+      "children": ["price_row"]
+    },
+    "price_row": {
+      "type": "hstack",
+      "props": { "spacing": "medium", "alignment": "center" },
+      "children": ["bitcoin_icon", "price", "market"]
+    },
+    "bitcoin_icon": {
+      "type": "image",
+      "props": {
+        "name": "bitcoinsign.circle.fill",
+        "accessibility_label": "Bitcoin",
+        "semantic": "accent",
+        "scale": "large"
+      },
+      "children": []
+    },
+    "price": {
+      "type": "metric",
+      "props": {
+        "label": "Spot price",
+        "value": { "source": "coinbase", "pointer": "/amount" },
+        "format": { "style": "currency", "currency": "USD", "maximum_fraction_digits": 2 },
+        "semantic": "primary"
+      },
+      "children": []
+    },
+    "market": {
+      "type": "badge",
+      "props": { "value": { "literal": "BTC · USD" }, "semantic": "neutral" },
+      "children": []
+    }
+  }
+}

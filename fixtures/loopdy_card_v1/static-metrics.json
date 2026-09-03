@@ -1,0 +1,45 @@
+{
+  "schema": "loopdy.card",
+  "version": 1,
+  "title": "Build health",
+  "spoken_summary": "All twelve checks passed and the build is ready for review.",
+  "data_sources": [],
+  "root": "card",
+  "elements": {
+    "card": {
+      "type": "card",
+      "props": { "title": "Build health", "subtitle": "Local verification" },
+      "children": ["metrics", "status"]
+    },
+    "metrics": {
+      "type": "hstack",
+      "props": { "spacing": "medium", "alignment": "leading" },
+      "children": ["passed", "failed"]
+    },
+    "passed": {
+      "type": "metric",
+      "props": {
+        "label": "Passed",
+        "value": { "literal": 12 },
+        "format": { "style": "integer" },
+        "semantic": "positive"
+      },
+      "children": []
+    },
+    "failed": {
+      "type": "metric",
+      "props": {
+        "label": "Failed",
+        "value": { "literal": 0 },
+        "format": { "style": "integer" },
+        "semantic": "neutral"
+      },
+      "children": []
+    },
+    "status": {
+      "type": "badge",
+      "props": { "value": { "literal": "Ready" }, "semantic": "positive" },
+      "children": []
+    }
+  }
+}

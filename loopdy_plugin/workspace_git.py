@@ -619,7 +619,11 @@ class WorkspaceGitService:
 
     def _repository_identity(self, root: Path) -> str:
         top = _run_git(root, self._timeout, self._max_output_bytes, "rev-parse", "--show-toplevel").decode().strip()
-        if Path(top).resolve(strict=True) != root:
+        try:
+            is_root = Path(top).samefile(root)
+        except OSError:
+            is_root = False
+        if not is_root:
             raise ValueError("Configured root must be the git worktree root")
         common = _run_git(root, self._timeout, self._max_output_bytes, "rev-parse", "--git-common-dir").decode().strip()
         common_path = (root / common).resolve(strict=True) if not Path(common).is_absolute() else Path(common).resolve(strict=True)

@@ -1,6 +1,8 @@
 # Loopdy protocol
 
-Plugin protocol version 2 keeps Hermes authoritative for sessions, policy, approvals, event details, and the local notification ledger. Plugin release `2.2.11` restores the selected Project into Hermes' task-local runtime CWD after the gateway binds session variables, so agent prompt construction and explicit terminal workdirs stay anchored to the session workspace without process-global state. Release 2.2.10 aligned Project selection with Hermes' native session lifecycle: new chats seed the selected CWD before first-turn creation without persisting an empty session, while existing chats persist the moved CWD, update the live tool runtime immediately, and evict cached agent context for the next turn. It also projects Hermes native image, document, video, and voice callbacks through the authenticated attachment resolver, including media delivered after streamed text. Release 2.2.6 projects request-bound Clarify attention through the encrypted Link notification path while keeping the opaque Link chat coordinate separate from Hermes' pending-session key, so the active chat, Home card, notification, and official Clarify resolver address the same request without weakening either coordinate boundary. Replayed events retry failed Link delivery but do not duplicate an event already recorded as sent. Release 2.2.5 made inbound attachment storage self-healing and retained verified media until Hermes' background processing lifecycle completed, preventing one missing cache directory or prematurely deleted image from stalling the shared Link transport. Release 2.2.4 added optional authenticated mid-session `steer`, `queue`, and `interrupt` behavior on the existing Link user-message envelope, plus fail-soft display sanitization for control scalars inside otherwise valid history-row content. Release 2.2.3 added bounded, cursor-like paging to session history so large transcripts and saved Generative UI payloads can be restored without exceeding the encrypted workspace-response limit. Release 2.2.2 derived Generative UI provenance age from signed timestamp facts at every renderer boundary so normal tool or transport delay cannot invalidate an otherwise truthful card. Release 2.2.1 added explicit correlated picker-open failures and complete compacted-session hydration to the fixed encrypted workspace-control family introduced in 2.2.0. The optional authenticated HTTPS notification-delivery path was introduced in 2.1. Link and notification relay wire contracts are independently versioned as version `1`. Neither service becomes a session, approval, or history authority.
+Plugin release `2.2.14` compares Project roots by filesystem identity so macOS case variants identify the same registered repository.
+
+Plugin protocol version 2 keeps Hermes authoritative for sessions, policy, approvals, event details, and the local notification ledger. Plugin release `2.2.13` reconciles persisted session activity with the live Loopdy owner and gives concurrent picker requests exact request identity, including correlated failure when Hermes returns without a native picker. Release 2.2.12 restored a persisted Project into both Hermes' task-local agent context and terminal session registry after gateway startup, and deterministically projected sessions newest-first. Release 2.2.11 restored the selected Project into Hermes' task-local runtime CWD after the gateway binds session variables, so agent prompt construction and explicit terminal workdirs stay anchored to the session workspace without process-global state. Release 2.2.10 aligned Project selection with Hermes' native session lifecycle: new chats seed the selected CWD before first-turn creation without persisting an empty session, while existing chats persist the moved CWD, update the live tool runtime immediately, and evict cached agent context for the next turn. It also projects Hermes native image, document, video, and voice callbacks through the authenticated attachment resolver, including media delivered after streamed text. Release 2.2.6 projects request-bound Clarify attention through the encrypted Link notification path while keeping the opaque Link chat coordinate separate from Hermes' pending-session key, so the active chat, Home card, notification, and official Clarify resolver address the same request without weakening either coordinate boundary. Replayed events retry failed Link delivery but do not duplicate an event already recorded as sent. Release 2.2.5 made inbound attachment storage self-healing and retained verified media until Hermes' background processing lifecycle completed, preventing one missing cache directory or prematurely deleted image from stalling the shared Link transport. Release 2.2.4 added optional authenticated mid-session `steer`, `queue`, and `interrupt` behavior on the existing Link user-message envelope, plus fail-soft display sanitization for control scalars inside otherwise valid history-row content. Release 2.2.3 added bounded, cursor-like paging to session history so large transcripts and saved Generative UI payloads can be restored without exceeding the encrypted workspace-response limit. Release 2.2.2 derived Generative UI provenance age from signed timestamp facts at every renderer boundary so normal tool or transport delay cannot invalidate an otherwise truthful card. Release 2.2.1 added explicit correlated picker-open failures and complete compacted-session hydration to the fixed encrypted workspace-control family introduced in 2.2.0. The optional authenticated HTTPS notification-delivery path was introduced in 2.1. Link and notification relay wire contracts are independently versioned as version `1`. Neither service becomes a session, approval, or history authority.
 
 ## Loopdy Link
 
@@ -39,6 +41,73 @@ Scheduled-task delivery stays on Hermes' cron contract. `scheduled_tasks.deliver
 Picker opens use the same request-bound control path. If Hermes cannot construct a requested picker, the plugin returns a failed `picker.result` containing the exact picker, session, and kind coordinates so the client can end its loading state immediately. Session-history requests explicitly include Hermes compacted rows and prefer non-empty `display_content` when it is a string, otherwise falling back to the persisted `content`; tool rows remain excluded from the chat transcript projection. The original `{storedId, agentId}` `sessions.history` payload remains valid, while clients may add a nonnegative `offset` to page backward from the latest message. Each returned page stays chronological and below the Link response budget; `nextOffset` is present only when an older page may remain.
 
 Authenticated `activity.event` tool rows may include the bounded canonical `toolName` coordinate plus `arguments` and `result` text so a paired client can label the folded row and disclose exact tool detail on demand. Those fields are valid only for canonical tool-call coordinates, reject unsafe control characters, and are never copied into the separately sanitized Live Activity or APNs projection.
+
+## Loopdy Card version 1
+
+`loopdy.card` version 1 is a display-only generated-interface document. The
+generic `loopdy_render_card` tool validates an agent-supplied input against the
+portable schema and cross-field policy, canonicalizes it, and adds these
+renderer-owned fields:
+
+```json
+{
+  "content_hash": "64 lowercase hexadecimal characters",
+  "card_id": "first 32 characters of content_hash",
+  "created_at": "RFC 3339 UTC timestamp",
+  "origin": "live"
+}
+```
+
+The content hash is SHA-256 over the canonical input before those fields are
+added. The plugin rejects a mismatched hash before the result crosses a channel
+or Link boundary. The existing `generative.ui` Link event carries the complete
+card in its `card` field and retains the event, session, turn, tool call, agent,
+and occurrence-time coordinates. The iOS client rejects invalid event
+coordinates, schema/version pairs, trees, sources, and limits before rendering.
+
+The v1 component type set is exactly `card`, `vstack`, `hstack`, `grid`, `text`,
+`metric`, `badge`, `progress`, `chart`, `table`, `list`, `divider`, `spacer`, and
+`image`. Values are literal bindings, JSON Pointer source bindings, or bounded
+expressions. The only expression operations are `coalesce`, `add`, `subtract`,
+`multiply`, `divide`, `percent_change`, `equal`, `not_equal`, `greater_than`,
+`greater_than_or_equal`, `less_than`, `less_than_or_equal`, `and`, `or`, and
+`not`. The document cannot carry scripts, HTML, arbitrary actions, POST
+requests, credentials, supplied headers, remote images, or downloaded code.
+
+Build 3 supports static Cards only. Every displayed value is embedded in the
+document, `data_sources` must be empty, and the plugin rejects nonempty sources
+with `live_data_unavailable`. The original Card crosses Loopdy Link once. The
+iOS envelope validator independently rejects nonempty sources, and its
+production Card data client fails closed. Opening a Card makes no third-party
+Card data request. Source bindings and refresh behavior remain reserved for a
+later security-reviewed release.
+
+Template synchronization uses request-bound encrypted workspace operations
+named exactly `cards.templates.list`, `cards.templates.install`, and
+`cards.templates.remove`. Bundles contain metadata, an embedded card document,
+a parameter schema, and a SHA-256 integrity value. Stores enforce profile and
+account ownership, supported versions, hash validity, idempotent install,
+upgrade ordering, and atomic replacement. Parameters can replace declared
+literal slots only; they cannot alter component types, IDs, bindings,
+operations, or renderer-owned fields. Template operations never use the notification relay,
+and no production catalog origin is configured.
+
+`loopdy.card` is additive. `loopdy.generative_ui` versions 1 and 2 continue to
+decode and render through the existing legacy path, and
+`loopdy_render_form` remains responsible for user input and request-bound
+submissions. No envelope is silently converted between these schemas.
+
+See [Loopdy Cards](docs/LOOPDY_CARDS.md) for the complete wire example,
+finite component table, static delivery sequence, source limits, template
+lifecycle, visible errors, and design credit.
+
+Loopdy Cards credits Sameer Gupta's
+[Generative UI DSL](https://github.com/sameergdogg/generative-ui) for the
+constrained JSON-tree and fixed native component-catalog approach.
+[Google A2UI](https://github.com/google/A2UI) and
+[`json-render`](https://json-render.dev/) are related designs only. Loopdy does
+not claim adoption, endorsement, API compatibility, or copied code from any of
+these projects.
 
 ## Delivery providers
 

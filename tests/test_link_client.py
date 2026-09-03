@@ -97,6 +97,47 @@ class LinkClientTests(unittest.TestCase):
             }
         )
 
+    def test_competing_host_receipts_targeted_request_without_dispatching_it(self):
+        from loopdy_plugin.link_client import LoopdyLinkClient
+
+        _, config = self._configuration()
+        state = _State()
+        client = LoopdyLinkClient(config, state=state)
+        socket = _Socket()
+        client._socket = socket
+        received = []
+        payload = {
+            "version": 1,
+            "type": "workspace.request",
+            "requestId": "request-targeted-0001",
+            "operation": "sessions.list",
+            "payload": {},
+            "sentAt": int(time.time()),
+            "targetHostId": "different-host-device",
+        }
+        wire = json.dumps(
+            {
+                "version": 1,
+                "type": "frame",
+                "id": "frame-targeted-request-0001",
+                "senderDeviceId": "mobile-device-1",
+                "senderEpoch": 1,
+                "sequence": 1,
+                "ack": 0,
+                "ciphertext": client.cipher.seal(payload),
+            }
+        )
+
+        asyncio.run(client.handle_wire_message(wire, received.append))
+
+        self.assertEqual(received, [])
+        self.assertEqual(
+            state.get("link.transport.host-device-fixture.received_sequences"),
+            {"mobile-device-1": 1},
+        )
+        self.assertEqual(socket.sent[-1]["type"], "receipt")
+        self.assertEqual(socket.sent[-1]["frameId"], "frame-targeted-request-0001")
+
     def test_assembles_attachment_frames_before_exposing_a_bound_hermes_turn(self) -> None:
         from loopdy_plugin.link_client import LoopdyLinkClient
 

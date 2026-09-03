@@ -83,4 +83,4 @@ Live Activity routes, deletes the passkey account and device directory rows, clo
 and purges the per-account Durable Object. The app clears its local account files, preferences,
 notification keys, credentials, and in-memory models only after remote deletion succeeds.
 
-Report vulnerabilities privately through this repository's GitHub security advisory page. Do not include credentials or live protocol coordinates in a public issue.
+Report vulnerabilities according to the repository's root `SECURITY.md`.

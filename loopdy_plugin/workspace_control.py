@@ -113,6 +113,7 @@ class HermesWorkspaceBackend:
         clarify_timeout: Any | None = None,
         session_workspace_setter: Any | None = None,
         session_workspace_getter: Any | None = None,
+        session_active_getter: Any | None = None,
         connection_id_getter: Any | None = None,
         workspace_git: WorkspaceGitService | Any | None = None,
         workspace_git_state_path: Path | str | None = None,
@@ -123,6 +124,7 @@ class HermesWorkspaceBackend:
         self.clarify_timeout = clarify_timeout
         self.session_workspace_setter = session_workspace_setter
         self.session_workspace_getter = session_workspace_getter
+        self.session_active_getter = session_active_getter
         self.connection_id_getter = connection_id_getter
         self.workspace_git = workspace_git
         self.workspace_git_state_path = Path(
@@ -767,7 +769,7 @@ class HermesWorkspaceBackend:
         session_root = getter(agent_id, session_id)
         if inspect.isawaitable(session_root):
             session_root = await session_root
-        if _absolute_project_path(session_root) != _absolute_project_path(project_root):
+        if not _same_project_path(session_root, project_root):
             raise WorkspaceControlError("The session is not anchored to this Project")
         try:
             service = self.workspace_git or self._project_git_service(
@@ -873,17 +875,24 @@ class HermesWorkspaceBackend:
         rows = raw.get("sessions")
         if not isinstance(rows, list) or len(rows) > 500:
             raise WorkspaceControlError("Hermes session catalog is invalid")
+        sources = [_object(row, "Hermes session") for row in rows]
+        sources.sort(
+            key=lambda source: (
+                _timestamp(source.get("last_active", source.get("started_at"))),
+                _timestamp(source.get("started_at")),
+                _coordinate(source.get("id"), 160),
+            ),
+            reverse=True,
+        )
         sessions = []
         stored_ids: set[str] = set()
-        for row in rows:
-            source = _object(row, "Hermes session")
+        for source in sources:
             stored_id = _coordinate(source.get("id"), 160)
             if stored_id in stored_ids:
                 raise WorkspaceControlError("Hermes session coordinates are ambiguous")
             stored_ids.add(stored_id)
         visible_ids: set[str] = set()
-        for row in rows:
-            source = _object(row, "Hermes session")
+        for source in sources:
             stored_id = _coordinate(source.get("id"), 160)
             profile = _agent_id(source.get("profile"))
             session_source = _coordinate(source.get("source", "local"), 64)
@@ -909,6 +918,16 @@ class HermesWorkspaceBackend:
             if visible_id in visible_ids:
                 raise WorkspaceControlError("Hermes session coordinates are ambiguous")
             visible_ids.add(visible_id)
+            is_active = source.get("is_active") is True
+            if session_source == "loopdy" and callable(self.session_active_getter):
+                resolved_active = self.session_active_getter(
+                    profile,
+                    preferred_visible_id,
+                    stored_id,
+                )
+                if inspect.isawaitable(resolved_active):
+                    resolved_active = await resolved_active
+                is_active = resolved_active is True
             sessions.append(
                 {
                     "storedId": stored_id,
@@ -928,7 +947,7 @@ class HermesWorkspaceBackend:
                     "lastActive": _timestamp(
                         source.get("last_active", source.get("started_at"))
                     ),
-                    "isActive": source.get("is_active") is True,
+                    "isActive": is_active,
                 }
             )
         return {"sessions": sessions}
@@ -2181,6 +2200,17 @@ def _absolute_project_path(value: Any) -> str:
     if not candidate.is_absolute() or ".." in candidate.parts:
         raise WorkspaceControlError("Project Git Project path is invalid")
     return str(candidate.resolve(strict=False))
+
+
+def _same_project_path(left: Any, right: Any) -> bool:
+    left_path = Path(_absolute_project_path(left))
+    right_path = Path(_absolute_project_path(right))
+    if left_path == right_path:
+        return True
+    try:
+        return left_path.samefile(right_path)
+    except OSError:
+        return False
 
 
 def _project_git_status_token(value: Any) -> str:

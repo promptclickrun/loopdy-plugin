@@ -1,0 +1,63 @@
+{
+  "schema": "loopdy.card",
+  "version": 1,
+  "title": "Significant earthquakes",
+  "spoken_summary": "Significant earthquakes reported by the USGS in the past day are listed.",
+  "importance": "urgent",
+  "valid_until": "2026-09-03T12:00:00Z",
+  "data_sources": [
+    {
+      "id": "usgs",
+      "request": {
+        "method": "GET",
+        "url": "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/significant_day.geojson"
+      },
+      "response": { "format": "json", "root": "" },
+      "refresh": {
+        "minimum_interval_seconds": 300,
+        "stale_after_seconds": 900,
+        "expires_at": "2026-09-03T12:00:00Z"
+      }
+    }
+  ],
+  "root": "card",
+  "elements": {
+    "card": {
+      "type": "card",
+      "props": { "title": "Significant earthquakes", "subtitle": "Past 24 hours" },
+      "children": ["quakes"]
+    },
+    "quakes": {
+      "type": "list",
+      "props": {
+        "items": { "source": "usgs", "pointer": "/features" },
+        "empty_text": "No significant earthquakes reported.",
+        "shows_dividers": true
+      },
+      "children": ["quake_row"]
+    },
+    "quake_row": {
+      "type": "hstack",
+      "props": { "spacing": "small", "alignment": "center" },
+      "children": ["quake_place", "quake_magnitude"]
+    },
+    "quake_place": {
+      "type": "text",
+      "props": {
+        "value": { "source": "usgs", "pointer": "/properties/place" },
+        "typography": "body",
+        "color": "primary",
+        "line_limit": 2
+      },
+      "children": []
+    },
+    "quake_magnitude": {
+      "type": "badge",
+      "props": {
+        "value": { "source": "usgs", "pointer": "/properties/mag" },
+        "semantic": "warning"
+      },
+      "children": []
+    }
+  }
+}

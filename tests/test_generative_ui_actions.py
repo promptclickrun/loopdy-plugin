@@ -72,13 +72,15 @@ class GenerativeUiActionTests(unittest.TestCase):
             now=now,
         )
 
-    def test_catalog_registers_exact_v1_and_v2_tools_with_strict_schemas(self) -> None:
+    def test_catalog_registers_exact_legacy_and_card_tools_with_strict_schemas(self) -> None:
         self.assertEqual(
             set(self.context.tools),
             {
                 "loopdy_render_summary", "loopdy_render_metrics", "loopdy_render_list", "loopdy_render_timeline",
                 "loopdy_render_weather_forecast", "loopdy_render_sports_game", "loopdy_render_stock_quote",
                 "loopdy_render_chart", "loopdy_render_dashboard", "loopdy_render_form",
+                "loopdy_render_card",
+                "loopdy_search_card_templates", "loopdy_get_card_template", "loopdy_render_card_template",
                 "loopdy_await_form_response",
             },
         )

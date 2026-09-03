@@ -214,6 +214,61 @@ class ActivityBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshots[0]["revision"], 4)
         self.assertEqual(snapshots[0]["todos"][0]["status"], "in_progress")
 
+    async def test_child_hooks_route_to_child_session_while_preserving_parent_ownership(self) -> None:
+        from loopdy_plugin.activity_bridge import LinkActivityBroker, publish_hook_activity
+
+        class CapturingBroker(LinkActivityBroker):
+            def __init__(self):
+                super().__init__()
+                self.payloads = []
+
+            def publish(self, payload):
+                self.payloads.append(payload)
+                return True
+
+        broker = CapturingBroker()
+        parent = "hermes_parent_coordinate_0001"
+        parent_turn = "hermes_parent_coordinate_0001:turn:abc12345"
+        child = "hermes_child_coordinate_0001"
+        broker.bind_link_session(parent, "link_parent_coordinate_0001")
+        publish_hook_activity(
+            "subagent_start",
+            broker=broker,
+            profile="default",
+            payload={
+                "parent_session_id": parent,
+                "parent_turn_id": parent_turn,
+                "child_session_id": child,
+                "child_subagent_id": "child_subagent_coordinate_0001",
+                "child_role": "researcher",
+                "child_goal": "Inspect source",
+            },
+            occurred_at=1_788_000_040,
+        )
+        publish_hook_activity(
+            "pre_tool_call",
+            broker=broker,
+            profile="default",
+            payload={
+                "session_id": child,
+                "turn_id": "hermes_child_coordinate_0001:turn:def67890",
+                "platform": "subagent",
+                "tool_name": "terminal",
+                "tool_call_id": "child_tool_coordinate_0001",
+                "args": {"command": "pwd"},
+            },
+            occurred_at=1_788_000_041,
+        )
+        events = [
+            item
+            for item in broker.payloads
+            if item["type"] == "activity.event" and item.get("toolCallId")
+        ]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["sessionId"], child)
+        self.assertEqual(events[0]["toolCallId"], "child_tool_coordinate_0001")
+        self.assertEqual(events[0]["turnId"], "turn_" + events[0]["turnId"].split("turn_", 1)[1])
+
     async def test_subagent_hooks_publish_one_active_roster_then_an_empty_roster(self) -> None:
         from loopdy_plugin.activity_bridge import LinkActivityBroker, publish_hook_activity
 

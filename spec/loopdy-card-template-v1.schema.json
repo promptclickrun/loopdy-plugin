@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loopdy.app/spec/loopdy-card-template-v1.schema.json",
+  "title": "Loopdy Card local template bundle v1",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1000
+    },
+    "author": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "license": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "minimum_card_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "parameters_schema": {
+      "$ref": "#/$defs/parametersSchema"
+    },
+    "document": {
+      "$ref": "loopdy-card-v1.schema.json"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  },
+  "required": [
+    "id",
+    "version",
+    "name",
+    "summary",
+    "author",
+    "license",
+    "minimum_card_version",
+    "parameters_schema",
+    "document",
+    "sha256"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "parametersSchema": {
+      "type": "object",
+      "properties": {
+        "type": { "const": "object" },
+        "properties": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/parameterDefinition"
+          }
+        },
+        "required": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$"
+          }
+        },
+        "additionalProperties": { "const": false }
+      },
+      "required": ["type", "properties", "required", "additionalProperties"],
+      "additionalProperties": false
+    },
+    "parameterDefinition": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["string", "integer", "number", "boolean"]
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "default": {
+          "type": ["string", "integer", "number", "boolean"]
+        },
+        "enum": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": ["string", "integer", "number", "boolean"]
+          }
+        }
+      },
+      "required": ["type"],
+      "additionalProperties": false
+    }
+  }
+}

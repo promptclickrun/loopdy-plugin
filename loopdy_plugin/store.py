@@ -13,10 +13,13 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .events import LoopdyEvent
+from .loopdy_cards import canonical_json as canonical_card_json
+from .loopdy_cards import validate_card_input
 
 
 _PROTOCOL_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,179}$")
@@ -489,6 +492,119 @@ class LoopdyStore:
         if group:
             return [item for item in devices if group in item["groups"]]
         return devices
+
+    def install_card_template(
+        self,
+        *,
+        profile: str,
+        template: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        owner = _identifier(profile, "profile")
+        normalized = _card_template(template)
+        now = int(time.time())
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT version, sha256, template_json FROM card_templates "
+                "WHERE profile=? AND template_id=?",
+                (owner, normalized["id"]),
+            ).fetchone()
+            if existing is not None:
+                current_version = int(existing["version"])
+                if normalized["version"] < current_version:
+                    raise ValueError("Card template version cannot decrease")
+                if normalized["version"] == current_version:
+                    if (
+                        hmac.compare_digest(str(existing["sha256"]), normalized["sha256"])
+                        and hmac.compare_digest(
+                            str(existing["template_json"]),
+                            canonical_card_json(normalized),
+                        )
+                    ):
+                        return {"changed": False, "template": normalized}
+                    raise ValueError("Card template version conflict")
+            connection.execute(
+                """
+                INSERT INTO card_templates (
+                    profile, template_id, version, name, summary, sha256,
+                    template_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(profile, template_id) DO UPDATE SET
+                    version=excluded.version,
+                    name=excluded.name,
+                    summary=excluded.summary,
+                    sha256=excluded.sha256,
+                    template_json=excluded.template_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    owner,
+                    normalized["id"],
+                    normalized["version"],
+                    normalized["name"],
+                    normalized["summary"],
+                    normalized["sha256"],
+                    canonical_card_json(normalized),
+                    now,
+                    now,
+                ),
+            )
+        return {"changed": True, "template": normalized}
+
+    def list_card_templates(self, *, profile: str) -> list[dict[str, Any]]:
+        owner = _identifier(profile, "profile")
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT template_json FROM card_templates WHERE profile=? "
+                "ORDER BY name COLLATE NOCASE, template_id",
+                (owner,),
+            ).fetchall()
+        return [json.loads(str(row["template_json"])) for row in rows]
+
+    def get_card_template(
+        self,
+        *,
+        profile: str,
+        template_id: str,
+    ) -> dict[str, Any] | None:
+        owner = _identifier(profile, "profile")
+        identifier = _card_template_id(template_id)
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT template_json FROM card_templates WHERE profile=? AND template_id=?",
+                (owner, identifier),
+            ).fetchone()
+        return None if row is None else json.loads(str(row["template_json"]))
+
+    def remove_card_template(
+        self,
+        *,
+        profile: str,
+        template_id: str,
+        version: int,
+        sha256: str,
+    ) -> dict[str, Any]:
+        owner = _identifier(profile, "profile")
+        identifier = _card_template_id(template_id)
+        expected_version = _positive_revision(version)
+        expected_hash = _card_template_hash(sha256)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT version, sha256 FROM card_templates WHERE profile=? AND template_id=?",
+                (owner, identifier),
+            ).fetchone()
+            if row is None:
+                return {"changed": False, "templateId": identifier}
+            if int(row["version"]) != expected_version or not hmac.compare_digest(
+                str(row["sha256"]), expected_hash
+            ):
+                raise ValueError("Card template removal conflict")
+            connection.execute(
+                "DELETE FROM card_templates WHERE profile=? AND template_id=?",
+                (owner, identifier),
+            )
+        return {"changed": True, "templateId": identifier}
 
     def provider_mode(self) -> str:
         with self._connect() as connection:
@@ -3307,6 +3423,20 @@ class LoopdyStore:
                     );
                     CREATE INDEX IF NOT EXISTS generative_ui_forms_owner_idx
                     ON generative_ui_forms(profile, session_id, state, expires_at);
+                    CREATE TABLE IF NOT EXISTS card_templates (
+                        profile TEXT NOT NULL,
+                        template_id TEXT NOT NULL,
+                        version INTEGER NOT NULL,
+                        name TEXT NOT NULL,
+                        summary TEXT NOT NULL,
+                        sha256 TEXT NOT NULL,
+                        template_json TEXT NOT NULL,
+                        created_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        PRIMARY KEY (profile, template_id)
+                    );
+                    CREATE INDEX IF NOT EXISTS card_templates_profile_name_idx
+                    ON card_templates(profile, name, template_id);
                     """
                 )
                 event_columns = {
@@ -3755,6 +3885,111 @@ def form_action_response(request_id: str, idempotency_key: str, state: str, code
     except ValueError:
         safe_request_id = "0" * 32
     return _form_response(safe_request_id, str(idempotency_key or ""), state, code)
+
+
+def _card_template(value: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError("Card template must be an object")
+    expected = {
+        "id",
+        "version",
+        "name",
+        "summary",
+        "author",
+        "license",
+        "minimum_card_version",
+        "parameters_schema",
+        "document",
+        "sha256",
+    }
+    if set(value) != expected:
+        raise ValueError("Card template schema is invalid")
+    normalized = json.loads(canonical_card_json(dict(value)))
+    normalized["id"] = _card_template_id(normalized["id"])
+    normalized["version"] = _positive_revision(normalized["version"])
+    normalized["name"] = _required_text(normalized["name"], "name", 120)
+    normalized["summary"] = _required_text(normalized["summary"], "summary", 1_000)
+    normalized["author"] = _required_text(normalized["author"], "author", 120)
+    normalized["license"] = _required_text(normalized["license"], "license", 120)
+    if normalized["minimum_card_version"] != 1:
+        raise ValueError("Card template minimum card version is unsupported")
+    _card_template_parameters_schema(normalized["parameters_schema"])
+    validate_card_input(normalized["document"], now=datetime.now(timezone.utc))
+    supplied_hash = _card_template_hash(normalized["sha256"])
+    expected_hash = hashlib.sha256(
+        canonical_card_json(normalized["document"]).encode("utf-8")
+    ).hexdigest()
+    if not hmac.compare_digest(supplied_hash, expected_hash):
+        raise ValueError("Card template hash does not match its bundle")
+    normalized["sha256"] = expected_hash
+    return normalized
+
+
+def _card_template_id(value: Any) -> str:
+    if type(value) is not str or re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,127}", value) is None:
+        raise ValueError("Card template id is invalid")
+    return value
+
+
+def _card_template_hash(value: Any) -> str:
+    if type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ValueError("Card template hash is invalid")
+    return value
+
+
+def _card_template_parameters_schema(value: Any) -> None:
+    if not isinstance(value, dict) or set(value) != {
+        "type", "properties", "required", "additionalProperties"
+    }:
+        raise ValueError("Card template parameters schema is invalid")
+    if value["type"] != "object" or value["additionalProperties"] is not False:
+        raise ValueError("Card template parameters schema must be a strict object")
+    properties = value["properties"]
+    required = value["required"]
+    if not isinstance(properties, dict):
+        raise ValueError("Card template parameter properties are invalid")
+    if (
+        not isinstance(required, list)
+        or len(required) != len(set(required))
+        or any(type(item) is not str or item not in properties for item in required)
+    ):
+        raise ValueError("Card template required parameters are invalid")
+    for name, schema in properties.items():
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", name) is None:
+            raise ValueError("Card template parameter name is invalid")
+        if (
+            not isinstance(schema, dict)
+            or set(schema) - {"type", "title", "description", "default", "enum"}
+            or schema.get("type") not in {"string", "integer", "number", "boolean"}
+        ):
+            raise ValueError("Card template parameter schema is invalid")
+        if "title" in schema:
+            _required_text(schema["title"], "parameter title", 120)
+        if "description" in schema:
+            _required_text(schema["description"], "parameter description", 500)
+        if "enum" in schema:
+            enum = schema["enum"]
+            if not isinstance(enum, list) or not enum:
+                raise ValueError("Card template parameter enum is invalid")
+            if len({canonical_card_json(item) for item in enum}) != len(enum):
+                raise ValueError("Card template parameter enum is invalid")
+            for item in enum:
+                _card_template_parameter_value(item, schema["type"])
+        if "default" in schema:
+            _card_template_parameter_value(schema["default"], schema["type"])
+            if "enum" in schema and schema["default"] not in schema["enum"]:
+                raise ValueError("Card template parameter default is invalid")
+
+
+def _card_template_parameter_value(value: Any, kind: str) -> None:
+    valid = (
+        (kind == "string" and isinstance(value, str))
+        or (kind == "integer" and type(value) is int)
+        or (kind == "number" and type(value) in {int, float})
+        or (kind == "boolean" and type(value) is bool)
+    )
+    if not valid:
+        raise ValueError("Card template parameter value is invalid")
 
 
 def _identifier(value: str, name: str) -> str:

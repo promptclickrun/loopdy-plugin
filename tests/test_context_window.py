@@ -79,6 +79,15 @@ class ContextWindowTests(unittest.IsolatedAsyncioTestCase):
             _running_agents={entry.session_key: agent},
             _agent_cache={},
             _agent_cache_lock=None,
+            _session_db=SimpleNamespace(
+                _db=SimpleNamespace(
+                    get_session_title=lambda session_id: (
+                        "Readable live title"
+                        if session_id == entry.session_id
+                        else None
+                    )
+                )
+            ),
         )
 
         adapter.set_session_store(store)
@@ -88,6 +97,7 @@ class ContextWindowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             broker.provider(entry.session_id),
             {
+                "title": "Readable live title",
                 "model": "anthropic/claude-fable-5",
                 "contextUsed": 154_200,
                 "contextMax": 272_000,
@@ -178,6 +188,49 @@ class ContextWindowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(received[2]["compressions"], 1)
         self.assertFalse(received[2]["isCompacting"])
         self.assertFalse(broker.is_active("hermes-session-2", "turn-coordinate-2"))
+        await broker.detach()
+
+    async def test_title_only_change_is_published_while_turn_remains_active(self) -> None:
+        broker = LinkActivityBroker()
+        broker.context_poll_interval_seconds = 0.01
+        received: list[dict] = []
+        state = {
+            "title": "Original title",
+            "model": "anthropic/claude-fable-5",
+            "contextUsed": 12_000,
+            "contextMax": 272_000,
+            "contextPercent": 4,
+            "compressions": 0,
+            "isCompacting": False,
+        }
+
+        async def sender(payload):
+            if payload.get("type") == "session.context":
+                received.append(payload)
+
+        broker.attach_context_provider(lambda _session_id: dict(state))
+        broker.bind_link_session("hermes-session-title", "link-chat-title")
+        await broker.attach(sender)
+
+        publish_hook_activity(
+            "pre_llm_call",
+            broker=broker,
+            profile="default",
+            payload={
+                "session_id": "hermes-session-title",
+                "turn_id": "turn-coordinate-title",
+                "platform": "loopdy",
+            },
+            occurred_at=1_788_000_100,
+        )
+        await _wait_until(lambda: len(received) == 1)
+        self.assertEqual(received[0]["title"], "Original title")
+
+        state["title"] = "Renamed while open"
+        await _wait_until(lambda: len(received) == 2)
+        self.assertEqual(received[1]["title"], "Renamed while open")
+        self.assertEqual(received[1]["contextUsed"], 12_000)
+
         await broker.detach()
 
     async def test_unchanged_periodic_context_is_not_republished(self) -> None:

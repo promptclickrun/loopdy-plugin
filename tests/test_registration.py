@@ -124,6 +124,25 @@ class _ActivityBroker:
 
 
 class RegistrationTests(unittest.TestCase):
+    def test_loopdy_native_presentation_context_matches_static_card_contract(self) -> None:
+        from loopdy_plugin.registration import register
+
+        service = _Service()
+        context = _Context()
+        register(context, service=service)
+
+        result = context.hooks["pre_llm_call"](
+            platform="loopdy",
+            session_id="static-card-contract",
+            sender_id="sender",
+        )
+
+        self.assertIsNotNone(result)
+        prompt = result["context"]
+        self.assertIn("embedded values and an empty data_sources array", prompt)
+        self.assertIn("Live Loopdy Card data refresh is unavailable", prompt)
+        self.assertNotIn("public-GET live-data", prompt)
+
     def test_link_chat_hooks_publish_safe_exact_activity_lifecycle(self) -> None:
         from loopdy_plugin.registration import register
 

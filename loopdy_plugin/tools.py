@@ -1,8 +1,13 @@
 import json
+import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from .generative_ui import V2_COMPONENTS, render_envelope, render_v2_envelope
+from .loopdy_cards import canonical_json as canonical_card_json
+from .loopdy_cards import render_card
 from .store import form_action_response
 
 
@@ -60,6 +65,29 @@ def _v2_parameters(component: str) -> dict[str, Any]:
         properties["provenance"] = provenance
         required.append("provenance")
     return _strict_object(properties, required)
+
+
+def _card_parameters() -> dict[str, Any]:
+    schema_path = (
+        Path(__file__).resolve().parents[1]
+        / "spec"
+        / "loopdy-card-v1.schema.json"
+    )
+    portable = json.loads(schema_path.read_text(encoding="utf-8"))
+    return {
+        "type": portable["type"],
+        "properties": portable["properties"],
+        "required": portable["required"],
+        "additionalProperties": portable["additionalProperties"],
+        "$defs": portable["$defs"],
+    }
+
+
+def _card_handler(now: Callable[[], datetime]):
+    def handle(payload, **_kwargs):
+        return canonical_card_json(render_card(payload, now=now()))
+
+    return handle
 
 
 def _v2_data_schema(component: str) -> dict[str, Any]:
@@ -176,6 +204,311 @@ def _await_handler(*, store: Any, profile: str, now: Callable[[], datetime]):
     return handle
 
 
+def _template_store(store: Any) -> Any:
+    if store is None or not all(
+        hasattr(store, name)
+        for name in ("list_card_templates", "get_card_template")
+    ):
+        raise ValueError("Loopdy card template storage is unavailable")
+    return store
+
+
+def _template_search_handler(*, store: Any, profile: str):
+    def handle(payload, **_kwargs):
+        if not isinstance(payload, dict) or set(payload) != {"query"}:
+            raise ValueError("template search arguments must contain only query")
+        query = payload.get("query")
+        if not isinstance(query, str) or len(query) > 120:
+            raise ValueError("template search query is invalid")
+        needle = query.strip().casefold()
+        templates = []
+        for template in _template_store(store).list_card_templates(profile=profile):
+            searchable = " ".join(
+                str(template.get(key) or "")
+                for key in ("id", "name", "summary", "author")
+            ).casefold()
+            if needle and needle not in searchable:
+                continue
+            templates.append({
+                key: template[key]
+                for key in (
+                    "id", "version", "name", "summary", "author", "license",
+                    "minimum_card_version", "sha256"
+                )
+            })
+        return canonical_card_json({"templates": templates})
+
+    return handle
+
+
+def _template_get_handler(*, store: Any, profile: str):
+    def handle(payload, **_kwargs):
+        if not isinstance(payload, dict) or set(payload) != {"template_id"}:
+            raise ValueError("template get arguments must contain only template_id")
+        template_id = payload.get("template_id")
+        if not isinstance(template_id, str):
+            raise ValueError("template id is invalid")
+        template = _template_store(store).get_card_template(
+            profile=profile,
+            template_id=template_id,
+        )
+        if template is None:
+            raise ValueError("Loopdy card template was not found")
+        return canonical_card_json({"template": template})
+
+    return handle
+
+
+def _template_render_handler(
+    *,
+    store: Any,
+    profile: str,
+    now: Callable[[], datetime],
+):
+    def handle(payload, **_kwargs):
+        if not isinstance(payload, dict) or set(payload) != {"template_id", "parameters"}:
+            raise ValueError("template render arguments are invalid")
+        template_id = payload.get("template_id")
+        parameters = payload.get("parameters")
+        if not isinstance(template_id, str) or not isinstance(parameters, dict):
+            raise ValueError("template render arguments are invalid")
+        template = _template_store(store).get_card_template(
+            profile=profile,
+            template_id=template_id,
+        )
+        if template is None:
+            raise ValueError("Loopdy card template was not found")
+        values = _validated_template_parameters(template["parameters_schema"], parameters)
+        document = _substitute_template_parameters(
+            template["document"],
+            values,
+            declared_names=set(template["parameters_schema"]["properties"]),
+        )
+        # This deliberately ends on the same renderer-owned validator as
+        # loopdy_render_card; templates do not gain a parallel rendering path.
+        return canonical_card_json(render_card(document, now=now()))
+
+    return handle
+
+
+def _validated_template_parameters(schema: dict[str, Any], values: dict[str, Any]) -> dict[str, Any]:
+    properties = schema["properties"]
+    required = set(schema["required"])
+    if set(values) - set(properties) or not required.issubset(values):
+        raise ValueError("template parameters do not match the declared schema")
+    normalized: dict[str, Any] = {}
+    for name, property_schema in properties.items():
+        if name not in values:
+            if "default" in property_schema:
+                normalized[name] = property_schema["default"]
+            continue
+        value = values[name]
+        kind = property_schema["type"]
+        valid_type = (
+            (kind == "string" and isinstance(value, str))
+            or (kind == "integer" and type(value) is int)
+            or (kind == "number" and type(value) in {int, float})
+            or (kind == "boolean" and type(value) is bool)
+        )
+        if not valid_type or ("enum" in property_schema and value not in property_schema["enum"]):
+            raise ValueError(f"template parameter {name} is invalid")
+        if kind == "string" and (
+            len(value) < int(property_schema.get("minLength", 0))
+            or len(value) > int(property_schema.get("maxLength", 2_000))
+        ):
+            raise ValueError(f"template parameter {name} is invalid")
+        if kind in {"integer", "number"} and (
+            value < property_schema.get("minimum", value)
+            or value > property_schema.get("maximum", value)
+        ):
+            raise ValueError(f"template parameter {name} is invalid")
+        normalized[name] = value
+    return normalized
+
+
+_TEMPLATE_SLOT = re.compile(r"\{\{([A-Za-z][A-Za-z0-9_-]{0,63})\}\}")
+_TEMPLATE_STRUCTURAL_KEYS = frozenset({
+    "schema", "version", "type", "id", "source", "pointer", "op", "operation",
+    "method", "root", "format", "children", "content_hash", "card_id", "origin",
+    "created_at", "valid_until", "minimum_interval_seconds", "stale_after_seconds",
+    "expires_at", "refresh",
+})
+
+
+def _substitute_template_parameters(
+    value: Any,
+    parameters: dict[str, Any],
+    *,
+    declared_names: set[str],
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("template document is invalid")
+    result = json.loads(canonical_card_json(value))
+    for key in ("title", "spoken_summary"):
+        result[key] = _substitute_template_literal(
+            result[key], parameters, declared_names
+        )
+    for key, item in result.items():
+        if key not in {"title", "spoken_summary", "elements", "data_sources"}:
+            _reject_template_slots(key)
+            _reject_template_slots(item)
+
+    elements = result.get("elements")
+    if not isinstance(elements, dict):
+        raise ValueError("template document is invalid")
+    for element_id, element in elements.items():
+        _reject_template_slots(element_id)
+        if not isinstance(element, dict):
+            raise ValueError("template document is invalid")
+        for key, item in element.items():
+            if key == "props":
+                element[key] = _substitute_template_literal(
+                    item, parameters, declared_names
+                )
+            else:
+                _reject_template_slots(key)
+                _reject_template_slots(item)
+
+    sources = result.get("data_sources")
+    if not isinstance(sources, list):
+        raise ValueError("template document is invalid")
+    for source in sources:
+        if not isinstance(source, dict):
+            raise ValueError("template document is invalid")
+        for key, item in source.items():
+            if key != "request":
+                _reject_template_slots(key)
+                _reject_template_slots(item)
+        request = source.get("request")
+        if not isinstance(request, dict):
+            raise ValueError("template document is invalid")
+        for key, item in request.items():
+            if key != "url":
+                _reject_template_slots(key)
+                _reject_template_slots(item)
+        request["url"] = _substitute_template_url(
+            request.get("url"), parameters, declared_names
+        )
+    return result
+
+
+def _substitute_template_literal(
+    value: Any,
+    parameters: dict[str, Any],
+    declared_names: set[str],
+) -> Any:
+    if isinstance(value, list):
+        return [
+            _substitute_template_literal(item, parameters, declared_names)
+            for item in value
+        ]
+    if isinstance(value, dict):
+        result = {}
+        for key, item in value.items():
+            _reject_template_slots(key)
+            if key in _TEMPLATE_STRUCTURAL_KEYS:
+                _reject_template_slots(item)
+                result[key] = item
+            elif key == "url":
+                result[key] = _substitute_template_url(
+                    item, parameters, declared_names
+                )
+            else:
+                result[key] = _substitute_template_literal(
+                    item, parameters, declared_names
+                )
+        return result
+    if not isinstance(value, str):
+        return value
+    return _substitute_template_string(
+        value,
+        parameters,
+        declared_names,
+        preserves_value_type=True,
+    )
+
+
+def _substitute_template_string(
+    value: str,
+    parameters: dict[str, Any],
+    declared_names: set[str],
+    *,
+    preserves_value_type: bool,
+) -> Any:
+    names = set(_TEMPLATE_SLOT.findall(value))
+    if not names:
+        return value
+    if not names.issubset(declared_names):
+        raise ValueError("template contains an unsafe undeclared parameter slot")
+    if value == f"{{{{{next(iter(names))}}}}}" and len(names) == 1:
+        parameter = parameters.get(next(iter(names)), _MISSING_TEMPLATE_PARAMETER)
+        if parameter is _MISSING_TEMPLATE_PARAMETER:
+            raise ValueError("template parameter is invalid")
+        return parameter if preserves_value_type else _template_parameter_text(parameter)
+    result = value
+    for name in sorted(names):
+        if name not in parameters:
+            raise ValueError("template parameter is invalid")
+        result = result.replace(f"{{{{{name}}}}}", _template_parameter_text(parameters[name]))
+    return result
+
+
+def _substitute_template_url(
+    value: Any,
+    parameters: dict[str, Any],
+    declared_names: set[str],
+) -> str:
+    if not isinstance(value, str):
+        raise ValueError("template URL is invalid")
+    parts = urlsplit(value)
+    for structural in (parts.scheme, parts.netloc, parts.path, parts.fragment):
+        _reject_template_slots(structural)
+    query = []
+    for name, item in parse_qsl(parts.query, keep_blank_values=True, strict_parsing=False):
+        _reject_template_slots(name)
+        query.append((
+            name,
+            _substitute_template_string(
+                item,
+                parameters,
+                declared_names,
+                preserves_value_type=False,
+            ),
+        ))
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+def _reject_template_slots(value: Any) -> None:
+    if isinstance(value, str) and _TEMPLATE_SLOT.search(value):
+        raise ValueError("template contains an unsafe structural parameter slot")
+    if isinstance(value, list):
+        for item in value:
+            _reject_template_slots(item)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _reject_template_slots(key)
+            _reject_template_slots(item)
+
+
+def _template_parameter_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if type(value) is bool:
+        return "true" if value else "false"
+    return str(value)
+
+
+_MISSING_TEMPLATE_PARAMETER = object()
+
+
+def _template_tool_description(action: str) -> str:
+    return (
+        f"{action} profile-installed Loopdy Card templates for the direct callable native "
+        "Loopdy renderer. Call it when visible in the current tool list. When progressively "
+        "disclosed, use tool_search, tool_describe, and tool_call to invoke this exact tool."
+    )
+
+
 def register(
     ctx,
     *,
@@ -230,6 +563,24 @@ def register(
             ),
         )
     ctx.register_tool(
+        name="loopdy_render_card",
+        toolset="loopdy",
+        schema={
+            "name": "loopdy_render_card",
+            "description": (
+                "Render one bounded static native Loopdy Card from the finite component catalog. "
+                "All displayed values must be embedded in the payload and data_sources must be empty; "
+                "live Card data refresh is unavailable in this release. This is the direct callable native Loopdy renderer. "
+                "Call this renderer directly when it is visible in the current tool list. When Hermes has progressively "
+                "disclosed it and it is absent, use the official tool_search, tool_describe, "
+                "and tool_call bridge to invoke this exact renderer; do not substitute or "
+                "wrap another tool."
+            ),
+            "parameters": _card_parameters(),
+        },
+        handler=_card_handler(clock),
+    )
+    ctx.register_tool(
         name="loopdy_await_form_response",
         toolset="loopdy",
         schema={
@@ -245,3 +596,55 @@ def register(
         },
         handler=_await_handler(store=store, profile=selected_profile, now=clock),
     )
+    if store is not None and all(
+        hasattr(store, name)
+        for name in ("list_card_templates", "get_card_template")
+    ):
+        template_tools = (
+            (
+                "loopdy_search_card_templates",
+                _template_tool_description("Search"),
+                _strict_object({"query": {"type": "string", "maxLength": 120}}, ["query"]),
+                _template_search_handler(store=store, profile=selected_profile),
+            ),
+            (
+                "loopdy_get_card_template",
+                _template_tool_description("Get"),
+                _strict_object(
+                    {"template_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"}},
+                    ["template_id"],
+                ),
+                _template_get_handler(store=store, profile=selected_profile),
+            ),
+            (
+                "loopdy_render_card_template",
+                _template_tool_description("Render"),
+                _strict_object(
+                    {
+                        "template_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"},
+                        "parameters": {
+                            "type": "object",
+                            "maxProperties": 32,
+                            "additionalProperties": True,
+                        },
+                    },
+                    ["template_id", "parameters"],
+                ),
+                _template_render_handler(
+                    store=store,
+                    profile=selected_profile,
+                    now=clock,
+                ),
+            ),
+        )
+        for name, description, parameters, handler in template_tools:
+            ctx.register_tool(
+                name=name,
+                toolset="loopdy",
+                schema={
+                    "name": name,
+                    "description": description,
+                    "parameters": parameters,
+                },
+                handler=handler,
+            )

@@ -1,0 +1,66 @@
+{
+  "schema": "loopdy.card",
+  "version": 1,
+  "title": "Chicago weather",
+  "spoken_summary": "Chicago's current temperature, humidity, and wind are shown.",
+  "importance": "normal",
+  "data_sources": [
+    {
+      "id": "weather",
+      "request": {
+        "method": "GET",
+        "url": "https://api.open-meteo.com/v1/forecast?latitude=41.8781&longitude=-87.6298&current=temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code&temperature_unit=fahrenheit&wind_speed_unit=mph"
+      },
+      "response": { "format": "json", "root": "/current" },
+      "refresh": {
+        "minimum_interval_seconds": 600,
+        "stale_after_seconds": 1800,
+        "expires_at": "2026-09-03T12:00:00Z"
+      }
+    }
+  ],
+  "root": "card",
+  "elements": {
+    "card": {
+      "type": "card",
+      "props": { "title": "Chicago weather", "subtitle": "Open-Meteo current conditions" },
+      "children": ["conditions", "humidity"]
+    },
+    "conditions": {
+      "type": "grid",
+      "props": { "columns": 2, "spacing": "medium", "alignment": "leading" },
+      "children": ["temperature", "wind"]
+    },
+    "temperature": {
+      "type": "metric",
+      "props": {
+        "label": "Temperature",
+        "value": { "source": "weather", "pointer": "/temperature_2m" },
+        "format": { "style": "number", "maximum_fraction_digits": 1 },
+        "semantic": "accent"
+      },
+      "children": []
+    },
+    "wind": {
+      "type": "metric",
+      "props": {
+        "label": "Wind speed",
+        "value": { "source": "weather", "pointer": "/wind_speed_10m" },
+        "format": { "style": "number", "maximum_fraction_digits": 1 },
+        "semantic": "secondary"
+      },
+      "children": []
+    },
+    "humidity": {
+      "type": "progress",
+      "props": {
+        "label": "Relative humidity",
+        "value": { "source": "weather", "pointer": "/relative_humidity_2m" },
+        "maximum": { "literal": 100 },
+        "format": { "style": "percent" },
+        "semantic": "accent"
+      },
+      "children": []
+    }
+  }
+}

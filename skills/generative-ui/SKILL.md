@@ -7,6 +7,10 @@ description: Render bounded v1 or v2 native Loopdy cards when structured present
 
 Use a Loopdy renderer when the user asks for a card, dashboard-like result, metrics, a bounded list, or a sequence of events. Keep normal prose when structured presentation adds no value.
 
+## Loopdy Cards
+
+Use the generic `loopdy_render_card` tool, documented in `references/loopdy-cards.md`, for new static compositions that do not match a typed renderer. These are called **Loopdy Cards**. Use typed v2 for existing polished use cases until generic rendering reaches visual parity. In this release, `data_sources` must be empty and all displayed values must be embedded in the card payload; live device refresh is not available. Cards allow no downloaded code, HTML, WebViews, authenticated requests, or secrets.
+
 The renderers are first-class model tools in the `loopdy` toolset. If the exact
 renderer is visible in the current tool list, call it directly. If Hermes has
 progressively disclosed plugin tools and that renderer is absent, use the

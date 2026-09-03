@@ -197,7 +197,11 @@ def _pre_llm_call(
         "When structured presentation is clearer than prose, call exactly one matching "
         "direct renderer such as loopdy_render_weather_forecast, "
         "loopdy_render_stock_quote, loopdy_render_chart, loopdy_render_dashboard, or "
-        "loopdy_render_form. For current weather or forecast requests, use "
+        "loopdy_render_form. Those typed v2 renderers remain preferred for their existing "
+        "polished use cases. For a new static layout that does not match a typed renderer, "
+        "use loopdy_render_card with embedded values and an empty data_sources array. "
+        "Live Loopdy Card data refresh is unavailable in this release. "
+        "For current weather or forecast requests, use "
         "loopdy_render_weather_forecast after obtaining the data when a card is useful; "
         "if Hermes has progressively disclosed the renderer, use the official "
         "tool_search, tool_describe, and tool_call bridge to load and invoke that exact "
@@ -367,6 +371,93 @@ def _queue_live_activity_update(service: Any, **update: Any) -> None:
         return
     if not service.enqueue_live_activity_update(**update):
         logger.warning("Loopdy Live Activity update was not queued")
+
+
+def _card_template_agent_id(value: Any) -> str:
+    agent_id = str(value or "").strip()
+    if (
+        not agent_id
+        or len(agent_id) > 64
+        or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for character in agent_id)
+        or not agent_id[0].isalnum()
+    ):
+        raise ValueError("Card template agent ownership is invalid")
+    return agent_id
+
+
+def _card_template_projection(template: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: template[key]
+        for key in (
+            "id", "version", "name", "summary", "author", "license",
+            "minimum_card_version", "sha256",
+        )
+    }
+
+
+async def _cards_templates_list(backend: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict) or set(payload) != {"agentId"}:
+        raise ValueError("Card template list payload is invalid")
+    agent_id = _card_template_agent_id(payload.get("agentId"))
+    templates = backend.service.store.list_card_templates(profile=agent_id)
+    return {
+        "agentId": agent_id,
+        "templates": [_card_template_projection(template) for template in templates],
+    }
+
+
+async def _cards_templates_install(backend: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict) or set(payload) != {"agentId", "template"}:
+        raise ValueError("Card template install payload is invalid")
+    agent_id = _card_template_agent_id(payload.get("agentId"))
+    template = payload.get("template")
+    if not isinstance(template, dict):
+        raise ValueError("Card template install payload is invalid")
+    result = backend.service.store.install_card_template(
+        profile=agent_id,
+        template=template,
+    )
+    return {
+        "agentId": agent_id,
+        "changed": result["changed"],
+        "template": _card_template_projection(result["template"]),
+    }
+
+
+async def _cards_templates_remove(backend: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict) or set(payload) != {
+        "agentId", "templateId", "version", "sha256"
+    }:
+        raise ValueError("Card template removal payload is invalid")
+    agent_id = _card_template_agent_id(payload.get("agentId"))
+    result = backend.service.store.remove_card_template(
+        profile=agent_id,
+        template_id=payload.get("templateId"),
+        version=payload.get("version"),
+        sha256=payload.get("sha256"),
+    )
+    return {"agentId": agent_id, **result}
+
+
+def _install_card_template_workspace_operations() -> None:
+    # The template sync extension is installed into the existing finite workspace
+    # controller so it inherits authenticated account encryption, request/result
+    # correlation, ordered delivery, and reconnect behavior. It never enters the
+    # notification service or relay journal.
+    from . import link_contracts, workspace_control
+
+    handlers = {
+        "cards.templates.list": "cards_templates_list",
+        "cards.templates.install": "cards_templates_install",
+        "cards.templates.remove": "cards_templates_remove",
+    }
+    operations = frozenset((*link_contracts.WORKSPACE_OPERATIONS, *handlers))
+    link_contracts.WORKSPACE_OPERATIONS = operations
+    workspace_control.WORKSPACE_OPERATIONS = operations
+    workspace_control.WorkspaceController._HANDLERS.update(handlers)
+    setattr(workspace_control.HermesWorkspaceBackend, "cards_templates_list", _cards_templates_list)
+    setattr(workspace_control.HermesWorkspaceBackend, "cards_templates_install", _cards_templates_install)
+    setattr(workspace_control.HermesWorkspaceBackend, "cards_templates_remove", _cards_templates_remove)
 
 
 def setup_cli(parser: Any) -> None:
@@ -699,3 +790,6 @@ def _public_device(device: Any) -> dict[str, Any]:
         hashlib.sha256(endpoint.encode("utf-8")).hexdigest()[:12] if endpoint else ""
     )
     return value
+
+
+_install_card_template_workspace_operations()

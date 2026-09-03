@@ -1151,6 +1151,52 @@ class HermesWorkspaceBackendTests(unittest.TestCase):
         self.assertEqual(status["changes"]["files"], 1)
         self.assertEqual(status["files"][0]["path"], "untracked.txt")
 
+    @unittest.skipUnless(sys.platform == "darwin", "macOS filesystem path behavior")
+    def test_project_git_accepts_case_variant_paths_to_the_same_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            root.mkdir()
+            subprocess.run(
+                ["git", "init", "-b", "main"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            (root / "untracked.txt").write_text("project change\n", encoding="utf-8")
+            variant = root.with_name("REPO")
+            if not variant.exists() or not variant.samefile(root):
+                self.skipTest("case-sensitive filesystem")
+
+            class ProjectBackend(HermesWorkspaceBackend):
+                async def _projects_catalog(self, agent_id):
+                    return {
+                        "projects": [
+                            {
+                                "id": "project-loopdy",
+                                "name": "Loopdy",
+                                "archived": False,
+                                "primary_path": str(variant),
+                                "folders": [],
+                            }
+                        ]
+                    }
+
+            backend = ProjectBackend(
+                service=object(),
+                session_workspace_getter=lambda _agent, _session: str(root),
+                connection_id_getter=lambda: "verified-link-connection-0001",
+                workspace_git_state_path=Path(directory) / "git-state.sqlite3",
+            )
+
+            status = asyncio.run(backend.projects_git_status({
+                "agentId": "default",
+                "sessionId": "session_fixture_0001",
+                "workspaceId": "project-loopdy",
+            }))
+
+        self.assertEqual(status["changes"]["files"], 1)
+        self.assertEqual(status["files"][0]["path"], "untracked.txt")
+
     def test_capability_catalog_uses_profile_and_strips_private_configuration(self) -> None:
         backend = _ProfileBackend()
 
@@ -2097,6 +2143,32 @@ class HermesWorkspaceBackendTests(unittest.TestCase):
         ])
         self.assertNotIn("system_prompt", repr(result))
 
+    def test_sessions_list_reconciles_stale_persisted_activity_with_live_owner(self) -> None:
+        observed = []
+
+        class _StaleActiveBackend(_ProfileBackend):
+            def __init__(self):
+                super().__init__()
+                self.session_active_getter = self._active
+
+            def _active(self, profile, visible_id, stored_id):
+                observed.append((profile, visible_id, stored_id))
+                return False
+
+            async def _session_catalog(self, agent_id):
+                value = await super()._session_catalog(agent_id)
+                value["sessions"][0]["is_active"] = True
+                return value
+
+        result = asyncio.run(_StaleActiveBackend().sessions_list({"agentId": "default"}))
+
+        self.assertFalse(result["sessions"][0]["isActive"])
+        self.assertEqual(observed, [(
+            "default",
+            "visible-session-0001",
+            "stored-session-0001",
+        )])
+
     def test_sessions_list_keeps_every_reset_row_without_merging_chat_transcripts(self) -> None:
         class _ResetLineageBackend(_ProfileBackend):
             async def _session_catalog(self, agent_id):
@@ -2150,6 +2222,43 @@ class HermesWorkspaceBackendTests(unittest.TestCase):
         self.assertEqual(
             [row["messageCount"] for row in result["sessions"]],
             [0, 12],
+        )
+
+    def test_sessions_list_orders_authoritative_rows_newest_first(self) -> None:
+        class _OutOfOrderBackend(_ProfileBackend):
+            async def _session_catalog(self, agent_id):
+                return {
+                    "sessions": [
+                        {
+                            "id": "older-row",
+                            "profile": "default",
+                            "source": "loopdy",
+                            "chat_id": "older-chat",
+                            "title": "Older",
+                            "preview": "Older turn",
+                            "message_count": 2,
+                            "started_at": 1_788_000_000,
+                            "last_active": 1_788_000_100,
+                        },
+                        {
+                            "id": "newer-row",
+                            "profile": "default",
+                            "source": "loopdy",
+                            "chat_id": "newer-chat",
+                            "title": "Newer",
+                            "preview": "Newer turn",
+                            "message_count": 2,
+                            "started_at": 1_788_000_050,
+                            "last_active": 1_788_000_200,
+                        },
+                    ]
+                }
+
+        result = asyncio.run(_OutOfOrderBackend().sessions_list({}))
+
+        self.assertEqual(
+            [row["visibleId"] for row in result["sessions"]],
+            ["newer-chat", "older-chat"],
         )
 
     def test_session_history_preserves_renderable_rich_hermes_message_records(self) -> None:

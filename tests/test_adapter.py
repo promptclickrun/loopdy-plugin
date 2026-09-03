@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -1662,8 +1663,27 @@ class AdapterTests(unittest.TestCase):
         adapter = LoopdyAdapter(
             PlatformConfig(enabled=True), service=_Service(), link_client=link
         )
-        adapter._message_handler = AsyncMock()
         callback = AsyncMock(return_value="Model changed for this session.")
+        picker_results = []
+
+        async def handler(event):
+            picker_results.append(await adapter.send_model_picker(
+                chat_id="session-coordinate-0001",
+                providers=[
+                    {
+                        "slug": "openai-codex",
+                        "name": "OpenAI Codex",
+                        "models": ["gpt-5.6", "gpt-5.5"],
+                        "api_key": "must-never-cross-link",
+                    }
+                ],
+                current_model="gpt-5.5",
+                current_provider="openai-codex",
+                session_key="loopdy:session-coordinate-0001",
+                on_model_selected=callback,
+            ))
+
+        adapter._message_handler = AsyncMock(side_effect=handler)
         opened = InboundLinkPickerOpen(
             request=PickerOpen(
                 request_id="picker_request_fixture_0001",
@@ -1681,22 +1701,7 @@ class AdapterTests(unittest.TestCase):
             self.assertEqual(event.text, "/model")
             self.assertEqual(event.source.profile, "finance")
             self.assertTrue(event.metadata["loopdy_link_control"])
-            result = await adapter.send_model_picker(
-                chat_id="session-coordinate-0001",
-                providers=[
-                    {
-                        "slug": "openai-codex",
-                        "name": "OpenAI Codex",
-                        "models": ["gpt-5.6", "gpt-5.5"],
-                        "api_key": "must-never-cross-link",
-                    }
-                ],
-                current_model="gpt-5.5",
-                current_provider="openai-codex",
-                session_key="loopdy:session-coordinate-0001",
-                on_model_selected=callback,
-            )
-            self.assertTrue(result.success)
+            self.assertTrue(picker_results[0].success)
             await adapter.receive_link_payload(
                 InboundLinkPickerSelection(
                     selection=PickerSelection(
@@ -1753,7 +1758,11 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(control_event.text, "/model")
         self.assertTrue(control_event.metadata["loopdy_link_control"])
         adapter.handle_message.assert_not_awaited()
-        self.assertEqual(link.payloads, [])
+        self.assertEqual(len(link.payloads), 1)
+        self.assertEqual(link.payloads[0]["type"], "picker.result")
+        self.assertEqual(link.payloads[0]["pickerId"], opened.request.request_id)
+        self.assertEqual(link.payloads[0]["status"], "failed")
+        self.assertIn("without opening", link.payloads[0]["message"].lower())
 
     def test_picker_open_without_handler_returns_correlated_failure(self) -> None:
         """A missing Hermes handler must not leave the mobile picker pending."""
@@ -1834,6 +1843,74 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(failure["status"], "failed")
         self.assertIn("could not open", failure["message"].lower())
 
+    def test_overlapping_picker_requests_keep_request_ownership_and_reject_late_callback(self) -> None:
+        from loopdy_plugin.link_client import InboundLinkPickerOpen
+        from loopdy_plugin.link_contracts import PickerOpen
+
+        link = _LinkClient()
+        adapter = LoopdyAdapter(
+            PlatformConfig(enabled=True), service=_Service(), link_client=link
+        )
+        callbacks = []
+
+        async def handler(event):
+            callbacks.append(event)
+            if event.message_id.endswith("0002"):
+                result = await adapter.send_model_picker(
+                    chat_id="shared-session-coordinate",
+                    providers=[{"slug": "openai", "name": "OpenAI", "models": ["gpt-5.6"]}],
+                    current_model="gpt-5.6",
+                    current_provider="openai",
+                    session_key="loopdy:shared-session",
+                    on_model_selected=AsyncMock(),
+                )
+                self.assertTrue(result.success)
+
+        adapter._message_handler = handler
+        first = InboundLinkPickerOpen(
+            request=PickerOpen(
+                request_id="picker_request_overlap_0001",
+                session_id="shared-session-coordinate",
+                agent_id="finance",
+                kind="model",
+                sent_at=1_788_000_043,
+            ),
+            sender_device_id="mobile-private-coordinate",
+        )
+        second = InboundLinkPickerOpen(
+            request=PickerOpen(
+                request_id="picker_request_overlap_0002",
+                session_id="shared-session-coordinate",
+                agent_id="finance",
+                kind="model",
+                sent_at=1_788_000_044,
+            ),
+            sender_device_id="mobile-private-coordinate",
+        )
+
+        async def run() -> None:
+            await adapter.receive_link_payload(first)
+            await adapter.receive_link_payload(second)
+            late = await adapter.send_model_picker(
+                chat_id="shared-session-coordinate",
+                providers=[{"slug": "openai", "name": "OpenAI", "models": ["gpt-5.5"]}],
+                current_model="gpt-5.5",
+                current_provider="openai",
+                session_key="loopdy:shared-session",
+                on_model_selected=AsyncMock(),
+            )
+            self.assertFalse(late.success)
+
+        asyncio.run(run())
+
+        self.assertEqual(
+            [(item["type"], item["pickerId"]) for item in link.payloads],
+            [
+                ("picker.result", first.request.request_id),
+                ("picker.model", second.request.request_id),
+            ],
+        )
+
     def test_reasoning_picker_rejects_replay_from_another_device_and_accepts_allowed_choice(self) -> None:
         from loopdy_plugin.link_client import (
             InboundLinkPickerOpen,
@@ -1845,8 +1922,22 @@ class AdapterTests(unittest.TestCase):
         adapter = LoopdyAdapter(
             PlatformConfig(enabled=True), service=_Service(), link_client=link
         )
-        adapter._message_handler = AsyncMock()
         callback = AsyncMock(return_value="Reasoning effort set to high.")
+        picker_results = []
+
+        async def handler(event):
+            picker_results.append(await adapter.send_choice_picker(
+                chat_id="session-coordinate-0001",
+                title="Reasoning effort · Medium",
+                choices=[
+                    {"value": "low", "label": "Low", "is_current": False},
+                    {"value": "high", "label": "High", "is_current": False},
+                ],
+                session_key="loopdy:session-coordinate-0001",
+                on_choice_selected=callback,
+            ))
+
+        adapter._message_handler = AsyncMock(side_effect=handler)
         open_message = InboundLinkPickerOpen(
             request=PickerOpen(
                 request_id="picker_request_fixture_0002",
@@ -1867,17 +1958,7 @@ class AdapterTests(unittest.TestCase):
 
         async def run() -> None:
             await adapter.receive_link_payload(open_message)
-            result = await adapter.send_choice_picker(
-                chat_id="session-coordinate-0001",
-                title="Reasoning effort · Medium",
-                choices=[
-                    {"value": "low", "label": "Low", "is_current": False},
-                    {"value": "high", "label": "High", "is_current": False},
-                ],
-                session_key="loopdy:session-coordinate-0001",
-                on_choice_selected=callback,
-            )
-            self.assertTrue(result.success)
+            self.assertTrue(picker_results[0].success)
             await adapter.receive_link_payload(
                 InboundLinkPickerSelection(
                     selection=selection,
@@ -2552,7 +2633,7 @@ class AdapterTests(unittest.TestCase):
     def test_gateway_runtime_cwd_bridge_uses_persisted_workspace_in_real_prompt(self) -> None:
         from agent.prompt_builder import build_environment_hints
         from agent.runtime_cwd import resolve_agent_cwd
-        from tools.terminal_tool import clear_task_env_overrides
+        from tools.terminal_tool import clear_task_env_overrides, terminal_tool
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2560,6 +2641,10 @@ class AdapterTests(unittest.TestCase):
             configured_home = root / "configured-home"
             selected.mkdir()
             configured_home.mkdir()
+            subprocess.run(
+                ["git", "init", "-q", str(selected)],
+                check=True,
+            )
             session_key = "agent:main:loopdy:dm:loopdy-chat-persisted"
             session_id = "canonical-session-persisted"
 
@@ -2609,6 +2694,11 @@ class AdapterTests(unittest.TestCase):
                 try:
                     self.assertEqual(resolve_agent_cwd(), selected)
                     prompt = build_environment_hints()
+                    terminal = json.loads(terminal_tool(
+                        "pwd; git rev-parse --show-toplevel",
+                        task_id=session_key,
+                        timeout=30,
+                    ))
                 finally:
                     runner._clear_session_env(tokens)
                 self.assertEqual(resolve_agent_cwd(), configured_home)
@@ -2617,6 +2707,11 @@ class AdapterTests(unittest.TestCase):
             self.assertNotIn(
                 f"Current working directory: {configured_home}",
                 prompt,
+            )
+            self.assertEqual(terminal["exit_code"], 0)
+            self.assertEqual(
+                [Path(value).resolve() for value in terminal["output"].strip().splitlines()],
+                [selected.resolve(), selected.resolve()],
             )
 
     def test_pending_first_turn_workspace_reaches_real_runtime_prompt(self) -> None:

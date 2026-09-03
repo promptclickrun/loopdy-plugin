@@ -95,6 +95,10 @@ _link_workspace_connection: contextvars.ContextVar[str] = contextvars.ContextVar
     "link_workspace_connection",
     default="",
 )
+_picker_request_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "loopdy_picker_request_id",
+    default="",
+)
 
 
 @dataclass(frozen=True)
@@ -252,8 +256,16 @@ def _install_runtime_cwd_bridge(runner: Any) -> None:
             cwd = _loopdy_runtime_cwd(runner, context)
             if cwd:
                 from agent.runtime_cwd import set_session_cwd
+                from tools.terminal_tool import register_task_env_overrides
 
                 set_session_cwd(cwd)
+                override = {"cwd": cwd, "cwd_source": "project"}
+                for coordinate in (
+                    str(getattr(context, "session_key", "") or "").strip(),
+                    str(getattr(context, "session_id", "") or "").strip(),
+                ):
+                    if coordinate:
+                        register_task_env_overrides(coordinate, override)
         except Exception:
             logger.warning(
                 "Loopdy could not restore Hermes runtime cwd for session %s",
@@ -300,6 +312,7 @@ class LoopdyAdapter(BasePlatformAdapter):
                 service=self.service,
                 session_workspace_setter=self._set_link_session_workspace,
                 session_workspace_getter=self._get_link_session_workspace,
+                session_active_getter=self._is_link_session_active,
                 connection_id_getter=self._link_workspace_connection_id,
                 workspace_git_state_path=(
                     get_hermes_home()
@@ -311,7 +324,7 @@ class LoopdyAdapter(BasePlatformAdapter):
         )
         self.voice_synthesizer = voice_synthesizer
         self._voice_tasks: set[asyncio.Task[None]] = set()
-        self._pending_picker_requests: dict[tuple[str, str], _PendingPickerRequest] = {}
+        self._pending_picker_requests: dict[str, _PendingPickerRequest] = {}
         self._active_pickers: dict[str, _ActivePicker] = {}
         self._link_session_profiles: OrderedDict[str, str] = OrderedDict()
         self._link_session_workspaces: OrderedDict[tuple[str, str], str] = OrderedDict()
@@ -403,7 +416,18 @@ class LoopdyAdapter(BasePlatformAdapter):
         model = str(getattr(agent, "model", "") or "").strip()
         if not model or not maximum:
             return None
-        return {
+
+        title = ""
+        session_db = getattr(runner, "_session_db", None)
+        session_db = getattr(session_db, "_db", session_db)
+        title_reader = getattr(session_db, "get_session_title", None)
+        if callable(title_reader):
+            try:
+                title = str(title_reader(session_id) or "").strip()[:240]
+            except Exception:
+                title = ""
+
+        snapshot = {
             "model": model,
             "contextUsed": used,
             "contextMax": maximum,
@@ -415,6 +439,9 @@ class LoopdyAdapter(BasePlatformAdapter):
                 getattr(agent, "_active_compression_lock_holder", None) is not None
             ),
         }
+        if title:
+            snapshot["title"] = title
+        return snapshot
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         _install_runtime_cwd_bridge(getattr(self, "gateway_runner", None))
@@ -1161,7 +1188,11 @@ class LoopdyAdapter(BasePlatformAdapter):
         del session_key, metadata
         if self.link_client is None:
             return SendResult(success=False, error="Loopdy Link is not connected")
-        pending = self._take_pending_picker(str(chat_id), "model")
+        pending = self._take_pending_picker(
+            request_id=_picker_request_id.get(),
+            session_id=str(chat_id),
+            kind="model",
+        )
         if pending is None:
             return SendResult(success=False, error="No active Loopdy model request")
         try:
@@ -1194,6 +1225,10 @@ class LoopdyAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=pending.request.request_id)
         except Exception as exc:
             self._active_pickers.pop(pending.request.request_id, None)
+            await self._send_picker_open_failure(
+                pending.request,
+                "Hermes could not open this model picker. Try again.",
+            )
             return SendResult(
                 success=False,
                 error=f"Loopdy model picker failed ({type(exc).__name__})",
@@ -1211,7 +1246,11 @@ class LoopdyAdapter(BasePlatformAdapter):
         del session_key, metadata
         if self.link_client is None:
             return SendResult(success=False, error="Loopdy Link is not connected")
-        pending = self._take_pending_picker(str(chat_id), "reasoning")
+        pending = self._take_pending_picker(
+            request_id=_picker_request_id.get(),
+            session_id=str(chat_id),
+            kind="reasoning",
+        )
         if pending is None:
             return SendResult(success=False, error="No active Loopdy reasoning request")
         try:
@@ -1238,6 +1277,10 @@ class LoopdyAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=pending.request.request_id)
         except Exception as exc:
             self._active_pickers.pop(pending.request.request_id, None)
+            await self._send_picker_open_failure(
+                pending.request,
+                "Hermes could not open this reasoning picker. Try again.",
+            )
             return SendResult(
                 success=False,
                 error=f"Loopdy reasoning picker failed ({type(exc).__name__})",
@@ -1354,6 +1397,27 @@ class LoopdyAdapter(BasePlatformAdapter):
             ),
             profile=self._session_key_profile(source),
         )
+
+    def _is_link_session_active(
+        self,
+        agent_id: str,
+        session_id: str,
+        _stored_id: str,
+    ) -> bool:
+        """Reconcile persisted catalog activity with the live Hermes owner."""
+        source = self.build_source(
+            chat_id=session_id,
+            chat_name="Loopdy chat",
+            chat_type="dm",
+            user_id="loopdy-session-state",
+            user_name="Loopdy",
+            message_id="loopdy-session-state-refresh",
+        )
+        source.profile = agent_id
+        session_key = self._link_session_key(source)
+        if session_key in self._active_sessions:
+            self._heal_stale_session_lock(session_key)
+        return session_key in self._active_sessions
 
     def _has_pending_link_intercept(self, source: SessionSource) -> bool:
         """Keep Hermes approval/clarification replies on the normal text path."""
@@ -1927,8 +1991,7 @@ class LoopdyAdapter(BasePlatformAdapter):
     async def _receive_picker_open(self, inbound: InboundLinkPickerOpen) -> None:
         self._clean_picker_state()
         request = inbound.request
-        key = (request.session_id, request.kind)
-        self._pending_picker_requests[key] = _PendingPickerRequest(
+        self._pending_picker_requests[request.request_id] = _PendingPickerRequest(
             request=request,
             sender_device_id=inbound.sender_device_id,
             expires_at=time.monotonic() + 60,
@@ -1961,25 +2024,34 @@ class LoopdyAdapter(BasePlatformAdapter):
         )
         handler = getattr(self, "_message_handler", None)
         if not callable(handler):
-            self._pending_picker_requests.pop(key, None)
+            self._pending_picker_requests.pop(request.request_id, None)
             await self._send_picker_open_failure(
                 request,
                 "Hermes could not open this picker because its message handler is unavailable.",
             )
             return
         try:
-            result = handler(event)
-            if inspect.isawaitable(result):
-                await result
+            token = _picker_request_id.set(request.request_id)
+            try:
+                result = handler(event)
+                if inspect.isawaitable(result):
+                    await result
+            finally:
+                _picker_request_id.reset(token)
         except Exception:
             # The native picker is best effort.  Its control response must
             # never become a normal assistant message or interrupt a chat.
-            self._pending_picker_requests.pop(key, None)
+            self._pending_picker_requests.pop(request.request_id, None)
             await self._send_picker_open_failure(
                 request,
                 "Hermes could not open this picker. Try again.",
             )
             return
+        if self._pending_picker_requests.pop(request.request_id, None) is not None:
+            await self._send_picker_open_failure(
+                request,
+                "Hermes completed this request without opening a native picker. Try again.",
+            )
 
     async def _send_picker_open_failure(
         self, request: PickerOpen, message: str
@@ -2070,10 +2142,17 @@ class LoopdyAdapter(BasePlatformAdapter):
             return
 
     def _take_pending_picker(
-        self, session_id: str, kind: str
+        self, request_id: str, session_id: str, kind: str
     ) -> _PendingPickerRequest | None:
         self._clean_picker_state()
-        return self._pending_picker_requests.pop((session_id, kind), None)
+        if not request_id:
+            return None
+        pending = self._pending_picker_requests.get(request_id)
+        if pending is None:
+            return None
+        if pending.request.session_id != session_id or pending.request.kind != kind:
+            return None
+        return self._pending_picker_requests.pop(request_id, None)
 
     def _remember_picker(self, state: _ActivePicker) -> None:
         self._clean_picker_state()

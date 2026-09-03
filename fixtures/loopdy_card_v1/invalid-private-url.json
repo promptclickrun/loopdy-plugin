@@ -1,0 +1,26 @@
+{
+  "schema": "loopdy.card",
+  "version": 1,
+  "title": "Unsafe source",
+  "spoken_summary": "This fixture must never be accepted.",
+  "data_sources": [
+    {
+      "id": "private",
+      "request": { "method": "GET", "url": "https://router.local/status" },
+      "response": { "format": "json", "root": "" },
+      "refresh": {
+        "minimum_interval_seconds": 60,
+        "stale_after_seconds": 60,
+        "expires_at": "2026-09-03T12:00:00Z"
+      }
+    }
+  ],
+  "root": "card",
+  "elements": {
+    "card": {
+      "type": "card",
+      "props": { "title": "Unsafe source" },
+      "children": []
+    }
+  }
+}

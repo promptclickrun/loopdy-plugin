@@ -607,6 +607,24 @@ class LoopdyLinkClient:
             if has_previous and frame.sequence != previous + 1:
                 raise ValueError("Loopdy Link inbound sequence is invalid")
         payload = self.cipher.open(frame.ciphertext)
+        target_host_id = payload.pop("targetHostId", None)
+        if target_host_id is not None:
+            if (
+                not isinstance(target_host_id, str)
+                or not 1 <= len(target_host_id) <= 96
+                or any(
+                    not character.isascii()
+                    or not (character.isalnum() or character in "_-")
+                    for character in target_host_id
+                )
+            ):
+                raise ValueError("Loopdy Link target host is invalid")
+            if target_host_id != self.config.device_id:
+                if defer_callbacks:
+                    self._enqueue_inbound_callback(callback, frame, None)
+                else:
+                    await self._accept_inbound_frame(frame)
+                return False
         inbound: (
             InboundLinkTurn
             | _InboundLinkTurnFailure

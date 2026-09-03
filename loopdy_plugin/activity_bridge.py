@@ -55,6 +55,7 @@ class LinkActivityBroker:
         self._context_task: asyncio.Task[None] | None = None
         self._active: OrderedDict[tuple[str, str], str] = OrderedDict()
         self._bound_sessions: OrderedDict[str, str] = OrderedDict()
+        self._child_routes: OrderedDict[str, tuple[str, str, str]] = OrderedDict()
         self._session_resolver: Callable[[str], Any] | None = None
         self._context_provider: Callable[[str], dict[str, Any] | None] | None = None
         self._context_signatures: dict[tuple[str, str], tuple[Any, ...]] = {}
@@ -102,6 +103,7 @@ class LinkActivityBroker:
                 self._context_task = None
                 self._active.clear()
                 self._bound_sessions.clear()
+                self._child_routes.clear()
                 self._context_signatures.clear()
                 self._live_state.clear()
             self._todo_signatures.clear()
@@ -139,6 +141,36 @@ class LinkActivityBroker:
             self._bound_sessions[hermes_session] = link_session
             while len(self._bound_sessions) > self.maximum_bound_sessions:
                 self._bound_sessions.popitem(last=False)
+
+    def register_child_route(
+        self, child_session_id: str, parent_link_session_id: str, parent_turn_id: str
+    ) -> None:
+        child = _coordinate(child_session_id, 180)
+        parent = _coordinate(parent_link_session_id, 128)
+        turn = _turn_coordinate(parent_turn_id)
+        if not child or not parent or not turn:
+            return
+        with self._lock:
+            self._child_routes.pop(child, None)
+            self._child_routes[child] = (parent, child, turn)
+            while len(self._child_routes) > self.maximum_bound_sessions:
+                self._child_routes.popitem(last=False)
+
+    def child_route(self, session_id: str) -> tuple[str, str, str] | None:
+        child = _coordinate(session_id, 180)
+        if not child:
+            return None
+        with self._lock:
+            route = self._child_routes.get(child)
+            if route is not None:
+                self._child_routes.move_to_end(child)
+            return route
+
+    def remove_child_route(self, session_id: str) -> None:
+        child = _coordinate(session_id, 180)
+        if child:
+            with self._lock:
+                self._child_routes.pop(child, None)
 
     def attach_session_store(self, session_store: Any) -> None:
         """Use Hermes' official session index for lifecycle-to-chat routing."""
@@ -219,6 +251,7 @@ class LinkActivityBroker:
         if not isinstance(snapshot, dict):
             return False
         signature = (
+            snapshot.get("title"),
             snapshot.get("model"),
             snapshot.get("contextUsed"),
             snapshot.get("contextMax"),
@@ -233,6 +266,7 @@ class LinkActivityBroker:
         try:
             payload = session_context(
                 session_id=link_session_id,
+                title=snapshot.get("title"),
                 model=snapshot.get("model"),
                 context_used=snapshot.get("contextUsed"),
                 context_max=snapshot.get("contextMax"),
@@ -299,6 +333,12 @@ class LinkActivityBroker:
         if not child_session_id or hook_name not in {"subagent_start", "subagent_stop"}:
             return False
         with self._status_lock:
+            parent_turn = _turn_coordinate(snapshot.get("parent_turn_id"))
+            parent_route = self.bound_link_session(
+                str(snapshot.get("parent_session_id") or "")
+            )
+            if hook_name == "subagent_start" and parent_route and parent_turn:
+                self.register_child_route(child_session_id, child_session_id, parent_turn)
             roster = self._subagent_rosters.setdefault(
                 link_session_id, OrderedDict()
             )
@@ -332,6 +372,8 @@ class LinkActivityBroker:
                     roster.popitem(last=False)
             elif roster.pop(child_session_id, None) is None:
                 return False
+            if hook_name == "subagent_stop":
+                self.remove_child_route(child_session_id)
             while len(self._subagent_rosters) > self.maximum_bound_sessions:
                 expired_session, _ = self._subagent_rosters.popitem(last=False)
                 self._subagent_signatures.pop(expired_session, None)
@@ -356,6 +398,30 @@ class LinkActivityBroker:
             if delivered:
                 self._subagent_signatures[link_session_id] = signature
                 self._subagent_signatures.move_to_end(link_session_id)
+            if parent_turn:
+                lifecycle = "running" if hook_name == "subagent_start" else _subagent_lifecycle(
+                    snapshot.get("child_status")
+                )
+                _publish(
+                    self,
+                    _event_id("delegate", child_session_id, parent_turn),
+                    child_session_id,
+                    parent_turn,
+                    "subagent",
+                    lifecycle,
+                    _safe_text(snapshot.get("child_role"), 80) or "Subagent",
+                    _safe_text(
+                        snapshot.get("child_goal")
+                        if hook_name == "subagent_start"
+                        else snapshot.get("child_summary"),
+                        500,
+                    ) or "Delegated work",
+                    None,
+                    occurred_at,
+                    subagent_id=_coordinate(
+                        snapshot.get("child_subagent_id"), 180
+                    ) or child_session_id,
+                )
             return delivered
 
     def publish(self, payload: dict[str, Any]) -> bool:
@@ -547,9 +613,17 @@ def publish_hook_activity(
     """Normalize one official Hermes hook without exposing raw tool payloads."""
 
     timestamp = int(occurred_at if occurred_at is not None else time.time())
+    child_route: tuple[str, str, str] | None = None
     if hook_name in {"pre_llm_call", "post_llm_call", "pre_tool_call", "post_tool_call"}:
         session_id = _coordinate(payload.get("session_id"), 128)
         turn_id = _turn_coordinate(payload.get("turn_id"))
+        route_resolver = getattr(broker, "child_route", None)
+        if session_id and callable(route_resolver):
+            candidate = route_resolver(session_id)
+            if isinstance(candidate, tuple) and len(candidate) == 3 and all(
+                isinstance(item, str) for item in candidate
+            ):
+                child_route = candidate
     else:
         session_id = _coordinate(payload.get("parent_session_id"), 128)
         turn_id = _turn_coordinate(payload.get("parent_turn_id"))
@@ -559,9 +633,12 @@ def publish_hook_activity(
     if hook_name == "pre_llm_call":
         if not turn_id:
             return
-        if str(payload.get("platform") or "").strip().lower() != "loopdy":
+        if (
+            str(payload.get("platform") or "").strip().lower() != "loopdy"
+            and child_route is None
+        ):
             return
-        link_session_id = broker.bound_link_session(session_id)
+        link_session_id = child_route[1] if child_route else broker.bound_link_session(session_id)
         if not link_session_id:
             return
         broker.activate(session_id, turn_id, link_session_id=link_session_id)
@@ -585,6 +662,8 @@ def publish_hook_activity(
     link_session_id = (
         broker.resolved_session_id(session_id, turn_id) if turn_id else None
     )
+    if child_route is not None:
+        link_session_id = child_route[1]
     bound_session_id = link_session_id
     if not bound_session_id:
         bound_resolver = getattr(broker, "bound_link_session", None)

@@ -1342,6 +1342,7 @@ def session_context(
     compressions: int,
     is_compacting: bool,
     updated_at: int,
+    title: str | None = None,
 ) -> dict[str, Any]:
     """Build the encrypted current-context projection for one Link chat."""
 
@@ -1352,7 +1353,7 @@ def session_context(
         raise ValueError("Loopdy Link contextPercent is invalid")
     if type(is_compacting) is not bool:
         raise ValueError("Loopdy Link isCompacting is invalid")
-    return {
+    value = {
         "version": 1,
         "type": "session.context",
         "sessionId": _session_coordinate(session_id),
@@ -1364,6 +1365,9 @@ def session_context(
         "isCompacting": is_compacting,
         "updatedAt": _positive(updated_at, "updatedAt"),
     }
+    if title is not None:
+        value["title"] = _activity_label(title, "title", 240)
+    return value
 
 
 def session_todos(

@@ -4,6 +4,7 @@ import gc
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -76,6 +77,34 @@ class WorkspaceGitTests(unittest.TestCase):
             self.assertEqual({item["path"] for item in status["files"]}, {"tracked.txt", "new file.txt"})
             self.assertTrue(status["status_token"].startswith("sha256:"))
             self.assertNotIn(str(root), repr(status))
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS filesystem path behavior")
+    def test_service_accepts_case_variant_path_to_git_worktree_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            root.mkdir()
+            git(root, "init", "-b", "main")
+            variant = root.with_name("REPO")
+            if not variant.exists() or not variant.samefile(root):
+                self.skipTest("case-sensitive filesystem")
+
+            service = WorkspaceGitService(
+                [{
+                    "workspace_id": "fixture",
+                    "label": "Fixture",
+                    "root": str(variant),
+                    "visibility": "private",
+                    "operations": ["status"],
+                    "remotes": [],
+                    "branches": [],
+                    "mutations_enabled": False,
+                }],
+                state_path=Path(directory) / "workspace-git.sqlite3",
+            )
+
+            status = service.status("fixture")
+
+        self.assertEqual(status["head"]["branch"], "main")
 
     def test_status_bounds_large_file_lists_and_marks_the_page_incomplete(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

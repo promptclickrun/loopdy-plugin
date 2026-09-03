@@ -409,7 +409,7 @@ def capabilities() -> dict[str, Any]:
     health = _active_service().health()
     return {
         "plugin": "loopdy",
-        "plugin_version": "2.2.11",
+        "plugin_version": "2.2.14",
         "schema_version": 2,
         "channel": "loopdy",
         "default_provider": "relay",

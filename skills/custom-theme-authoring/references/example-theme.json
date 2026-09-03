@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "themes": [
+    {
+      "id": "7d1b2f5e-88a4-4f89-9c5a-f838e2108c7f",
+      "name": "Midnight Citrus",
+      "font": "rounded",
+      "accentHex": "C04F00",
+      "light": {
+        "backgroundHex": "FFF9F2",
+        "primaryTextHex": "24180F",
+        "secondaryTextHex": "594536",
+        "tertiaryTextHex": "725C4B"
+      },
+      "dark": {
+        "backgroundHex": "15100C",
+        "primaryTextHex": "FFF8F0",
+        "secondaryTextHex": "E5D5C6",
+        "tertiaryTextHex": "C7B4A3"
+      }
+    }
+  ]
+}

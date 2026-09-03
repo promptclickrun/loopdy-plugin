@@ -336,6 +336,24 @@ class WorkspaceGitTests(unittest.TestCase):
             self.assertIsNotNone(page["next_offset"])
             self.assertLessEqual(len(json.dumps(page).encode("utf-8")), 160_000)
 
+    def test_diff_includes_complete_markdown_content_for_rendered_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, service = self.make_repo(directory)
+            markdown = "# Build notes\n\nRendered **Markdown** preview.\n"
+            (root / "README.md").write_text(markdown, encoding="utf-8")
+            status = service.status("fixture")
+
+            page = service.diff(
+                "fixture",
+                path="README.md",
+                side="worktree",
+                expected_status_token=status["status_token"],
+                offset=0,
+                limit=100,
+            )
+
+            self.assertEqual(page["preview_content"], markdown)
+
     def test_diff_rechecks_status_after_a_tracked_file_changes_during_projection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, service = self.make_repo(directory)

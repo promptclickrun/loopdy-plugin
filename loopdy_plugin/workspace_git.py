@@ -48,6 +48,7 @@ _MAX_DIFF_FILE_BYTES = 2_000_000
 _MAX_DIFF_LINES = 100_000
 _MAX_DIFF_LINE_BYTES = 16_000
 _MAX_DIFF_RESPONSE_BYTES = 160_000
+_MAX_MARKDOWN_PREVIEW_BYTES = 65_536
 _FIXED_ENV = {
     "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
     "LANG": "C.UTF-8",
@@ -272,6 +273,10 @@ class WorkspaceGitService:
             ):
                 raise WorkspaceGitError("INVALID_REQUEST", "Diff page is invalid")
             page = self._structured_diff_page(workspace, current, selected, side, offset, limit)
+            if offset == 0:
+                preview = self._markdown_preview(workspace, selected, side)
+                if preview is not None:
+                    page["preview_content"] = preview
             final = self.status(workspace_id)
             self._require_status(expected_status_token, final)
             return page
@@ -720,6 +725,38 @@ class WorkspaceGitService:
                 else:
                     availability, rows = _parse_unified_diff(raw)
         return _diff_page(path, side, availability, rows, offset, limit)
+
+    def _markdown_preview(
+        self,
+        workspace: Workspace,
+        path: str,
+        side: str,
+    ) -> str | None:
+        if PurePosixPath(path).suffix.lower() not in {".md", ".markdown"}:
+            return None
+        if side == "staged":
+            try:
+                raw, overflow = self._git_bounded(
+                    workspace,
+                    _MAX_MARKDOWN_PREVIEW_BYTES,
+                    "show",
+                    f":{path}",
+                )
+            except WorkspaceGitError:
+                return None
+        else:
+            raw = _read_workspace_file(
+                workspace.root,
+                path,
+                _MAX_MARKDOWN_PREVIEW_BYTES,
+            )
+            overflow = raw is None
+        if raw is None or overflow:
+            return None
+        try:
+            return raw.decode("utf-8", "strict")
+        except UnicodeDecodeError:
+            return None
 
     def _index_digest(self, workspace: Workspace) -> str:
         git_dir = Path(self._git_text(workspace, "rev-parse", "--git-dir"))

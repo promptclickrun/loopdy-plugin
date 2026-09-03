@@ -299,7 +299,7 @@ class DashboardApiTests(unittest.TestCase):
             capabilities = client.get("/capabilities")
             self.assertEqual(capabilities.status_code, 200)
             value = capabilities.json()
-            self.assertEqual(value["plugin_version"], "2.2.14")
+            self.assertEqual(value["plugin_version"], "2.2.15")
             self.assertEqual(value["default_provider"], "relay")
             self.assertEqual(value["detail_modes"], ["automatic", "minimal", "detailed"])
             self.assertTrue(value["capabilities"]["native_channel"])

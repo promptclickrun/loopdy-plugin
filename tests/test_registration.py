@@ -8,6 +8,7 @@ import json
 import stat
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -290,6 +291,48 @@ class RegistrationTests(unittest.TestCase):
         self.assertNotIn(":", cards[0]["turnId"])
         self.assertEqual(cards[0]["toolCallId"], "call_render_fixture_0001")
         self.assertEqual(cards[0]["card"]["component"], "summary")
+
+    def test_successful_loopdy_card_renderer_publishes_native_card_live(self) -> None:
+        from loopdy_plugin.loopdy_cards import render_card
+        from loopdy_plugin.registration import register
+
+        broker = _ActivityBroker()
+        context = _Context()
+        register(context, service=_Service(), activity_broker=broker)
+        session_id = "session_coordinate_card_0001"
+        turn_id = "session_coordinate_card_0001:session_coordinate_card_0001:abc12345"
+        broker.bind_link_session(session_id, "link_chat_coordinate_card_0001")
+        context.hooks["pre_llm_call"](
+            session_id=session_id,
+            turn_id=turn_id,
+            platform="loopdy",
+            profile_name="personal",
+        )
+        source = json.loads(
+            (PLUGIN_ROOT / "fixtures/loopdy_card_v1/static-metrics.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        rendered = render_card(
+            source,
+            now=datetime(2026, 9, 3, tzinfo=timezone.utc),
+        )
+
+        context.hooks["post_tool_call"](
+            session_id=session_id,
+            turn_id=turn_id,
+            profile_name="personal",
+            tool_name="loopdy_render_card",
+            tool_call_id="call_render_card_fixture_0001",
+            status="ok",
+            result=json.dumps(rendered),
+        )
+
+        cards = [item for item in broker.payloads if item["type"] == "generative.ui"]
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0]["sessionId"], "link_chat_coordinate_card_0001")
+        self.assertEqual(cards[0]["card"]["schema"], "loopdy.card")
+        self.assertEqual(cards[0]["card"]["content_hash"], rendered["content_hash"])
 
     def test_failed_or_unbound_renderer_tool_never_publishes_native_card(self) -> None:
         from loopdy_plugin.registration import register

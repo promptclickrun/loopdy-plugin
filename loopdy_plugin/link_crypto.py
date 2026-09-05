@@ -35,7 +35,7 @@ def _plaintext_limit(value: Any) -> int:
     operation = value.get("operation")
     if (
         message_type == "workspace.request"
-        and operation == "agents.avatar.set"
+        and operation in {"agents.avatar.set", "skills_tools.import"}
     ) or (
         message_type == "workspace.result"
         and operation == "agents.avatar.get"

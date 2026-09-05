@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import re
+import shlex
 import threading
 import time
 from collections import OrderedDict
@@ -25,6 +26,7 @@ from .link_contracts import (
 logger = logging.getLogger("hermes.plugins.loopdy.activity")
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9_-]+$")
 _INTERNAL_TURN = re.compile(r"^[A-Za-z0-9_:-]+$")
+
 _TOOL_TITLES = {
     "browser": "Using the browser",
     "clarify": "Waiting for your answer",
@@ -56,10 +58,16 @@ class LinkActivityBroker:
         self._active: OrderedDict[tuple[str, str], str] = OrderedDict()
         self._bound_sessions: OrderedDict[str, str] = OrderedDict()
         self._child_routes: OrderedDict[str, tuple[str, str, str]] = OrderedDict()
+        self._handoffs_by_process: OrderedDict[str, tuple[str, str, str]] = OrderedDict()
+
         self._session_resolver: Callable[[str], Any] | None = None
         self._context_provider: Callable[[str], dict[str, Any] | None] | None = None
         self._context_signatures: dict[tuple[str, str], tuple[Any, ...]] = {}
+        self._context_updated_at: dict[tuple[str, str], int] = {}
         self._status_lock = threading.Lock()
+        self._goal_provider: Callable[[str], dict[str, Any] | None] | None = None
+        self._goal_snapshots: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._goal_published_at: dict[str, float] = {}
         self._todo_signatures: OrderedDict[str, str] = OrderedDict()
         self._subagent_rosters: OrderedDict[
             str, OrderedDict[str, dict[str, Any]]
@@ -104,9 +112,14 @@ class LinkActivityBroker:
                 self._active.clear()
                 self._bound_sessions.clear()
                 self._child_routes.clear()
+                self._handoffs_by_process.clear()
+
                 self._context_signatures.clear()
+                self._context_updated_at.clear()
                 self._live_state.clear()
             self._todo_signatures.clear()
+            self._goal_snapshots.clear()
+            self._goal_published_at.clear()
             self._subagent_rosters.clear()
             self._subagent_signatures.clear()
         tasks = tuple(item for item in (task, context_task) if item is not None)
@@ -128,6 +141,7 @@ class LinkActivityBroker:
             self._active[coordinate] = link_session_id
             while len(self._active) > self.maximum_active_turns:
                 self._active.popitem(last=False)
+        self.bind_link_session(session_id, link_session_id)
 
     def bind_link_session(self, session_id: str, link_session_id: str) -> None:
         """Bind one verified Link chat to its canonical Hermes conversation."""
@@ -172,6 +186,46 @@ class LinkActivityBroker:
             with self._lock:
                 self._child_routes.pop(child, None)
 
+    def bind_handoff_process(
+        self,
+        process_id: str,
+        link_session_id: str,
+        target: str,
+        sender: str,
+    ) -> None:
+        process = _coordinate(process_id, 180)
+        link_session = _coordinate(link_session_id, 128)
+        target_member = _coordinate(target, 96)
+        sender_member = _coordinate(sender, 96)
+        if not all((process, link_session, target_member, sender_member)):
+            return
+        with self._lock:
+            self._handoffs_by_process.pop(process, None)
+            self._handoffs_by_process[process] = (
+                link_session,
+                target_member,
+                sender_member,
+            )
+            while len(self._handoffs_by_process) > self.maximum_bound_sessions:
+                self._handoffs_by_process.popitem(last=False)
+
+
+    def take_handoff_process(
+        self,
+        process_id: str,
+        link_session_id: str,
+    ) -> tuple[str, str] | None:
+        process = _coordinate(process_id, 180)
+        link_session = _coordinate(link_session_id, 128)
+        if not process or not link_session:
+            return None
+        with self._lock:
+            handoff = self._handoffs_by_process.get(process)
+            if handoff is None or handoff[0] != link_session:
+                return None
+            self._handoffs_by_process.pop(process, None)
+        return handoff[1], handoff[2]
+
     def attach_session_store(self, session_store: Any) -> None:
         """Use Hermes' official session index for lifecycle-to-chat routing."""
 
@@ -214,6 +268,92 @@ class LinkActivityBroker:
             return None
         return _coordinate(getattr(origin, "chat_id", None), 128)
 
+    def attach_goal_provider(
+        self, provider: Callable[[str], dict[str, Any] | None]
+    ) -> None:
+        with self._status_lock:
+            self._goal_provider = provider if callable(provider) else None
+
+    def goal_snapshot(self, session_id: str) -> dict[str, Any] | None:
+        """Read a goal under the same lock that orders its observations.
+
+        None means unavailable, not no goal. The provider must prove the
+        current Hermes-to-Link route and explicitly return status=none for a
+        successful absent-row read. Old/foreign session hooks cannot supply
+        their own state or get a new timestamp for an old read.
+        """
+        with self._status_lock:
+            return self._goal_snapshot_locked(session_id)
+
+    def _goal_snapshot_locked(self, session_id: str) -> dict[str, Any] | None:
+        if self._goal_provider is None:
+            return None
+        try:
+            state = self._goal_provider(session_id)
+        except Exception as exc:
+            logger.warning("Loopdy goal snapshot failed (%s)", type(exc).__name__)
+            return None
+        if not isinstance(state, dict):
+            return None
+        link_session_id = _coordinate(state.get("sessionId"), 128)
+        stored_session_id = _coordinate(state.get("storedSessionId"), 128)
+        if not link_session_id or stored_session_id != session_id:
+            return None
+        status = state.get("status")
+        if not isinstance(status, str) or status not in {"active", "paused", "done", "cleared", "none"}:
+            return None
+        summary = state.get("summary")
+        if status in {"active", "paused"}:
+            if not isinstance(summary, str) or not summary.strip():
+                return None
+            summary = _safe_text(summary, 2_000)
+            if not summary:
+                return None
+        else:
+            summary = None
+        previous = self._goal_snapshots.get(link_session_id)
+        if previous and (
+            previous["storedSessionId"], previous["status"], previous["summary"]
+        ) == (stored_session_id, status, summary):
+            self._goal_snapshots.move_to_end(link_session_id)
+            return dict(previous)
+        payload = {
+            "version": 1,
+            "type": "session.goal",
+            "sessionId": link_session_id,
+            "storedSessionId": stored_session_id,
+            "status": status,
+            "summary": summary,
+            "updatedAt": max(
+                time.time_ns() // 1_000_000,
+                (previous["updatedAt"] + 1) if previous else 1,
+            ),
+        }
+        self._goal_snapshots[link_session_id] = payload
+        self._goal_snapshots.move_to_end(link_session_id)
+        self._goal_published_at.pop(link_session_id, None)
+        while len(self._goal_snapshots) > self.maximum_bound_sessions:
+            evicted, _ = self._goal_snapshots.popitem(last=False)
+            self._goal_published_at.pop(evicted, None)
+        return dict(payload)
+
+    def publish_goal_snapshot(self, session_id: str, *, force: bool = False) -> bool:
+        with self._status_lock:
+            payload = self._goal_snapshot_locked(session_id)
+            if payload is None:
+                return False
+            route = payload["sessionId"]
+            now = time.monotonic()
+            last = self._goal_published_at.get(route)
+            # Periodic retransmission heals bounded-queue drops and reconnects,
+            # even when no subsequent turn or goal mutation occurs.
+            if not force and last is not None and now - last < 30:
+                return False
+            delivered = self.publish(payload)
+            if delivered:
+                self._goal_published_at[route] = now
+            return delivered
+
     def is_active(self, session_id: str, turn_id: str) -> bool:
         with self._lock:
             return (session_id, turn_id) in self._active
@@ -226,6 +366,7 @@ class LinkActivityBroker:
         with self._lock:
             self._active.pop((session_id, turn_id), None)
             self._context_signatures.pop((session_id, turn_id), None)
+            self._context_updated_at.pop((session_id, turn_id), None)
 
     def publish_context_window(
         self,
@@ -258,11 +399,21 @@ class LinkActivityBroker:
             snapshot.get("contextPercent"),
             snapshot.get("compressions"),
             snapshot.get("isCompacting"),
+            snapshot.get("inputTokens"),
+            snapshot.get("outputTokens"),
+            snapshot.get("cachedTokens"),
+            snapshot.get("totalTokens"),
         )
         with self._lock:
             if not force and self._context_signatures.get(coordinate) == signature:
                 return False
             self._context_signatures[coordinate] = signature
+            updated_at = int(occurred_at if occurred_at is not None else time.time())
+            updated_at = max(
+                updated_at,
+                self._context_updated_at.get(coordinate, updated_at - 1) + 1,
+            )
+            self._context_updated_at[coordinate] = updated_at
         try:
             payload = session_context(
                 session_id=link_session_id,
@@ -273,12 +424,17 @@ class LinkActivityBroker:
                 context_percent=snapshot.get("contextPercent"),
                 compressions=snapshot.get("compressions"),
                 is_compacting=snapshot.get("isCompacting"),
-                updated_at=int(occurred_at if occurred_at is not None else time.time()),
+                updated_at=updated_at,
+                input_tokens=snapshot.get("inputTokens"),
+                output_tokens=snapshot.get("outputTokens"),
+                cached_tokens=snapshot.get("cachedTokens"),
+                total_tokens=snapshot.get("totalTokens"),
             )
         except (TypeError, ValueError):
             with self._lock:
                 if self._context_signatures.get(coordinate) == signature:
                     self._context_signatures.pop(coordinate, None)
+                    self._context_updated_at.pop(coordinate, None)
             logger.warning("Hermes context snapshot was invalid")
             return False
         return self.publish(payload)
@@ -522,8 +678,14 @@ class LinkActivityBroker:
             await asyncio.sleep(max(0.01, self.context_poll_interval_seconds))
             with self._lock:
                 active = tuple(self._active)
+                bound = tuple(self._bound_sessions)
             for session_id, turn_id in active:
                 self.publish_context_window(session_id, turn_id)
+            # The goal judge runs AFTER post_llm_call deactivates a turn. A
+            # standing goal must therefore remain observed while the chat is
+            # idle; terminal/tool events are refresh triggers, not verdicts.
+            for session_id in bound:
+                await asyncio.to_thread(self.publish_goal_snapshot, session_id)
 
     def _project_live_activity(self, payload: dict[str, Any]) -> dict[str, Any] | None:
         if payload.get("version") != 1 or payload.get("type") != "activity.event":
@@ -642,6 +804,37 @@ def publish_hook_activity(
         if not link_session_id:
             return
         broker.activate(session_id, turn_id, link_session_id=link_session_id)
+        completion = _background_handoff_completion(payload.get("user_message"))
+        resolver = getattr(broker, "take_handoff_process", None)
+        handoff = (
+            resolver(completion[0], link_session_id)
+            if completion is not None and callable(resolver)
+            else None
+        )
+        if (
+            completion is not None
+            and isinstance(handoff, tuple)
+            and len(handoff) == 2
+            and all(isinstance(item, str) for item in handoff)
+        ):
+            process_id, output, succeeded = completion
+            target, sender = handoff
+            _publish(
+                broker,
+                _event_id("handoff_return", link_session_id, process_id),
+                link_session_id,
+                turn_id,
+                "bot_handoff",
+                "succeeded" if succeeded else "failed",
+                "Agent reply",
+                f"@{target} replied" if succeeded else f"@{target} could not reply",
+                None,
+                timestamp,
+                result=output or None,
+                bot_run_id=process_id,
+                member_id=sender,
+                from_member_id=target,
+            )
         publish_context = getattr(broker, "publish_context_window", None)
         if callable(publish_context):
             publish_context(session_id, turn_id, occurred_at=timestamp)
@@ -668,9 +861,16 @@ def publish_hook_activity(
     if not bound_session_id:
         bound_resolver = getattr(broker, "bound_link_session", None)
         if callable(bound_resolver):
-            bound_session_id = bound_resolver(session_id)
+            bound_session_id = _coordinate(bound_resolver(session_id), 128) or None
+    if not link_session_id:
+        link_session_id = bound_session_id
 
     if hook_name == "post_tool_call" and bound_session_id:
+        publish_goal = getattr(broker, "publish_goal_snapshot", None)
+        if callable(publish_goal):
+            # A terminal tool can mutate goal state; its arguments/results
+            # cannot prove it did. Re-read Hermes instead of parsing either.
+            publish_goal(session_id)
         if (
             _coordinate(payload.get("tool_name"), 80) == "todo"
             and _tool_lifecycle(payload.get("status")) == "succeeded"
@@ -722,6 +922,27 @@ def publish_hook_activity(
         tool_call_id = _coordinate(payload.get("tool_call_id"), 180)
         if not tool_name or not tool_call_id:
             return
+        if tool_name in {"message_agent", "terminal"}:
+            request = _collaboration_request(tool_name, payload.get("args"))
+            if request is not None:
+                target, message = request
+                _publish(
+                    broker,
+                    _event_id("handoff", link_session_id, turn_id, tool_call_id),
+                    link_session_id,
+                    turn_id,
+                    "bot_handoff",
+                    "running",
+                    f"Contacting @{target}",
+                    f"Message sent to @{target}",
+                    None,
+                    timestamp,
+                    arguments=message,
+                    bot_run_id=tool_call_id,
+                    member_id=target,
+                    from_member_id=_profile_member_id(profile),
+                )
+                return
         _publish(
             broker,
             _event_id("tool", link_session_id, turn_id, tool_call_id),
@@ -746,6 +967,42 @@ def publish_hook_activity(
             return
         lifecycle = _tool_lifecycle(payload.get("status"))
         duration = _duration(payload.get("duration_ms"))
+        if tool_name in {"message_agent", "terminal"}:
+            request = _collaboration_request(tool_name, payload.get("args"))
+            if request is not None:
+                target, message = request
+                process_id = (
+                    _agent_message_process_id(
+                        payload.get("result"),
+                        accepts_legacy_terminal_result=tool_name == "terminal",
+                    )
+                    if lifecycle == "succeeded"
+                    else None
+                )
+                binder = getattr(broker, "bind_handoff_process", None)
+                sender = _profile_member_id(profile)
+                if process_id is not None and callable(binder):
+                    binder(process_id, link_session_id, target, sender)
+
+                _publish(
+                    broker,
+                    _event_id("handoff", link_session_id, turn_id, tool_call_id),
+                    link_session_id,
+                    turn_id,
+                    "bot_handoff",
+                    lifecycle,
+                    f"Contacting @{target}",
+                    "Message accepted" if lifecycle == "succeeded" else "Message was not sent",
+                    _duration_label(duration),
+                    timestamp,
+                    arguments=message,
+                    result=(None if lifecycle == "succeeded" else _tool_detail(payload.get("result"))),
+                    duration_ms=duration,
+                    bot_run_id=tool_call_id,
+                    member_id=target,
+                    from_member_id=sender,
+                )
+                return
         _publish(
             broker,
             _event_id("tool", link_session_id, turn_id, tool_call_id),
@@ -868,6 +1125,121 @@ def external_turn_id(session_id: str, turn_id: str) -> str:
     """Project an internal Hermes turn coordinate into the opaque Link contract."""
 
     return _event_id("turn", session_id, turn_id)
+
+
+def _profile_member_id(profile: str) -> str:
+    member_id = _coordinate(profile, 96)
+    return "default" if member_id in {"", "hermes"} else member_id
+
+
+
+def _agent_message_process_id(
+    value: Any,
+    *,
+    accepts_legacy_terminal_result: bool,
+) -> str | None:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(value, dict):
+        return None
+    status = value.get("status")
+    process_id = value.get("process_id") or value.get("session_id")
+    if status != "sent" and not (
+        accepts_legacy_terminal_result and status == "running"
+    ):
+        return None
+    return _coordinate(process_id, 180) or None
+
+
+def _background_handoff_completion(
+    value: Any,
+) -> tuple[str, str, bool] | None:
+    if not isinstance(value, str) or len(value.encode("utf-8")) > 1_065_000:
+        return None
+    marker = "Background process "
+    start = value.find(marker)
+    if start < 0:
+        return None
+    tail = value[start + len(marker):]
+    raw_process = tail.split(maxsplit=1)[0] if tail else ""
+    process_id = _coordinate(raw_process, 180)
+    if not process_id:
+        return None
+    output_marker = "\nOutput:\n"
+    output = value.split(output_marker, 1)[1].strip() if output_marker in value else ""
+    if len(output.encode("utf-8")) > 64_000:
+        return None
+    succeeded = "completed normally (exit code 0)" in value
+    return process_id, output, succeeded
+
+
+def _agent_message_request(value: Any) -> tuple[str, str] | None:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(value, dict):
+        return None
+    raw_target = value.get("target")
+    message = value.get("message")
+    if not isinstance(raw_target, str) or not isinstance(message, str):
+        return None
+    target = raw_target.strip().removeprefix("@")
+    if target == "hermes":
+        target = "default"
+    target = _coordinate(target, 96)
+    if not target or not message.strip() or len(message.encode("utf-8")) > 64_000:
+        return None
+    return target, message
+
+
+def _collaboration_request(tool_name: str, value: Any) -> tuple[str, str] | None:
+    if tool_name == "message_agent":
+        return _agent_message_request(value)
+    return _legacy_agent_message_request(value) if tool_name == "terminal" else None
+
+
+def _legacy_agent_message_request(value: Any) -> tuple[str, str] | None:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(value, dict) or not isinstance(value.get("command"), str):
+        return None
+    if "\n" in value["command"] or "\r" in value["command"]:
+        return None
+    lexer = shlex.shlex(value["command"], posix=True, punctuation_chars=";&|")
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        words = list(lexer)
+    except ValueError:
+        return None
+    if any(word and set(word) <= set(";&|") for word in words):
+        return None
+    if len(words) < 4 or words[0].rsplit("/", 1)[-1] != "hermes":
+        return None
+    if words[1] != "-p" or words[3] != "chat":
+        return None
+
+    def argument(flag: str) -> str | None:
+        try:
+            index = words.index(flag)
+        except ValueError:
+            return None
+        return words[index + 1] if index + 1 < len(words) else None
+
+    if argument("-c") != "Bot Chat":
+        return None
+    message = argument("-q") or argument("--query")
+    if message is None:
+        return None
+    return _agent_message_request({"target": words[2], "message": message})
 
 
 def _coordinate(value: Any, maximum: int) -> str:

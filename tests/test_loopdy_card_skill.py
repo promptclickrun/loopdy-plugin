@@ -4,8 +4,8 @@ import unittest
 from pathlib import Path
 
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-SKILL_ROOT = REPOSITORY_ROOT / "skills" / "generative-ui"
+SKILL_ROOT = Path(__file__).resolve().parents[1] / "skills" / "generative-ui"
+REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 
 
 class LoopdyCardSkillTests(unittest.TestCase):
@@ -65,7 +65,9 @@ class LoopdyCardSkillTests(unittest.TestCase):
             REPOSITORY_ROOT / "README.md",
             REPOSITORY_ROOT / "docs" / "LOOPDY_CARDS.md",
             REPOSITORY_ROOT / "docs" / "SECURITY_AND_PRIVACY.md",
-            REPOSITORY_ROOT / "PROTOCOL.md",
+            REPOSITORY_ROOT / "docs" / "ARCHITECTURE.md",
+            REPOSITORY_ROOT / "plugins" / "loopdy" / "README.md",
+            REPOSITORY_ROOT / "plugins" / "loopdy" / "PROTOCOL.md",
         )
         prohibited = (
             "Opening a live card",

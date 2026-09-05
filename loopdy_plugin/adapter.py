@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -48,6 +48,8 @@ from .link_contracts import (
     PickerSelection,
     SessionForkRequest,
     VoiceSpeakRequest,
+    WorkspaceRequest,
+    _session_coordinate,
     assistant_message,
     choice_picker_payload,
     command_catalog_payload,
@@ -56,10 +58,12 @@ from .link_contracts import (
     notification_event,
     picker_result,
     personality_catalog_payload,
+    session_context,
     session_fork_result,
     verified_fork_prefix,
     voice_audio_chunks,
     voice_speak_error,
+    workspace_capabilities,
     workspace_result,
 )
 from .generative_ui import (
@@ -86,6 +90,8 @@ _services_lock = threading.Lock()
 logger = logging.getLogger(__name__)
 _MAX_LINK_SESSION_PROFILE_BINDINGS = 4096
 _MAX_LINK_DRAFT_IDENTITIES = 512
+_MAX_LINK_METADATA_DEVICES = 256
+_LINK_DRAFT_MINIMUM_INTERVAL_SECONDS = 0.25
 _RUNTIME_CWD_BRIDGE_MARKER = "_loopdy_runtime_cwd_bridge_installed"
 _suppress_link_control_ephemeral: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "suppress_link_control_ephemeral",
@@ -313,6 +319,8 @@ class LoopdyAdapter(BasePlatformAdapter):
                 session_workspace_setter=self._set_link_session_workspace,
                 session_workspace_getter=self._get_link_session_workspace,
                 session_active_getter=self._is_link_session_active,
+                session_goal_getter=self.goal_snapshot_for_session,
+                session_runtime_getter=self.runtime_snapshot_for_session,
                 connection_id_getter=self._link_workspace_connection_id,
                 workspace_git_state_path=(
                     get_hermes_home()
@@ -326,12 +334,14 @@ class LoopdyAdapter(BasePlatformAdapter):
         self._voice_tasks: set[asyncio.Task[None]] = set()
         self._pending_picker_requests: dict[str, _PendingPickerRequest] = {}
         self._active_pickers: dict[str, _ActivePicker] = {}
+        self._link_metadata_devices: OrderedDict[str, None] = OrderedDict()
         self._link_session_profiles: OrderedDict[str, str] = OrderedDict()
         self._link_session_workspaces: OrderedDict[tuple[str, str], str] = OrderedDict()
         self._link_draft_messages: OrderedDict[tuple[str, int], str] = OrderedDict()
         self._link_active_drafts: OrderedDict[
             tuple[str, str], tuple[tuple[str, int], str]
         ] = OrderedDict()
+        self._link_draft_sent_at: OrderedDict[tuple[str, str], float] = OrderedDict()
         self._link_delivery_lock = asyncio.Lock()
         self.link_configuration_error = ""
         if self.link_client is None:
@@ -367,6 +377,131 @@ class LoopdyAdapter(BasePlatformAdapter):
         attach_context = getattr(self.activity_broker, "attach_context_provider", None)
         if callable(attach_context):
             attach_context(self._context_window_snapshot)
+        attach_goal = getattr(self.activity_broker, "attach_goal_provider", None)
+        if callable(attach_goal):
+            attach_goal(self._goal_state_snapshot)
+
+    def _goal_state_snapshot(self, session_id: str) -> dict[str, Any] | None:
+        """Read Hermes' documented goal:<session_id> metadata, without mutation.
+
+        load_goal() intentionally collapses storage failures into None. That
+        convenience API is unsuitable for reconciliation: only a successful
+        absent-row read is authoritative absence. Read the same public
+        SessionDB metadata through the owning gateway profile instead.
+        """
+        store = getattr(self, "_session_store", None)
+        lookup = getattr(store, "lookup_by_session_id", None)
+        db_for_session = getattr(store, "_db_for_session_id", None)
+        if not callable(lookup) or not callable(db_for_session):
+            return None
+        entry = lookup(session_id)
+        origin = getattr(entry, "origin", None)
+        if (
+            getattr(entry, "session_id", None) != session_id
+            or getattr(getattr(entry, "platform", None), "value", None) != "loopdy"
+            or getattr(getattr(origin, "platform", None), "value", None) != "loopdy"
+        ):
+            return None
+        route = getattr(origin, "chat_id", None)
+        if not isinstance(route, str) or not _is_link_chat_id(route):
+            return None
+        db = db_for_session(session_id)
+        get_meta = getattr(db, "get_meta", None)
+        if not callable(get_meta):
+            return None
+        raw = get_meta(f"goal:{session_id}")
+        if raw is None:
+            status, summary = "none", None
+        else:
+            # Reject malformed/unknown state rather than erasing a valid rail.
+            # Hermes' raw status is done (not a tool/turn's completed flag).
+            if not isinstance(raw, (str, bytes, bytearray)):
+                return None
+            state = json.loads(raw)
+            if not isinstance(state, dict):
+                return None
+            status = state.get("status")
+            if not isinstance(status, str) or status not in {"active", "paused", "done", "cleared"}:
+                return None
+            summary = state.get("goal") if status in {"active", "paused"} else None
+            if status in {"active", "paused"} and (
+                not isinstance(summary, str) or not summary.strip()
+            ):
+                return None
+        # Compression/reset may replace the route while the DB read is in
+        # flight. Do not stamp the former owner's state as a fresh snapshot.
+        current = lookup(session_id)
+        if (
+            getattr(current, "session_id", None) != session_id
+            or getattr(getattr(current, "origin", None), "chat_id", None) != route
+        ):
+            return None
+        return {
+            "sessionId": route, "storedSessionId": session_id,
+            "status": status, "summary": summary,
+        }
+
+    async def runtime_snapshot_for_session(self, agent_id: str, stored_id: str) -> dict[str, str] | None:
+        """Read an exact current session override through the public session store."""
+        store = getattr(self, "_session_store", None)
+        if store is None:
+            return None
+
+        def read():
+            entry = store.lookup_by_session_id(stored_id)
+            if entry is None or (getattr(entry.origin, "profile", None) or "default") != agent_id:
+                return None
+            key = entry.session_key
+            override = store.get_model_override(key)
+            if store.peek_session_id(key) != stored_id or not override:
+                return None
+            return {key: override[key] for key in ("model", "provider") if override.get(key)}
+
+        return await asyncio.to_thread(read)
+
+    async def goal_snapshot_for_session(
+        self, agent_id: str, session_id: str, stored_id: str
+    ) -> dict[str, Any] | None:
+        """Catalog/history readback seam for an already authorized session row.
+
+        The workspace owner calls this with the resolved profile, visible
+        route and exact stored id. Mismatched/retired rows are unavailable,
+        never aliased onto the current conversation's goal.
+        """
+        store = getattr(self, "_session_store", None)
+        lookup = getattr(store, "lookup_by_session_key", None)
+        snapshot = getattr(self.activity_broker, "goal_snapshot", None)
+        bind = getattr(self.activity_broker, "bind_link_session", None)
+        if not callable(lookup) or not callable(snapshot) or not callable(bind):
+            return None
+        source = self.build_source(chat_id=session_id, chat_type="dm")
+        source.profile = agent_id
+        try:
+            entry = await asyncio.to_thread(lookup, self._link_session_key(source))
+            if getattr(entry, "session_id", None) != stored_id:
+                return None
+            bind(stored_id, session_id)
+            result = await asyncio.to_thread(snapshot, stored_id)
+            return result if isinstance(result, dict) else None
+        except Exception as exc:
+            logger.warning("Loopdy goal readback failed (%s)", type(exc).__name__)
+            return None
+
+    async def _refresh_goal_for_source(self, source: SessionSource) -> None:
+        store = getattr(self, "_session_store", None)
+        lookup = getattr(store, "lookup_by_session_key", None)
+        publish = getattr(self.activity_broker, "publish_goal_snapshot", None)
+        bind = getattr(self.activity_broker, "bind_link_session", None)
+        if not callable(lookup) or not callable(publish) or not callable(bind):
+            return
+        try:
+            entry = await asyncio.to_thread(lookup, self._link_session_key(source))
+            session_id = getattr(entry, "session_id", None)
+            if session_id:
+                bind(session_id, source.chat_id)
+                await asyncio.to_thread(publish, session_id, force=True)
+        except Exception as exc:
+            logger.warning("Loopdy goal refresh failed (%s)", type(exc).__name__)
 
     def _context_window_snapshot(self, session_id: str) -> dict[str, Any] | None:
         """Read the live/cached gateway state used by Hermes /status and /context."""
@@ -441,6 +576,72 @@ class LoopdyAdapter(BasePlatformAdapter):
         }
         if title:
             snapshot["title"] = title
+
+        # Token accounting is optional. Hermes runtimes that do not expose a
+        # usage counter omit the key so Loopdy renders the window-only summary
+        # instead of a misleading zero.
+        def optional_token(*candidates: Any) -> int | None:
+            for holder, name in candidates:
+                if holder is None:
+                    continue
+                raw = getattr(holder, name, None)
+                if raw is None:
+                    continue
+                try:
+                    parsed = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                if parsed >= 0:
+                    return parsed
+            return None
+
+        usage = getattr(agent, "token_usage", None) or getattr(
+            compressor, "token_usage", None
+        )
+        for key, candidates in (
+            (
+                "inputTokens",
+                (
+                    (usage, "input_tokens"),
+                    (usage, "prompt_tokens"),
+                ),
+            ),
+            (
+                "outputTokens",
+                (
+                    (usage, "output_tokens"),
+                    (usage, "completion_tokens"),
+                    (compressor, "last_completion_tokens"),
+                    (entry, "last_completion_tokens"),
+                ),
+            ),
+            (
+                "cachedTokens",
+                (
+                    (usage, "cached_tokens"),
+                    (usage, "cache_read_input_tokens"),
+                    (compressor, "last_cached_tokens"),
+                ),
+            ),
+            (
+                "totalTokens",
+                (
+                    (usage, "total_tokens"),
+                    (compressor, "total_tokens"),
+                    (entry, "total_tokens"),
+                ),
+            ),
+        ):
+            value = optional_token(*candidates)
+            if value is not None:
+                snapshot[key] = value
+
+        if "totalTokens" not in snapshot:
+            input_tokens = snapshot.get("inputTokens")
+            output_tokens = snapshot.get("outputTokens")
+            if input_tokens is not None and output_tokens is not None:
+                snapshot["totalTokens"] = input_tokens + output_tokens
+
         return snapshot
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -654,9 +855,11 @@ class LoopdyAdapter(BasePlatformAdapter):
             await self.link_client.stop()
         self._pending_picker_requests.clear()
         self._active_pickers.clear()
+        self._link_metadata_devices.clear()
         self._link_session_workspaces.clear()
         self._link_draft_messages.clear()
         self._link_active_drafts.clear()
+        self._link_draft_sent_at.clear()
         self._mark_disconnected()
 
     async def send(
@@ -1111,6 +1314,16 @@ class LoopdyAdapter(BasePlatformAdapter):
             if previous is not None and previous[0] != draft_key:
                 self._link_draft_messages.pop(previous[0], None)
             self._trim_link_draft_identities()
+            now = time.monotonic()
+            last_sent_at = self._link_draft_sent_at.get(turn_key)
+            if (
+                last_sent_at is not None
+                and now - last_sent_at < _LINK_DRAFT_MINIMUM_INTERVAL_SECONDS
+            ):
+                # The final response carries the complete text. Intermediate
+                # token snapshots are presentation hints, so bound Link/APNs
+                # backlog without weakening durable final/tool history.
+                return SendResult(success=True)
             agent_id = self._link_response_profile(chat_id, values)
             await self._send_link_payload(
                 assistant_message(
@@ -1127,6 +1340,8 @@ class LoopdyAdapter(BasePlatformAdapter):
                     draft_id=draft_id,
                 )
             )
+            self._link_draft_sent_at[turn_key] = now
+            self._link_draft_sent_at.move_to_end(turn_key)
             return SendResult(success=True)
         except Exception as exc:
             return SendResult(
@@ -1160,9 +1375,9 @@ class LoopdyAdapter(BasePlatformAdapter):
         metadata: Dict[str, Any],
         draft_key: tuple[str, int],
     ) -> None:
-        self._link_active_drafts.pop(
-            self._link_draft_turn_key(chat_id, metadata), None
-        )
+        turn_key = self._link_draft_turn_key(chat_id, metadata)
+        self._link_active_drafts.pop(turn_key, None)
+        self._link_draft_sent_at.pop(turn_key, None)
         self._link_draft_messages.pop(draft_key, None)
 
     def _trim_link_draft_identities(self) -> None:
@@ -1171,8 +1386,10 @@ class LoopdyAdapter(BasePlatformAdapter):
             for turn_key, active in tuple(self._link_active_drafts.items()):
                 if active[0] == stale_key:
                     self._link_active_drafts.pop(turn_key, None)
+                    self._link_draft_sent_at.pop(turn_key, None)
         while len(self._link_active_drafts) > _MAX_LINK_DRAFT_IDENTITIES:
-            _, active = self._link_active_drafts.popitem(last=False)
+            turn_key, active = self._link_active_drafts.popitem(last=False)
+            self._link_draft_sent_at.pop(turn_key, None)
             self._link_draft_messages.pop(active[0], None)
 
     async def send_model_picker(
@@ -1321,8 +1538,15 @@ class LoopdyAdapter(BasePlatformAdapter):
             source,
         )
         behavior = turn.message.behavior
-        if behavior is None or self._has_pending_link_intercept(source):
+        if (
+            behavior is None
+            or self._has_pending_link_intercept(source)
+            or self._has_registered_command(event.text)
+        ):
             await self.handle_message(event)
+            # Safe/bypass slash commands need not enter background processing,
+            # so they do not necessarily reach on_processing_complete.
+            await self._refresh_goal_for_source(source)
             return
 
         if behavior == "steer" and (event.media_urls or event.media_types):
@@ -1385,6 +1609,10 @@ class LoopdyAdapter(BasePlatformAdapter):
                 release = getattr(self.link_client, "release_attachment_paths", None)
                 if callable(release) and event.media_urls:
                     release(tuple(event.media_urls))
+            # Runs after the goal judge. The text/outcome are never verdicts.
+            # Release attachments first even if this readback is cancelled.
+            if event.source is not None:
+                await self._refresh_goal_for_source(event.source)
 
     def _link_session_key(self, source: SessionSource) -> str:
         return build_session_key(
@@ -1445,6 +1673,19 @@ class LoopdyAdapter(BasePlatformAdapter):
             # Fail safe for the same reason: never hide a possible clarify
             # response behind /steer or /queue when inspection is unavailable.
             return True
+
+    @staticmethod
+    def _has_registered_command(text: str) -> bool:
+        """Let Hermes own every registered command's active-turn behavior."""
+        token = text.split(None, 1)[0] if text else ""
+        if not token.startswith("/"):
+            return False
+        try:
+            from hermes_cli.commands import should_bypass_active_session
+
+            return should_bypass_active_session(token[1:].lower())
+        except Exception:
+            return False
 
     def _unwrap_ephemeral(self, response: Any) -> tuple[Optional[str], int]:
         if _suppress_link_control_ephemeral.get() and isinstance(
@@ -1670,6 +1911,54 @@ class LoopdyAdapter(BasePlatformAdapter):
             raise ValueError("Loopdy Link response agent does not match its session")
         return explicit or verified or _active_profile_id()
 
+    async def _workspace_history_context(
+        self, request: WorkspaceRequest, result: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Read current context only after profile-scoped history succeeded.
+
+        The controller resolves visible aliases through its authorized catalog;
+        only its returned storedId is a provider coordinate. The wire snapshot
+        retains the requested coordinate, not that internal alias resolution.
+        """
+        try:
+            requested = _session_coordinate(request.payload.get("storedId"))
+        except ValueError:
+            return None
+        envelope = {"sessionId": requested, "available": False, "snapshot": None}
+        agent_id = request.payload.get("agentId")
+        if not isinstance(agent_id, str) or not agent_id or result.get("agentId") != agent_id:
+            return envelope
+        try:
+            stored_id = _session_coordinate(result.get("storedId"))
+            # A known live binding must agree with the successful controller.
+            for coordinate in (requested, stored_id):
+                bound = self._link_session_profiles.get(coordinate)
+                if bound is not None and bound != agent_id:
+                    return envelope
+            current = await asyncio.to_thread(self._context_window_snapshot, stored_id)
+            if not isinstance(current, dict):
+                return envelope
+            snapshot = session_context(
+                session_id=requested,
+                model=current["model"],
+                context_used=current["contextUsed"],
+                context_max=current["contextMax"],
+                context_percent=current["contextPercent"],
+                compressions=current["compressions"],
+                is_compacting=current["isCompacting"],
+                updated_at=current.get("updatedAt", int(time.time())),
+                title=current.get("title"),
+                input_tokens=current.get("inputTokens"),
+                output_tokens=current.get("outputTokens"),
+                cached_tokens=current.get("cachedTokens"),
+                total_tokens=current.get("totalTokens"),
+            )
+        except Exception:
+            # Provider absence/failure is not a failed history load. Never log
+            # payloads or exception text from this optional private boundary.
+            return envelope
+        return {"sessionId": requested, "available": True, "snapshot": snapshot}
+
     async def receive_link_payload(
         self,
         payload: (
@@ -1686,13 +1975,29 @@ class LoopdyAdapter(BasePlatformAdapter):
         ),
     ) -> None:
         if isinstance(payload, InboundLinkWorkspaceRequest):
+            request = payload.request
+            # Opt in only via the existing read-only operation; the v1 envelope
+            # and controller operation permissions are unchanged.
+            if (request.operation == "agents.list"
+                    and type(request.payload.get("linkProtocol")) is int
+                    and request.payload["linkProtocol"] == 1):
+                request = replace(request, payload={
+                    key: value for key, value in request.payload.items()
+                    if key != "linkProtocol"
+                })
+                self._link_metadata_devices[payload.sender_device_id] = None
+            negotiated = payload.sender_device_id in self._link_metadata_devices
+            if negotiated:
+                self._link_metadata_devices.move_to_end(payload.sender_device_id)
+            while len(self._link_metadata_devices) > _MAX_LINK_METADATA_DEVICES:
+                self._link_metadata_devices.popitem(last=False)
             connection_token = _link_workspace_connection.set(
                 payload.sender_device_id
             )
             try:
                 if self.workspace_controller is None:
                     raise RuntimeError("Workspace controls are unavailable")
-                result_payload = await self.workspace_controller.execute(payload.request)
+                result_payload = await self.workspace_controller.execute(request)
                 result = workspace_result(
                     request=payload.request,
                     status="completed",
@@ -1728,6 +2033,12 @@ class LoopdyAdapter(BasePlatformAdapter):
                 )
             finally:
                 _link_workspace_connection.reset(connection_token)
+            if negotiated:
+                result["capabilities"] = workspace_capabilities()
+                if result["status"] == "completed" and request.operation == "sessions.history":
+                    context = await self._workspace_history_context(request, result["payload"])
+                    if context is not None:
+                        result["context"] = context
             if self.link_client is not None:
                 await self._send_link_payload(result)
             return

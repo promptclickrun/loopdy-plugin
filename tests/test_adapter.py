@@ -243,6 +243,26 @@ class _ActivityBroker:
 
 
 class AdapterTests(unittest.TestCase):
+    def test_runtime_snapshot_reads_only_the_exact_current_owner(self):
+        entry = SimpleNamespace(session_id="stored-one", session_key="route-one", origin=SimpleNamespace(profile="default"))
+        class Store:
+            current_id = "stored-one"
+            def lookup_by_session_id(self, stored_id):
+                return entry if stored_id == "stored-one" else None
+            def get_model_override(self, key):
+                return {"model": "chosen-model", "provider": "anthropic", "base_url": "private", "api_key": "secret"}
+            def peek_session_id(self, key):
+                return self.current_id
+        store = Store()
+        adapter = SimpleNamespace(_session_store=store)
+        async def read(agent="default", stored="stored-one"):
+            return await LoopdyAdapter.runtime_snapshot_for_session(adapter, agent, stored)
+        self.assertEqual(asyncio.run(read()), {"model": "chosen-model", "provider": "anthropic"})
+        self.assertIsNone(asyncio.run(read(agent="other")))
+        self.assertIsNone(asyncio.run(read(stored="retired")))
+        store.current_id = "replacement"
+        self.assertIsNone(asyncio.run(read()))
+
     def setUp(self) -> None:
         runtime_config_patcher = patch(
             "loopdy_plugin.adapter.load_runtime_config",
@@ -1210,6 +1230,74 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(observed[0][1], (None, 0))
         self.assertEqual(observed[1][1], ("Stopped", 0))
 
+    def test_registered_command_keeps_hermes_busy_contract(self) -> None:
+        from gateway.session import build_session_key
+        from loopdy_plugin.link_client import InboundLinkTurn
+        from loopdy_plugin.link_contracts import UserMessage
+
+        for index, (text, behavior) in enumerate(
+            (
+                ("/btw Which module owns titles?", "interrupt"),
+                ("/btw Which module owns titles?", "steer"),
+                ("/btw Which module owns titles?", "queue"),
+                ("/model", "interrupt"),
+                ("/reset", "interrupt"),
+            )
+        ):
+            with self.subTest(text=text, behavior=behavior):
+                adapter = LoopdyAdapter(
+                    PlatformConfig(enabled=True),
+                    service=_Service(),
+                    link_client=_LinkClient(),
+                )
+                observed = []
+
+                async def handle(event):
+                    observed.append(event.text)
+
+                adapter.handle_message = handle
+                turn = InboundLinkTurn(
+                    message=UserMessage(
+                        message_id=f"message-command-coordinate-{index:04d}",
+                        session_id=f"session-command-coordinate-{index:04d}",
+                        agent_id="finance",
+                        actor_id="actor-coordinate-1",
+                        actor_name="Alex",
+                        device_name="Kitchen iPad",
+                        text=text,
+                        sent_at=1788000000,
+                        behavior=behavior,
+                    ),
+                    sender_id="link_verified_sender_coordinate",
+                    sender_device_id="mobile-private-coordinate",
+                    attachment_paths=(),
+                    attachment_types=(),
+                )
+                source = adapter.build_source(
+                    chat_id=turn.message.session_id,
+                    chat_name="Loopdy chat",
+                    chat_type="dm",
+                    user_id=turn.sender_id,
+                    user_name=turn.message.actor_name,
+                    message_id=turn.message.message_id,
+                )
+                source.profile = turn.message.agent_id
+                session_key = build_session_key(
+                    source,
+                    group_sessions_per_user=adapter.config.extra.get(
+                        "group_sessions_per_user", True
+                    ),
+                    thread_sessions_per_user=adapter.config.extra.get(
+                        "thread_sessions_per_user", False
+                    ),
+                    profile=adapter._session_key_profile(source),
+                )
+                adapter._active_sessions[session_key] = asyncio.Event()
+
+                asyncio.run(adapter.receive_link_turn(turn))
+
+                self.assertEqual(observed, [text])
+
     def test_link_reply_uses_the_verified_profile_bound_to_its_session(self) -> None:
         from loopdy_plugin.link_client import InboundLinkTurn
         from loopdy_plugin.link_contracts import UserMessage
@@ -1421,6 +1509,24 @@ class AdapterTests(unittest.TestCase):
         )
         self.assertEqual(link.payloads[-1]["text"], "The weather is sunny.")
 
+    def test_rapid_drafts_are_coalesced_but_final_is_complete_and_identity_stable(self) -> None:
+        link = _LinkClient()
+        adapter = LoopdyAdapter(PlatformConfig(enabled=True), service=_Service(), link_client=link)
+        metadata = {"reply_to_message_id": "throttle_turn", "agent_name": "Avery"}
+        async def scenario():
+            with patch("loopdy_plugin.adapter.time.monotonic", return_value=100):
+                for index in range(75):
+                    self.assertTrue((await adapter.send_draft("session-throttle", 42, f"Draft {index}", metadata)).success)
+            with patch("loopdy_plugin.adapter.time.monotonic", return_value=100.3):
+                self.assertTrue((await adapter.send_draft("session-throttle", 42, "Latest draft", metadata)).success)
+            self.assertTrue((await adapter.send("session-throttle", "Complete final response", metadata=metadata)).success)
+        asyncio.run(scenario())
+        self.assertEqual([p["delivery"] for p in link.payloads], ["draft", "draft", "final"])
+        self.assertEqual(link.payloads[-1]["text"], "Complete final response")
+        self.assertEqual(len({p["messageId"] for p in link.payloads}), 1)
+        self.assertEqual(adapter._link_draft_sent_at, {})
+
+    @patch("loopdy_plugin.adapter._LINK_DRAFT_MINIMUM_INTERVAL_SECONDS", 0)
     def test_native_draft_revisions_and_final_reuse_one_link_message_identity(self) -> None:
         link = _LinkClient()
         adapter = LoopdyAdapter(
@@ -1461,6 +1567,7 @@ class AdapterTests(unittest.TestCase):
         )
         self.assertEqual(len({payload["messageId"] for payload in link.payloads}), 1)
 
+    @patch("loopdy_plugin.adapter._LINK_DRAFT_MINIMUM_INTERVAL_SECONDS", 0)
     def test_native_draft_revision_ids_still_reuse_one_turn_message_identity(self) -> None:
         link = _LinkClient()
         adapter = LoopdyAdapter(
@@ -2166,6 +2273,70 @@ class AdapterTests(unittest.TestCase):
         self.assertIs(personalities.request, request)
         self.assertEqual(link.payloads[0]["type"], "personalities.catalog")
         self.assertEqual(link.payloads[0]["revision"], 7)
+
+    def test_workspace_metadata_is_not_sent_to_an_unnegotiated_legacy_client(self) -> None:
+        from loopdy_plugin.link_client import InboundLinkWorkspaceRequest
+        from loopdy_plugin.link_contracts import WorkspaceRequest
+
+        controller = SimpleNamespace(execute=AsyncMock(return_value={"agents": []}))
+        link = _LinkClient()
+        adapter = LoopdyAdapter(PlatformConfig(enabled=True), service=_Service(),
+                                link_client=link, workspace_controller=controller)
+        request = WorkspaceRequest("workspace-legacy-metadata-0001", "agents.list", {}, 1_788_000_000)
+        asyncio.run(adapter.receive_link_payload(InboundLinkWorkspaceRequest(
+            request=request, sender_device_id="mobile-legacy-fixture",
+        )))
+        self.assertNotIn("capabilities", link.payloads[-1])
+        self.assertNotIn("context", link.payloads[-1])
+
+    def test_safe_probe_negotiates_metadata_per_device_and_history_reports_current_context(self) -> None:
+        from loopdy_plugin.link_client import InboundLinkWorkspaceRequest
+        from loopdy_plugin.link_contracts import WorkspaceRequest
+
+        class Controller:
+            def __init__(self):
+                self.requests = []
+
+            async def execute(self, request):
+                self.requests.append(request)
+                if request.operation == "agents.list":
+                    return {"agents": []}
+                return {"storedId": "canonical-session-fixture", "agentId": "default", "messages": []}
+
+        link = _LinkClient()
+        controller = Controller()
+        adapter = LoopdyAdapter(PlatformConfig(enabled=True), service=_Service(),
+                                link_client=link, workspace_controller=controller)
+        provider = lambda _: {
+            "model": "fixture-model", "contextUsed": 17, "contextMax": 100,
+            "contextPercent": 17, "compressions": 0, "isCompacting": False,
+        }
+        with patch.object(adapter, "_context_window_snapshot", side_effect=provider) as context:
+            async def scenario():
+                probe = WorkspaceRequest("workspace-metadata-probe-0001", "agents.list",
+                                         {"linkProtocol": 1}, 1_788_000_000)
+                await adapter.receive_link_payload(InboundLinkWorkspaceRequest(
+                    request=probe, sender_device_id="mobile-metadata-fixture",
+                ))
+                self.assertEqual(controller.requests[-1].payload, {})
+                self.assertIn("capabilities", link.payloads[-1])
+                history = WorkspaceRequest("workspace-metadata-history-0001", "sessions.history",
+                                           {"storedId": "visible-session-fixture", "agentId": "default"},
+                                           1_788_000_001)
+                await adapter.receive_link_payload(InboundLinkWorkspaceRequest(
+                    request=history, sender_device_id="mobile-metadata-fixture",
+                ))
+                envelope = link.payloads[-1]["context"]
+                self.assertEqual(envelope["sessionId"], "visible-session-fixture")
+                self.assertTrue(envelope["available"])
+                self.assertEqual(envelope["snapshot"]["contextUsed"], 17)
+                context.assert_called_with("canonical-session-fixture")
+                await adapter.receive_link_payload(InboundLinkWorkspaceRequest(
+                    request=history, sender_device_id="another-legacy-fixture",
+                ))
+                self.assertNotIn("capabilities", link.payloads[-1])
+                self.assertNotIn("context", link.payloads[-1])
+            asyncio.run(scenario())
 
     def test_workspace_request_uses_the_explicit_controller_and_returns_a_bound_result(self) -> None:
         from loopdy_plugin.link_client import InboundLinkWorkspaceRequest

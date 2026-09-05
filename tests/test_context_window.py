@@ -107,6 +107,29 @@ class ContextWindowTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+        agent.token_usage = SimpleNamespace(
+            input_tokens=120_000,
+            output_tokens=8_400,
+            cached_tokens=24_000,
+            total_tokens=128_400,
+        )
+        self.assertEqual(
+            broker.provider(entry.session_id),
+            {
+                "title": "Readable live title",
+                "model": "anthropic/claude-fable-5",
+                "contextUsed": 154_200,
+                "contextMax": 272_000,
+                "contextPercent": 57,
+                "compressions": 2,
+                "isCompacting": False,
+                "inputTokens": 120_000,
+                "outputTokens": 8_400,
+                "cachedTokens": 24_000,
+                "totalTokens": 128_400,
+            },
+        )
+
     async def test_active_turn_pushes_pre_active_and_final_compaction_context(self) -> None:
         broker = LinkActivityBroker()
         broker.context_poll_interval_seconds = 0.01
@@ -230,6 +253,12 @@ class ContextWindowTests(unittest.IsolatedAsyncioTestCase):
         await _wait_until(lambda: len(received) == 2)
         self.assertEqual(received[1]["title"], "Renamed while open")
         self.assertEqual(received[1]["contextUsed"], 12_000)
+        self.assertGreater(received[1]["updatedAt"], received[0]["updatedAt"])
+
+        state["title"] = "Renamed again immediately"
+        await _wait_until(lambda: len(received) == 3)
+        self.assertEqual(received[2]["title"], "Renamed again immediately")
+        self.assertGreater(received[2]["updatedAt"], received[1]["updatedAt"])
 
         await broker.detach()
 

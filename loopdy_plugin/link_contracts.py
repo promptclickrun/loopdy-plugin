@@ -24,6 +24,7 @@ MAX_ATTACHMENT_CHUNK_BYTES = 64 * 1024
 MAX_ATTACHMENT_CHUNKS = 128
 MAX_AVATAR_WORKSPACE_PLAINTEXT_BYTES = 2_800_000
 MAX_ENCRYPTED_FRAME_CHARACTERS = 4_000_000
+PLUGIN_VERSION = "2.3.0"
 WORKSPACE_OPERATIONS = frozenset(
     {
         "agents.list",
@@ -33,6 +34,8 @@ WORKSPACE_OPERATIONS = frozenset(
         "agents.avatar.set",
         "sessions.list",
         "sessions.history",
+        "sessions.update",
+        "sessions.delete",
         "attachments.resolve",
         "attachments.fetch",
         "scheduled_tasks.list",
@@ -46,6 +49,10 @@ WORKSPACE_OPERATIONS = frozenset(
         "agent_defaults.get",
         "agent_defaults.set",
         "skills_tools.list",
+        "skills_tools.get",
+        "skills_tools.create",
+        "skills_tools.update",
+        "skills_tools.import",
         "projects.list",
         "projects.set_active",
         "projects.create",
@@ -295,6 +302,10 @@ class WorkspaceRequest:
         }
 
 
+class ExpiredHostRelayEnrollment(ValueError):
+    """A valid host-relay enrollment whose lease cannot be replayed."""
+
+
 @dataclass(frozen=True)
 class RelayReady:
     device_id: str
@@ -375,6 +386,8 @@ def parse_workspace_request(value: dict[str, Any]) -> WorkspaceRequest:
         payload = _project_git_workspace_payload(operation, value.get("payload"))
     elif operation in {"agents.create", "agents.update", "agents.avatar.set"}:
         payload = _workspace_json_allowing_avatar_blobs(value.get("payload"))
+    elif operation == "skills_tools.import":
+        payload = _workspace_json_allowing_skill_archive(value.get("payload"))
     else:
         payload = _workspace_json(value.get("payload"), depth=0)
     if not isinstance(payload, dict):
@@ -1521,6 +1534,66 @@ def generative_ui_form_result(
     }
 
 
+def workspace_capabilities() -> dict[str, Any]:
+    return {
+        "protocolVersion": 1,
+        "pluginVersion": PLUGIN_VERSION,
+        "features": ["workspace-rejected-v1", "backpressure-v1"],
+        "operations": sorted(WORKSPACE_OPERATIONS),
+    }
+
+
+def workspace_rejection(value: Any, *, sent_at: int) -> dict[str, Any] | None:
+    """Correlate a rejected request without constructing a supported request.
+
+    Called only after authenticated decryption and failed request validation.
+    Never echo operation names, invalid payloads, or exception details.
+    """
+    if not isinstance(value, dict) or value.get("type") != "workspace.request":
+        return None
+    try:
+        request_id = _opaque(value.get("requestId"), "requestId", 16, 128)
+    except ValueError:
+        return None
+    operation = value.get("operation")
+    unsupported = (
+        type(value.get("version")) is int and value.get("version") == 1
+        and isinstance(operation, str)
+        and re.fullmatch(r"[A-Za-z0-9_.-]{1,96}", operation) is not None
+        and operation not in WORKSPACE_OPERATIONS
+    )
+    return {
+        "version": 1,
+        "type": "workspace.rejected",
+        "requestId": request_id,
+        "code": "unsupported_operation" if unsupported else "invalid_request",
+        "message": (
+            "This host does not support that operation."
+            if unsupported else "This workspace request is invalid."
+        ),
+        "sentAt": _positive(sent_at, "sentAt"),
+    }
+
+
+def parse_backpressure(value: Any) -> tuple[str, int, int]:
+    expected = {"version", "type", "id", "sequence", "retryAfterMs", "reason"}
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected
+        or type(value.get("version")) is not int
+        or value.get("version") != 1
+        or value.get("type") != "backpressure"
+        or value.get("reason") != "storage_limit"
+    ):
+        raise ValueError("Loopdy Link backpressure is invalid")
+    frame_id = _opaque(value.get("id"), "id", 16, 128)
+    sequence = _positive(value.get("sequence"), "sequence")
+    delay = _positive(value.get("retryAfterMs"), "retryAfterMs")
+    if not 100 <= delay <= 30_000:
+        raise ValueError("Loopdy Link backpressure delay is invalid")
+    return frame_id, sequence, delay
+
+
 def workspace_result(
     *,
     request: WorkspaceRequest,
@@ -1554,6 +1627,7 @@ def workspace_result(
     result: dict[str, Any] = {
         "version": 1,
         "type": "workspace.result",
+        "capabilities": workspace_capabilities(),
         "requestId": request.request_id,
         "operation": request.operation,
         "status": status,
@@ -1798,6 +1872,22 @@ def _workspace_json(
     ) > 196_608:
         raise ValueError("Loopdy Link workspace payload is invalid")
     return projected
+
+
+def _workspace_json_allowing_skill_archive(value: Any) -> Any:
+    if not isinstance(value, dict):
+        raise ValueError("Loopdy Link workspace payload is invalid")
+    encoded = value.get("dataBase64")
+    if not isinstance(encoded, str) or not 1 <= len(encoded) <= 2_100_000:
+        raise ValueError("Loopdy Link skill archive is invalid")
+    try:
+        base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("Loopdy Link skill archive is invalid") from exc
+    placeholder = dict(value)
+    placeholder["dataBase64"] = "AA=="
+    _workspace_json(placeholder, depth=0)
+    return value
 
 
 def _workspace_json_allowing_avatar_blobs(value: Any) -> Any:
@@ -2162,4 +2252,7 @@ __all__ = [
     "voice_audio_chunks",
     "voice_speak_error",
     "workspace_result",
+    "workspace_capabilities",
+    "workspace_rejection",
+    "parse_backpressure",
 ]

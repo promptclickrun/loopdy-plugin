@@ -2,7 +2,7 @@ manifest_version: 1
 name: loopdy
 label: Loopdy
 kind: platform
-version: "2.2.15"
+version: "2.3.0"
 license: Apache-2.0
 description: >
   Native Hermes platform for encrypted Loopdy Link chat and workspace controls,

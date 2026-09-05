@@ -113,7 +113,7 @@ hermes loopdy provider direct
 Relay mode is the app default and is designed for hosts that cannot receive inbound connections. Configure
 the relay origin, tenant, and references to owner-controlled HMAC/signing-key material in the active
 Hermes profile. Secret references are resolved on the Hermes host and are never sent to the mobile
-client or written to relay request bodies. Plugin protocol `2.2.15` carries Link and relay wire version `1`;
+client or written to relay request bodies. Plugin release `2.3.0` carries Link and relay wire version `1`;
 the two version layers are independent. An authenticated encrypted `user.message` may include the
 optional wire-version-1 `behavior` value `steer`, `queue`, or `interrupt`. The adapter maps those values
 to Hermes' registered platform controls, preserves normal approval and clarification interception, and

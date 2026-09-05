@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import inspect
 import json
@@ -23,6 +24,7 @@ from .link_contracts import (
     AttachmentChunk,
     CommandCatalogRequest,
     EncryptedFrame,
+    ExpiredHostRelayEnrollment,
     GenerativeUIFormSubmission,
     MAX_ENCRYPTED_FRAME_CHARACTERS,
     PersonalityRequest,
@@ -34,6 +36,7 @@ from .link_contracts import (
     VoiceSpeakRequest,
     WorkspaceRequest,
     parse_attachment_chunk,
+    parse_backpressure,
     parse_encrypted_frame,
     parse_generative_ui_form_submission,
     parse_command_catalog_request,
@@ -45,6 +48,7 @@ from .link_contracts import (
     parse_user_message,
     parse_voice_speak_request,
     parse_workspace_request,
+    workspace_rejection,
 )
 from .link_attachments import LinkAttachmentInbox
 from .link_crypto import (
@@ -91,23 +95,38 @@ class _LoopdyLinkTransportLock:
         self._process_lock: threading.Lock | None = None
 
     async def __aenter__(self) -> "_LoopdyLinkTransportLock":
-        acquisition = asyncio.create_task(asyncio.to_thread(self._acquire_blocking))
+        cancelled = threading.Event()
+        acquisition = asyncio.create_task(
+            asyncio.to_thread(self._acquire_blocking, cancelled)
+        )
         try:
             await asyncio.shield(acquisition)
         except asyncio.CancelledError:
-            await acquisition
+            # A cancelled response must not leave a blocking flock worker or
+            # wait forever for another process to relinquish the transport.
+            cancelled.set()
+            while not acquisition.done():
+                try:
+                    await asyncio.shield(acquisition)
+                except asyncio.CancelledError:
+                    continue
             self._release_blocking()
+            # Retrieve acquisition failures even when cancellation won the race.
+            acquisition.result()
             raise
         return self
 
     async def __aexit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
         self._release_blocking()
 
-    def _acquire_blocking(self) -> None:
+    def _acquire_blocking(self, cancelled: threading.Event | None = None) -> None:
+        cancelled = cancelled or threading.Event()
         key = str(self.path.resolve())
         with _PROCESS_TRANSPORT_LOCKS_GUARD:
             process_lock = _PROCESS_TRANSPORT_LOCKS.setdefault(key, threading.Lock())
-        process_lock.acquire()
+        while not process_lock.acquire(timeout=0.05):
+            if cancelled.is_set():
+                return
         handle: Any | None = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -119,11 +138,24 @@ class _LoopdyLinkTransportLock:
                     handle.write(b"\0")
                     handle.flush()
                 handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
             else:
                 import fcntl
 
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            while True:
+                if cancelled.is_set():
+                    handle.close()
+                    process_lock.release()
+                    return
+                try:
+                    if os.name == "nt":  # pragma: no cover - Windows CI
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError as exc:
+                    if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                        raise
+                    cancelled.wait(0.05)
             self._handle = handle
             self._process_lock = process_lock
         except BaseException:
@@ -256,7 +288,8 @@ class _InboundLinkTurnFailure:
 
 @dataclass(frozen=True)
 class _InboundLinkPayloadRejection:
-    error: ValueError
+    error: BaseException
+    response: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -391,6 +424,12 @@ class LoopdyLinkClient:
             tuple[Callable[[Any], Any], EncryptedFrame, Any]
         ] = asyncio.Queue()
         self._inbound_callback_task: asyncio.Task[None] | None = None
+        self._rejection_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=32)
+        self._rejection_task: asyncio.Task[None] | None = None
+        self._backpressure_task: asyncio.Task[None] | None = None
+        self._backpressured_frame_id: str | None = None
+        self._backpressure_repeat_delay: float | None = None
+        self._authentication_failed = False
         self._last_error = ""
         self._reconnect_attempt = 0
         self._superseded = False
@@ -406,6 +445,7 @@ class LoopdyLinkClient:
             "state": (
                 "connected"
                 if self.connected
+                else "authentication_error" if self._authentication_failed
                 else "superseded" if self._superseded else "disconnected"
             ),
             "base_url": self.config.base_url,
@@ -441,6 +481,9 @@ class LoopdyLinkClient:
     ) -> None:
         if self._task is not None and not self._task.done():
             return
+        if self._authentication_failed:
+            self._record_runtime_status("authentication_error", self._last_error)
+            return
         if self._superseded:
             self._record_runtime_status("superseded", self._last_error)
             return
@@ -455,7 +498,7 @@ class LoopdyLinkClient:
         """Wait for the verified socket.ready handshake, not task startup."""
         if self.connected:
             return True
-        if self._stopping.is_set():
+        if self._stopping.is_set() or self._authentication_failed:
             return False
         try:
             await asyncio.wait_for(self._connected.wait(), timeout=timeout)
@@ -466,6 +509,7 @@ class LoopdyLinkClient:
     async def stop(self) -> None:
         self._stopping.set()
         self._connected.clear()
+        await self._stop_backpressure_retry()
         task, self._task = self._task, None
         if task is not None and not task.done():
             task.cancel()
@@ -489,9 +533,16 @@ class LoopdyLinkClient:
                 future.cancel()
         self._live_activity_accepted.clear()
         await self._stop_inbound_callback_dispatcher()
-        self._record_runtime_status("disconnected")
+        self._record_runtime_status(
+            "authentication_error" if self._authentication_failed else "disconnected",
+            self._last_error if self._authentication_failed else "",
+        )
 
-    async def send_payload(self, payload: dict[str, Any]) -> str:
+    async def send_payload(
+        self, payload: dict[str, Any], *, preserve_pending_on_failure: bool = False
+    ) -> str:
+        if self._authentication_failed:
+            raise ConnectionError("Loopdy Link authorization requires re-pairing")
         async with self._send_lock:
             await asyncio.wait_for(self._connected.wait(), timeout=20.0)
             async with self._transport_lock:
@@ -510,16 +561,33 @@ class LoopdyLinkClient:
                 loop = asyncio.get_running_loop()
                 accepted: asyncio.Future[None] = loop.create_future()
                 self._accepted[frame.frame_id] = accepted
-                await self._send_wire(wire)
                 try:
+                    await asyncio.wait_for(
+                        self._send_wire(wire), timeout=self._delivery_timeout
+                    )
                     await asyncio.wait_for(
                         asyncio.shield(accepted), timeout=self._delivery_timeout
                     )
-                except asyncio.TimeoutError:
-                    await self._mark_failed_outbound_and_reconnect(frame)
+                except (Exception, asyncio.CancelledError):
+                    # A readiness rebase can move this future to a new frame ID.
+                    # Only its current durable frame belongs to this send.
+                    pending = self._transport_get("pending_frame")
+                    if (
+                        not preserve_pending_on_failure
+                        and not self._authentication_failed
+                        and isinstance(pending, dict)
+                        and self._accepted.get(pending.get("id")) is accepted
+                        and pending.get("id") != self._backpressured_frame_id
+                    ):
+                        current = parse_encrypted_frame(json.dumps(pending))
+                        await self._mark_failed_outbound_and_reconnect(current)
                     raise
                 finally:
-                    self._accepted.pop(frame.frame_id, None)
+                    for owned_id, future in tuple(self._accepted.items()):
+                        if future is accepted:
+                            self._accepted.pop(owned_id, None)
+                    if not accepted.done():
+                        accepted.cancel()
                 return frame.frame_id
 
     def pending_payload_frame_id(self, payload: dict[str, Any]) -> str | None:
@@ -544,11 +612,13 @@ class LoopdyLinkClient:
             loop = asyncio.get_running_loop()
             accepted: asyncio.Future[None] = loop.create_future()
             self._live_activity_accepted[update_id] = accepted
-            await self._send_wire(update)
             try:
+                await asyncio.wait_for(self._send_wire(update), timeout=20.0)
                 await asyncio.wait_for(asyncio.shield(accepted), timeout=20.0)
             finally:
                 self._live_activity_accepted.pop(update_id, None)
+                if not accepted.done():
+                    accepted.cancel()
         return update_id
 
     async def handle_wire_message(
@@ -572,6 +642,8 @@ class LoopdyLinkClient:
         *,
         defer_callbacks: bool = False,
     ) -> bool:
+        if not isinstance(encoded, str) or len(encoded) > MAX_ENCRYPTED_FRAME_CHARACTERS:
+            raise ValueError("Loopdy Link socket message is invalid")
         try:
             header = json.loads(encoded)
         except (TypeError, json.JSONDecodeError) as exc:
@@ -600,6 +672,9 @@ class LoopdyLinkClient:
         ):
             self._accept_live_activity(header)
             return False
+        if isinstance(header, dict) and header.get("type") == "backpressure":
+            self._handle_backpressure(header)
+            return False
         frame = parse_encrypted_frame(encoded)
         sequences = self._transport_get("received_sequences", {})
         sequence_map = dict(sequences) if isinstance(sequences, dict) else {}
@@ -609,8 +684,8 @@ class LoopdyLinkClient:
             if has_previous and frame.sequence <= previous:
                 await self._send_receipt(frame)
                 return False
-            if has_previous and frame.sequence != previous + 1:
-                raise ValueError("Loopdy Link inbound sequence is invalid")
+        # Sender sequences are account-wide; a host may legitimately skip
+        # frames. Keep monotonic replay rejection and authenticate fresh data.
         payload = self.cipher.open(frame.ciphertext)
         target_host_id = payload.pop("targetHostId", None)
         if target_host_id is not None:
@@ -653,14 +728,18 @@ class LoopdyLinkClient:
                     chunk=chunk,
                 )
             except (OSError, ValueError) as exc:
-                await self._quarantine_inbound_payload(frame, exc)
+                await self._reject_inbound_payload(
+                    callback, frame, exc, defer_callbacks=defer_callbacks,
+                )
                 return False
             inbound = None
         elif payload.get("type") == "user.message":
             try:
                 message = parse_user_message(payload)
             except ValueError as exc:
-                await self._quarantine_inbound_payload(frame, exc)
+                await self._reject_inbound_payload(
+                    callback, frame, exc, defer_callbacks=defer_callbacks,
+                )
                 return False
             try:
                 sender_id = self.identity_registry.remember(
@@ -722,6 +801,13 @@ class LoopdyLinkClient:
             registration = parse_relay_ready(payload)
             if registration.device_id != frame.sender_device_id:
                 raise ValueError("Loopdy Link relay device does not match the verified sender")
+            if _expired_host_relay(registration):
+                await self._reject_inbound_payload(
+                    callback, frame,
+                    ExpiredHostRelayEnrollment("Loopdy Link host-relay enrollment has expired"),
+                    defer_callbacks=defer_callbacks,
+                )
+                return False
             inbound = InboundLinkRelayReady(
                 registration=registration,
                 sender_device_id=frame.sender_device_id,
@@ -776,29 +862,37 @@ class LoopdyLinkClient:
             try:
                 request = parse_workspace_request(payload)
             except ValueError as exc:
-                if defer_callbacks:
-                    self._enqueue_inbound_callback(
-                        callback,
-                        frame,
-                        _InboundLinkPayloadRejection(error=exc),
-                    )
-                else:
-                    await self._quarantine_inbound_payload(frame, exc)
+                await self._reject_inbound_payload(
+                    callback, frame, exc, defer_callbacks=defer_callbacks,
+                    response=workspace_rejection(payload, sent_at=int(time.time())),
+                )
                 return False
             inbound = InboundLinkWorkspaceRequest(
                 request=request,
                 sender_device_id=frame.sender_device_id,
             )
         else:
-            raise ValueError("Loopdy Link payload type is invalid")
+            # Authenticated unfamiliar application payloads (including newer
+            # workspace.rejected responses) are not business actions to replay.
+            await self._reject_inbound_payload(
+                callback, frame, ValueError("Loopdy Link payload type is unsupported"),
+                defer_callbacks=defer_callbacks,
+            )
+            return False
         if defer_callbacks:
             self._enqueue_inbound_callback(callback, frame, inbound)
             return False
 
         if inbound is not None:
-            result = callback(inbound)
-            if inspect.isawaitable(result):
-                await result
+            try:
+                result = callback(inbound)
+                if inspect.isawaitable(result):
+                    await result
+            except ExpiredHostRelayEnrollment as exc:
+                if not isinstance(inbound, InboundLinkRelayReady) or inbound.registration.scope != "host_relay":
+                    raise
+                await self._quarantine_inbound_payload(frame, exc)
+                return False
         sequence_map[frame.sender_device_id] = frame.sequence
         self._transport_set("received_sequences", sequence_map)
         self._transport_set(
@@ -842,7 +936,7 @@ class LoopdyLinkClient:
             # Explicitly negotiate the readiness frame. Older Hermes hosts
             # treat all text messages as encrypted frames and must not receive
             # this control message unexpectedly.
-            headers["x-loopdy-capabilities"] = "socket-ready-v1"
+            headers["x-loopdy-capabilities"] = "socket-ready-v1,backpressure-v1"
             try:
                 async with connect(
                     self.config.socket_url,
@@ -882,7 +976,14 @@ class LoopdyLinkClient:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                if _connection_was_replaced(exc):
+                if _connection_authentication_failed(exc):
+                    self._authentication_failed = True
+                    self._last_error = "Link authorization denied. Re-pair this host to restore access."
+                    for future in tuple(self._accepted.values()):
+                        if not future.done():
+                            future.set_exception(ConnectionError(self._last_error))
+                    logger.warning("Loopdy Link authorization denied; automatic reconnect stopped")
+                elif _connection_was_replaced(exc):
                     superseded = True
                     self._superseded = True
                     self._last_error = "connection replaced by newer runtime"
@@ -892,12 +993,17 @@ class LoopdyLinkClient:
                     logger.warning("Loopdy Link connection interrupted (%s)", self._last_error)
             finally:
                 self._connected.clear()
+                await self._stop_backpressure_retry()
                 self._socket = None
-                self._notify_status("disconnected", self._last_error)
+                self._notify_status(
+                    "authentication_error" if self._authentication_failed else "disconnected",
+                    self._last_error,
+                )
                 await self._stop_inbound_callback_dispatcher()
-            if self._stopping.is_set() or superseded:
+            if self._stopping.is_set() or superseded or self._authentication_failed:
                 self._record_runtime_status(
-                    "superseded" if superseded else "disconnected",
+                    "authentication_error" if self._authentication_failed
+                    else "superseded" if superseded else "disconnected",
                     self._last_error,
                 )
                 break
@@ -952,6 +1058,88 @@ class LoopdyLinkClient:
                 _connection_error_detail(exc),
             )
 
+    def _handle_backpressure(self, value: dict[str, Any]) -> None:
+        frame_id, sequence, delay_ms = parse_backpressure(value)
+        pending = self._transport_get("pending_frame")
+        if (
+            not isinstance(pending, dict)
+            or pending.get("id") != frame_id
+            or pending.get("sequence") != sequence
+        ):
+            # Delayed controls for an acknowledged/replaced frame own nothing.
+            return
+        frame = parse_encrypted_frame(json.dumps(pending))
+        if (
+            frame.sender_device_id != self.config.device_id
+            or frame.sender_epoch != self.config.authorization_epoch
+        ):
+            raise ValueError("Loopdy Link backpressure pending owner is invalid")
+        socket = self._socket
+        if socket is None or self._stopping.is_set():
+            return
+        self._backpressured_frame_id = frame_id
+        if self._transport_get("failed_pending_frame_id") == frame_id:
+            self._transport_set("failed_pending_frame_id", None)
+        # Repeated controls must not postpone the same retry indefinitely.
+        if (
+            self._backpressure_task is not None
+            and not self._backpressure_task.done()
+            and not self._backpressure_task.cancelling()
+        ):
+            self._backpressure_repeat_delay = delay_ms / 1000
+            return
+        wire = dict(pending)
+        self._backpressure_task = asyncio.create_task(
+            self._retry_backpressured_frame(socket, wire, delay_ms / 1000),
+            name="loopdy-link-backpressure",
+        )
+
+    async def _retry_backpressured_frame(
+        self, socket: Any, wire: dict[str, Any], delay: float
+    ) -> None:
+        try:
+            while True:
+                await asyncio.sleep(delay)
+                if (
+                    self._stopping.is_set()
+                    or self._socket is not socket
+                    or not self.connected
+                    or self._transport_get("pending_frame") != wire
+                ):
+                    return
+                self._backpressure_repeat_delay = None
+                # Send through the captured live socket, never a replacement
+                # socket or a newly allocated frame/sequence/ciphertext.
+                await asyncio.wait_for(
+                    socket.send(json.dumps(wire, separators=(",", ":"), sort_keys=True)),
+                    timeout=self._delivery_timeout,
+                )
+                # A fast relay can reject the retransmission while send() is
+                # still yielding. Keep that control rather than losing a retry.
+                if self._backpressure_repeat_delay is None:
+                    return
+                delay = self._backpressure_repeat_delay
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if self._socket is socket and not self._stopping.is_set():
+                await self._close_for_reconnect("backpressure retry delivery failed")
+        finally:
+            if self._backpressure_task is asyncio.current_task():
+                self._backpressure_task = None
+
+    def _cancel_backpressure_retry(self) -> None:
+        task = self._backpressure_task
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+
+    async def _stop_backpressure_retry(self) -> None:
+        task, self._backpressure_task = self._backpressure_task, None
+        if task is not None and task is not asyncio.current_task():
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
     async def _send_wire(self, value: dict[str, Any]) -> None:
         socket = self._socket
         if socket is None:
@@ -977,6 +1165,67 @@ class LoopdyLinkClient:
             )
         )
 
+    async def _reject_inbound_payload(
+        self, callback: Callable[[Any], Any], frame: EncryptedFrame,
+        error: BaseException, *, defer_callbacks: bool,
+        response: dict[str, Any] | None = None,
+    ) -> None:
+        if defer_callbacks:
+            self._enqueue_inbound_callback(
+                callback, frame, _InboundLinkPayloadRejection(error, response)
+            )
+        else:
+            await self._quarantine_inbound_payload(frame, error)
+            self._enqueue_rejection_response(response)
+
+    def _enqueue_rejection_response(self, payload: dict[str, Any] | None) -> None:
+        if payload is None or self._stopping.is_set():
+            return
+        try:
+            self._rejection_queue.put_nowait(payload)
+        except asyncio.QueueFull:
+            # Quarantine/receipt has already completed in receive order. Do not
+            # turn a peer's invalid-request flood into unbounded response work.
+            logger.warning("Loopdy Link rejection response queue is full")
+            return
+        if self._rejection_task is None or self._rejection_task.done():
+            self._rejection_task = asyncio.create_task(
+                self._send_rejection_responses(), name="loopdy-link-rejections"
+            )
+
+    async def _send_rejection_responses(self) -> None:
+        try:
+            while True:
+                payload = self._rejection_queue.get_nowait()
+                try:
+                    # Separate from both receive and callback dispatch: receipts
+                    # free storage and ACKs keep flowing while sends are paused.
+                    await asyncio.wait_for(
+                        self.send_payload(payload, preserve_pending_on_failure=True),
+                        timeout=20.0 + self._delivery_timeout,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.warning("Loopdy Link rejection response delivery failed")
+                finally:
+                    self._rejection_queue.task_done()
+        except asyncio.QueueEmpty:
+            pass
+        finally:
+            if self._rejection_task is asyncio.current_task():
+                self._rejection_task = None
+
+    async def _stop_rejection_responses(self) -> None:
+        task, self._rejection_task = self._rejection_task, None
+        if task is not None:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        while not self._rejection_queue.empty():
+            self._rejection_queue.get_nowait()
+            self._rejection_queue.task_done()
+
     def _enqueue_inbound_callback(
         self,
         callback: Callable[[Any], Any],
@@ -995,6 +1244,7 @@ class LoopdyLinkClient:
         if task is not None and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        await self._stop_rejection_responses()
         while not self._inbound_callback_queue.empty():
             try:
                 self._inbound_callback_queue.get_nowait()
@@ -1013,10 +1263,9 @@ class LoopdyLinkClient:
                 if has_previous and frame.sequence <= previous:
                     await self._send_receipt(frame)
                     continue
-                if has_previous and frame.sequence != previous + 1:
-                    raise ValueError("Loopdy Link inbound sequence is invalid")
                 if isinstance(inbound, _InboundLinkPayloadRejection):
                     await self._quarantine_inbound_payload(frame, inbound.error)
+                    self._enqueue_rejection_response(inbound.response)
                     continue
                 if isinstance(inbound, _InboundLinkTurnFailure):
                     try:
@@ -1037,6 +1286,13 @@ class LoopdyLinkClient:
                         )
                         return
                     continue
+                # The queue may have waited long enough for a previously valid
+                # lease to expire. Link-wake readiness is deliberately unchanged.
+                if isinstance(inbound, InboundLinkRelayReady) and _expired_host_relay(inbound.registration):
+                    await self._quarantine_inbound_payload(
+                        frame, ExpiredHostRelayEnrollment("Loopdy Link host-relay enrollment has expired")
+                    )
+                    continue
                 callback_error: Exception | None = None
                 if inbound is not None:
                     try:
@@ -1048,6 +1304,13 @@ class LoopdyLinkClient:
                     except Exception as exc:
                         callback_error = exc
                 if callback_error is not None:
+                    if (
+                        isinstance(inbound, InboundLinkRelayReady)
+                        and inbound.registration.scope == "host_relay"
+                        and isinstance(callback_error, ExpiredHostRelayEnrollment)
+                    ):
+                        await self._quarantine_inbound_payload(frame, callback_error)
+                        continue
                     if isinstance(inbound, InboundLinkRelayReady):
                         detail = _connection_error_detail(callback_error)
                         logger.warning(
@@ -1161,10 +1424,13 @@ class LoopdyLinkClient:
     async def _close_for_reconnect(self, detail: str) -> None:
         self._last_error = detail
         self._connected.clear()
+        self._cancel_backpressure_retry()
         socket = self._socket
         if socket is not None:
             try:
-                await socket.close(code=1011, reason="Link delivery recovery")
+                await asyncio.wait_for(
+                    socket.close(code=1011, reason="Link delivery recovery"), timeout=1.0
+                )
             except Exception:
                 pass
 
@@ -1192,8 +1458,6 @@ class LoopdyLinkClient:
         if has_previous and frame.sequence <= previous:
             await self._send_receipt(frame)
             return
-        if has_previous and frame.sequence != previous + 1:
-            raise ValueError("Loopdy Link inbound sequence is invalid")
         sequence_map[frame.sender_device_id] = frame.sequence
         self._transport_set("received_sequences", sequence_map)
         self._transport_set(
@@ -1215,13 +1479,18 @@ class LoopdyLinkClient:
     def _accept_outbound(self, value: dict[str, Any]) -> None:
         frame_id = value.get("id")
         sequence = value.get("sequence")
-        if not isinstance(frame_id, str) or not isinstance(sequence, int) or sequence < 1:
+        if (
+            not isinstance(frame_id, str) or not isinstance(sequence, int)
+            or isinstance(sequence, bool) or sequence < 1
+        ):
             raise ValueError("Loopdy Link acknowledgement is invalid")
         pending = self._transport_get("pending_frame")
         if not isinstance(pending, dict):
             return
         if pending.get("id") != frame_id or pending.get("sequence") != sequence:
             raise ValueError("Loopdy Link acknowledgement does not match pending state")
+        self._cancel_backpressure_retry()
+        self._backpressured_frame_id = None
         self._transport_set("outbound_sequence", sequence)
         self._transport_set("pending_frame", None)
         if self._transport_get("failed_pending_frame_id") == frame_id:
@@ -1240,8 +1509,23 @@ class LoopdyLinkClient:
             "lastInboundFrameId",
             "lastAcknowledgedSequence",
         }
-        if set(value) != expected or value.get("version") != 1 or value.get("type") != "socket.ready":
+        if (
+            frozenset(value) not in {frozenset(expected), frozenset(expected | {"capabilities"})}
+            or type(value.get("version")) is not int
+            or value.get("version") != 1 or value.get("type") != "socket.ready"
+        ):
             raise ValueError("Loopdy Link socket readiness is invalid")
+        if "capabilities" in value:
+            capabilities = value["capabilities"]
+            if (
+                not isinstance(capabilities, list) or len(capabilities) > 32
+                or any(
+                    not isinstance(item, str) or not 1 <= len(item) <= 64
+                    or any(not (c.isascii() and (c.isalnum() or c in "_-")) for c in item)
+                    for item in capabilities
+                )
+            ):
+                raise ValueError("Loopdy Link socket capabilities are invalid")
         if value.get("deviceId") != self.config.device_id:
             raise ValueError("Loopdy Link socket readiness device is invalid")
         if value.get("authorizationEpoch") != self.config.authorization_epoch:
@@ -1271,10 +1555,12 @@ class LoopdyLinkClient:
         ):
             raise ValueError("Loopdy Link socket readiness state is invalid")
 
+        self._cancel_backpressure_retry()
         state = self._transport_get("pending_frame")
         outbound = int(self._transport_get("outbound_sequence", 0) or 0)
         received = int(self._transport_get("last_received_sequence", 0) or 0)
         if not isinstance(state, dict):
+            self._backpressured_frame_id = None
             self._transport_set("outbound_sequence", max(outbound, server_sequence))
             self._transport_set("last_received_sequence", max(received, server_ack))
             return
@@ -1286,6 +1572,7 @@ class LoopdyLinkClient:
         ):
             raise ValueError("Loopdy Link pending frame owner is invalid")
         if pending.sequence == server_sequence and pending.frame_id == server_frame_id:
+            self._backpressured_frame_id = None
             self._transport_set("outbound_sequence", max(outbound, server_sequence))
             self._transport_set("last_received_sequence", max(received, server_ack))
             self._transport_set("pending_frame", None)
@@ -1319,6 +1606,8 @@ class LoopdyLinkClient:
             ack=max(pending.ack, server_ack),
             ciphertext=self.cipher.seal(self.cipher.open(pending.ciphertext)),
         )
+        if self._backpressured_frame_id == pending.frame_id:
+            self._backpressured_frame_id = rebased.frame_id
         self._transport_set("pending_frame", rebased.wire_value())
         future = self._accepted.pop(pending.frame_id, None)
         if future is not None:
@@ -1386,6 +1675,27 @@ def _connection_error_detail(error: BaseException) -> str:
     if message:
         detail += f": {message}"
     return detail[:160]
+
+
+def _expired_host_relay(registration: RelayReady) -> bool:
+    return registration.scope == "host_relay" and registration.lease_expires <= int(time.time())
+
+
+def _connection_authentication_failed(error: BaseException) -> bool:
+    """Use the verified WSS peer's HTTP/close status, never exception text.
+
+    Both revoked credentials and other definitive authentication denials need
+    operator intervention. Network errors, 429/5xx and replacement code 4000
+    are not authentication denials.
+    """
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", None)
+    if status is None:
+        status = getattr(error, "status_code", None)
+    if status in {401, 403}:
+        return True
+    received = getattr(error, "rcvd", None)
+    return getattr(received, "code", None) == 1008
 
 
 def _connection_was_replaced(error: BaseException) -> bool:

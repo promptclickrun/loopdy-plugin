@@ -18,7 +18,7 @@ from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .events import LoopdyEvent
-from .link_contracts import RelayReady
+from .link_contracts import ExpiredHostRelayEnrollment, RelayReady
 from .presentation import shape_notification
 from .provider import DeliveryError, LiveActivityState, PushProvider
 from .providers.apns import ApnsPushProvider, load_apns_config
@@ -164,8 +164,10 @@ class LoopdyService:
         if registration.device_id != str(sender_device_id or ""):
             raise ValueError("Loopdy Link relay device does not match the verified sender")
         now = int(self._timestamp())
-        if registration.sent_at > now + 300 or registration.lease_expires <= now:
-            raise ValueError("Loopdy Link relay readiness is expired or from the future")
+        if registration.lease_expires <= now:
+            raise ExpiredHostRelayEnrollment("Loopdy Link host-relay enrollment has expired")
+        if registration.sent_at > now + 300:
+            raise ValueError("Loopdy Link relay readiness is from the future")
 
         acknowledged_ids = list(registration.acknowledged_sender_key_ids)
         with self._provider_lease("relay") as provider:

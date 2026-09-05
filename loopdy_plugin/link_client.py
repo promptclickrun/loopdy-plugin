@@ -1035,6 +1035,16 @@ class LoopdyLinkClient:
                 "reconnect_attempt": self._reconnect_attempt,
                 "detail": " ".join(str(detail).split())[:160],
             }
+            # Frame receipts are not state transitions. Keep diagnostics fresh
+            # at a coarse cadence without adding a durable write per frame.
+            previous_observed = prior.get("observed_at")
+            unchanged = all(
+                prior.get(key) == item for key, item in value.items()
+                if key != "observed_at"
+            )
+            if (unchanged and isinstance(previous_observed, (int, float))
+                    and 0 <= observed_at - previous_observed < 30):
+                return
             self.state.set("link.runtime_status", value)
         except Exception as exc:
             logger.warning(

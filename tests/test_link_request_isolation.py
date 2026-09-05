@@ -102,5 +102,47 @@ class LinkRequestIsolationTests(unittest.IsolatedAsyncioTestCase):
                 await client._stop_inbound_callback_dispatcher()
 
 
+    async def test_rejected_request_cannot_overtake_an_earlier_valid_request(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="loopdy-request-order-") as directory:
+            root = Path(directory)
+            config = LinkRuntimeConfig(
+                "https://link.example.invalid", "host-isolation-fixture", 1,
+                ec.generate_private_key(ec.SECP256R1()), b"k" * 32,
+            )
+            client = LoopdyLinkClient(
+                config, state=_State(root), attachment_root=root / "attachments"
+            )
+            socket = _Socket()
+            client._socket = socket
+            received = []
+            operations = ["sessions.list", "unsupported.fixture.operation", "sessions.list"]
+            try:
+                for sequence, operation in enumerate(operations, 1):
+                    payload = {
+                        "version": 1, "type": "workspace.request",
+                        "requestId": f"request-ordered-{sequence:04d}",
+                        "operation": operation, "payload": {}, "sentAt": 1_788_000_000,
+                    }
+                    wire = json.dumps({
+                        "version": 1, "type": "frame", "id": f"frame-ordered-{sequence:04d}",
+                        "senderDeviceId": "mobile-isolation-fixture", "senderEpoch": 1,
+                        "sequence": sequence, "ack": 0,
+                        "ciphertext": client.cipher.seal(payload),
+                    })
+                    await client.handle_wire_message(wire, received.append, defer_callbacks=True)
+                await client._inbound_callback_queue.join()
+                self.assertEqual(
+                    [item.request.request_id for item in received],
+                    ["request-ordered-0001", "request-ordered-0003"],
+                )
+                self.assertEqual(
+                    [item["frameId"] for item in socket.sent if item.get("type") == "receipt"],
+                    ["frame-ordered-0001", "frame-ordered-0002", "frame-ordered-0003"],
+                )
+                self.assertEqual(socket.closes, [])
+            finally:
+                await client._stop_inbound_callback_dispatcher()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -255,6 +255,11 @@ class _InboundLinkTurnFailure:
 
 
 @dataclass(frozen=True)
+class _InboundLinkPayloadRejection:
+    error: ValueError
+
+
+@dataclass(frozen=True)
 class InboundLinkRelayReady:
     registration: RelayReady
     sender_device_id: str
@@ -628,6 +633,7 @@ class LoopdyLinkClient:
         inbound: (
             InboundLinkTurn
             | _InboundLinkTurnFailure
+            | _InboundLinkPayloadRejection
             | InboundLinkRelayReady
             | InboundLinkVoiceSpeak
             | InboundLinkPickerOpen
@@ -767,8 +773,20 @@ class LoopdyLinkClient:
                 sender_device_id=frame.sender_device_id,
             )
         elif payload.get("type") == "workspace.request":
+            try:
+                request = parse_workspace_request(payload)
+            except ValueError as exc:
+                if defer_callbacks:
+                    self._enqueue_inbound_callback(
+                        callback,
+                        frame,
+                        _InboundLinkPayloadRejection(error=exc),
+                    )
+                else:
+                    await self._quarantine_inbound_payload(frame, exc)
+                return False
             inbound = InboundLinkWorkspaceRequest(
-                request=parse_workspace_request(payload),
+                request=request,
                 sender_device_id=frame.sender_device_id,
             )
         else:
@@ -997,6 +1015,9 @@ class LoopdyLinkClient:
                     continue
                 if has_previous and frame.sequence != previous + 1:
                     raise ValueError("Loopdy Link inbound sequence is invalid")
+                if isinstance(inbound, _InboundLinkPayloadRejection):
+                    await self._quarantine_inbound_payload(frame, inbound.error)
+                    continue
                 if isinstance(inbound, _InboundLinkTurnFailure):
                     try:
                         await self._send_user_message_result(
@@ -1153,10 +1174,10 @@ class LoopdyLinkClient:
         error: BaseException,
     ) -> None:
         # This is an authenticated, sequence-valid application payload. If its
-        # bounded attachment processing fails, replaying the same durable frame
-        # on every replacement socket can never repair it and instead creates a
-        # permanent reconnect loop. Consume only that frame so later requests
-        # remain usable; transport/protocol failures still escape normally.
+        # bounded validation or attachment processing fails, replaying the same
+        # durable frame on every replacement socket can never repair it and
+        # instead creates a permanent reconnect loop. Consume only that frame so
+        # later requests remain usable; transport/protocol failures still escape.
         logger.warning(
             "Loopdy Link quarantined inbound payload (%s)",
             _connection_error_detail(error),

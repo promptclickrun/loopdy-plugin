@@ -320,6 +320,7 @@ class LoopdyAdapter(BasePlatformAdapter):
                 session_workspace_getter=self._get_link_session_workspace,
                 session_active_getter=self._is_link_session_active,
                 session_goal_getter=self.goal_snapshot_for_session,
+                session_runtime_getter=self.runtime_snapshot_for_session,
                 connection_id_getter=self._link_workspace_connection_id,
                 workspace_git_state_path=(
                     get_hermes_home()
@@ -439,6 +440,24 @@ class LoopdyAdapter(BasePlatformAdapter):
             "sessionId": route, "storedSessionId": session_id,
             "status": status, "summary": summary,
         }
+
+    async def runtime_snapshot_for_session(self, agent_id: str, stored_id: str) -> dict[str, str] | None:
+        """Read an exact current session override through the public session store."""
+        store = getattr(self, "_session_store", None)
+        if store is None:
+            return None
+
+        def read():
+            entry = store.lookup_by_session_id(stored_id)
+            if entry is None or (getattr(entry.origin, "profile", None) or "default") != agent_id:
+                return None
+            key = entry.session_key
+            override = store.get_model_override(key)
+            if store.peek_session_id(key) != stored_id or not override:
+                return None
+            return {key: override[key] for key in ("model", "provider") if override.get(key)}
+
+        return await asyncio.to_thread(read)
 
     async def goal_snapshot_for_session(
         self, agent_id: str, session_id: str, stored_id: str

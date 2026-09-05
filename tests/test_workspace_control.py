@@ -2609,6 +2609,53 @@ class HermesWorkspaceBackendTests(unittest.TestCase):
             ["newer-chat", "older-chat"],
         )
 
+    def test_session_history_includes_only_safe_exact_session_runtime(self) -> None:
+        class RuntimeBackend(_ProfileBackend):
+            async def _session_detail(self, session_id, agent_id):
+                return {"id": session_id, "profile": agent_id, "model": "saved-model",
+                        "model_config": json.dumps({"gateway_runtime": {
+                            "provider": "openai", "base_url": "https://private.invalid"},
+                            "api_key": "never-export-this"})}
+        result = asyncio.run(RuntimeBackend().sessions_history({
+            "storedId": "stored-session-0001", "agentId": "default"}))
+        self.assertEqual(result.get("runtime"), {"model": "saved-model", "provider": "openai"})
+        self.assertNotIn("private.invalid", json.dumps(result))
+        self.assertNotIn("never-export-this", json.dumps(result))
+
+    def test_session_runtime_omits_mismatched_or_malformed_metadata(self) -> None:
+        for metadata in (
+            {"id": "another-session", "profile": "default", "model": "wrong"},
+            {"id": "stored-session-0001", "profile": "other-agent", "model": "wrong"},
+            {"id": "stored-session-0001", "profile": "default", "model": "x" * 161},
+        ):
+            class RuntimeBackend(_ProfileBackend):
+                async def _session_detail(self, session_id, agent_id):
+                    return metadata
+            result = asyncio.run(RuntimeBackend().sessions_history({
+                "storedId": "stored-session-0001", "agentId": "default"}))
+            self.assertNotIn("runtime", result)
+            self.assertEqual(len(result["messages"]), 3)
+
+    def test_session_runtime_prefers_current_override_and_omits_secrets(self) -> None:
+        class RuntimeBackend(_ProfileBackend):
+            async def _session_detail(self, session_id, agent_id):
+                return {"id": session_id, "profile": agent_id, "model": "last-used"}
+        backend = RuntimeBackend()
+        async def current(agent_id, stored_id):
+            self.assertEqual((agent_id, stored_id), ("default", "stored-session-0001"))
+            return {"model": "selected-next", "provider": "anthropic", "base_url": "private", "api_key": "secret"}
+        backend.session_runtime_getter = current
+        result = asyncio.run(backend.sessions_history({"storedId": "stored-session-0001", "agentId": "default"}))
+        self.assertEqual(result["runtime"], {"model": "selected-next", "provider": "anthropic"})
+
+    def test_session_runtime_read_failure_does_not_block_history(self) -> None:
+        class RuntimeBackend(_ProfileBackend):
+            async def _session_detail(self, session_id, agent_id):
+                raise RuntimeError("unavailable")
+        result = asyncio.run(RuntimeBackend().sessions_history({"storedId": "stored-session-0001", "agentId": "default"}))
+        self.assertNotIn("runtime", result)
+        self.assertEqual(len(result["messages"]), 3)
+
     def test_session_history_preserves_renderable_rich_hermes_message_records(self) -> None:
         backend = _ProfileBackend()
 

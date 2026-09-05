@@ -125,6 +125,7 @@ class HermesWorkspaceBackend:
         session_workspace_getter: Any | None = None,
         session_active_getter: Any | None = None,
         session_goal_getter: Any | None = None,
+        session_runtime_getter: Any | None = None,
         connection_id_getter: Any | None = None,
         workspace_git: WorkspaceGitService | Any | None = None,
         workspace_git_state_path: Path | str | None = None,
@@ -137,6 +138,7 @@ class HermesWorkspaceBackend:
         self.session_workspace_getter = session_workspace_getter
         self.session_active_getter = session_active_getter
         self.session_goal_getter = session_goal_getter
+        self.session_runtime_getter = session_runtime_getter
         self.connection_id_getter = connection_id_getter
         self.workspace_git = workspace_git
         self.workspace_git_state_path = Path(
@@ -1229,6 +1231,30 @@ class HermesWorkspaceBackend:
             "deleted": True,
         }
 
+    async def _session_runtime(self, stored_id: str, agent_id: str) -> dict[str, str] | None:
+        """Optional display-only metadata. Never export the underlying model config."""
+        try:
+            detail = await self._session_detail(stored_id, agent_id)
+            if detail.get("id") != stored_id or detail.get("profile") != agent_id:
+                return None
+            from hermes_state import SessionDB
+
+            runtime = {"model": detail.get("model")}
+            provider = SessionDB.session_gateway_runtime(detail).get("provider")
+            if provider:
+                runtime["provider"] = provider
+            if self.session_runtime_getter is not None:
+                override = await self.session_runtime_getter(agent_id, stored_id)
+                if override and override.get("model"):
+                    runtime = override
+            result = {"model": _text(runtime.get("model"), 160, allow_empty=False)}
+            if runtime.get("provider"):
+                result["provider"] = _text(runtime["provider"], 128, allow_empty=False)
+            return result
+        except Exception:
+            # Unavailable/legacy optional metadata must not strand history.
+            return None
+
     async def sessions_history(self, payload: dict[str, Any]) -> dict[str, Any]:
         values = _object(payload, "workspace payload")
         required = {"storedId", "agentId"}
@@ -1283,6 +1309,10 @@ class HermesWorkspaceBackend:
         rows = raw.get("messages")
         if not isinstance(rows, list) or len(rows) > 500:
             raise WorkspaceControlError("Hermes session history is invalid")
+        runtime = None
+        if offset == 0 and raw.get("session_id", stored_id) == stored_id:
+            runtime = await self._session_runtime(stored_id, agent_id)
+        runtime_fields = {"runtime": runtime} if runtime else {}
         messages_by_row: dict[int, dict[str, Any]] = {}
         for index, row in enumerate(rows):
             if not isinstance(row, dict):
@@ -1346,6 +1376,7 @@ class HermesWorkspaceBackend:
                 "storedId": stored_id,
                 "agentId": agent_id,
                 "messages": candidate,
+                **runtime_fields,
                 "nextOffset": offset + consumed + 1,
             }
             encoded = json.dumps(
@@ -1370,6 +1401,7 @@ class HermesWorkspaceBackend:
             "storedId": stored_id,
             "agentId": agent_id,
             "messages": selected,
+            **runtime_fields,
         }
         if consumed < len(rows) or len(rows) == 500:
             result["nextOffset"] = offset + consumed

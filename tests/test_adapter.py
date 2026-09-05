@@ -243,6 +243,26 @@ class _ActivityBroker:
 
 
 class AdapterTests(unittest.TestCase):
+    def test_runtime_snapshot_reads_only_the_exact_current_owner(self):
+        entry = SimpleNamespace(session_id="stored-one", session_key="route-one", origin=SimpleNamespace(profile="default"))
+        class Store:
+            current_id = "stored-one"
+            def lookup_by_session_id(self, stored_id):
+                return entry if stored_id == "stored-one" else None
+            def get_model_override(self, key):
+                return {"model": "chosen-model", "provider": "anthropic", "base_url": "private", "api_key": "secret"}
+            def peek_session_id(self, key):
+                return self.current_id
+        store = Store()
+        adapter = SimpleNamespace(_session_store=store)
+        async def read(agent="default", stored="stored-one"):
+            return await LoopdyAdapter.runtime_snapshot_for_session(adapter, agent, stored)
+        self.assertEqual(asyncio.run(read()), {"model": "chosen-model", "provider": "anthropic"})
+        self.assertIsNone(asyncio.run(read(agent="other")))
+        self.assertIsNone(asyncio.run(read(stored="retired")))
+        store.current_id = "replacement"
+        self.assertIsNone(asyncio.run(read()))
+
     def setUp(self) -> None:
         runtime_config_patcher = patch(
             "loopdy_plugin.adapter.load_runtime_config",

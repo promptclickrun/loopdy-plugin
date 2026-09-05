@@ -36,10 +36,12 @@ if str(PLUGIN_ROOT) not in sys.path:
 from loopdy_plugin.adapter import data_path, get_service  # noqa: E402
 from loopdy_plugin.attachments import AttachmentStore, MAX_ITEMS  # noqa: E402
 from loopdy_plugin.events import EVENT_TYPES  # noqa: E402
+
 from loopdy_plugin.generative_ui import (  # noqa: E402
     GenerativeUIError,
     validate_submission_values,
 )
+from loopdy_plugin.link_contracts import PLUGIN_VERSION  # noqa: E402
 from loopdy_plugin.provider import DeliveryError  # noqa: E402
 from loopdy_plugin.relay_crypto import b64url_decode, key_id  # noqa: E402
 from loopdy_plugin.targets import validate_target  # noqa: E402
@@ -409,7 +411,7 @@ def capabilities() -> dict[str, Any]:
     health = _active_service().health()
     return {
         "plugin": "loopdy",
-        "plugin_version": "2.2.15",
+        "plugin_version": PLUGIN_VERSION,
         "schema_version": 2,
         "channel": "loopdy",
         "default_provider": "relay",

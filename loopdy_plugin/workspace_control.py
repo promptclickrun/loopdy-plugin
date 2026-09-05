@@ -32,6 +32,7 @@ from .link_contracts import (
     _workspace_json,
 )
 from .workspace_git import WorkspaceGitError, WorkspaceGitService
+from . import workspace_capabilities
 
 
 class WorkspaceControlError(RuntimeError):
@@ -123,6 +124,7 @@ class HermesWorkspaceBackend:
         session_workspace_setter: Any | None = None,
         session_workspace_getter: Any | None = None,
         session_active_getter: Any | None = None,
+        session_goal_getter: Any | None = None,
         connection_id_getter: Any | None = None,
         workspace_git: WorkspaceGitService | Any | None = None,
         workspace_git_state_path: Path | str | None = None,
@@ -134,6 +136,7 @@ class HermesWorkspaceBackend:
         self.session_workspace_setter = session_workspace_setter
         self.session_workspace_getter = session_workspace_getter
         self.session_active_getter = session_active_getter
+        self.session_goal_getter = session_goal_getter
         self.connection_id_getter = connection_id_getter
         self.workspace_git = workspace_git
         self.workspace_git_state_path = Path(
@@ -153,6 +156,7 @@ class HermesWorkspaceBackend:
             tuple[str, str, str, str], WorkspaceGitService
         ] = OrderedDict()
         self._skill_update_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._capability_update_lock = asyncio.Lock()
 
     async def agents_list(self, payload: dict[str, Any]) -> dict[str, Any]:
         _empty_payload(payload)
@@ -376,7 +380,7 @@ class HermesWorkspaceBackend:
         agent_id = _agent_payload_id(payload)
         raw_skills, raw_plugins, raw_mcp = await asyncio.gather(
             self._skills_catalog(agent_id),
-            self._plugins_catalog(),
+            self._plugins_catalog(agent_id),
             self._mcp_catalog(agent_id),
         )
         if not isinstance(raw_skills, list) or len(raw_skills) > 1_000:
@@ -424,6 +428,7 @@ class HermesWorkspaceBackend:
                     ),
                     "enabled": source.get("enabled") is not False,
                     "capabilityCount": sum(counts),
+                    "controlReason": _text(source.get("controlReason"), 1024, allow_empty=True),
                 }
             )
 
@@ -450,15 +455,36 @@ class HermesWorkspaceBackend:
                     "toolCount": tool_count,
                 }
             )
+        tools = []
+        tools_notice = ""
+        try:
+            raw_tools = await workspace_capabilities.toolsets(agent_id)
+            for source in raw_tools:
+                tools.append({
+                    "id": _text(source.get("id"), 160),
+                    "name": _text(source.get("name"), 160),
+                    "description": _text(source.get("description"), 4096, allow_empty=True),
+                    "platform": _text(source.get("platform"), 80),
+                    "enabled": source["enabled"],
+                    "toolCount": _nonnegative_integer(source.get("toolCount"), maximum=100_000),
+                })
+        except Exception:
+            # An absent optional toolset API must not erase the older catalog.
+            tools_notice = "Toolset configuration is unavailable on this Hermes host."
         return {
             "agentId": agent_id,
             "skills": skills,
             "plugins": plugins,
             "mcpServers": mcp_servers,
+            "tools": tools,
+            "management": workspace_capabilities.editor_capabilities(),
+            "toolsNotice": tools_notice,
         }
 
     async def skills_tools_get(self, payload: dict[str, Any]) -> dict[str, Any]:
         values = _object(payload, "skill payload")
+        if "capabilityKind" in values:
+            return await self._capability_get(values)
         if set(values) != {"agentId", "skillId"}:
             raise WorkspaceControlError("Skill request is invalid")
         agent_id = _agent_id(values.get("agentId"))
@@ -473,6 +499,63 @@ class HermesWorkspaceBackend:
             "content": content,
             "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
         }
+
+    async def _capability_get(self, values: dict[str, Any]) -> dict[str, Any]:
+        if set(values) != {"agentId", "capabilityKind", "capabilityId"}:
+            raise WorkspaceControlError("Capability request is invalid")
+        agent_id = _agent_id(values.get("agentId"))
+        kind = values.get("capabilityKind")
+        sections = {"skill": "skills", "plugin": "plugins", "mcpServer": "mcpServers", "toolset": "tools"}
+        if not isinstance(kind, str) or kind not in sections:
+            raise WorkspaceControlError("Capability type is invalid")
+        item_id = _coordinate(values.get("capabilityId"), 160)
+        catalog = await self.skills_tools_list({"agentId": agent_id})
+        matches = [item for item in catalog[sections[kind]] if item["id"] == item_id]
+        if len(matches) != 1:
+            raise WorkspaceConflictError("This capability is no longer uniquely available in the selected profile. Refresh the catalog.")
+        item = dict(matches[0])
+        if kind == "plugin":
+            item["identityAmbiguous"] = sum(row["name"] == item["name"] for row in catalog["plugins"]) != 1
+        return {"agentId": agent_id, "control": workspace_capabilities.control(agent_id, kind, item)}
+
+    async def _capability_set_enabled(self, values: dict[str, Any]) -> dict[str, Any]:
+        if set(values) != {"agentId", "capabilityKind", "capabilityId", "enabled", "expectedRevision", "confirmed"}:
+            raise WorkspaceControlError("Capability update is invalid")
+        if values.get("confirmed") is not True or type(values.get("enabled")) is not bool:
+            raise WorkspaceControlError("Confirm this capability change before applying it")
+        expected = _sha256_coordinate(values.get("expectedRevision"))
+        target = {key: values[key] for key in ("agentId", "capabilityKind", "capabilityId")}
+        # Serialize this Link controller's mutations. Hermes owns config-file
+        # locking; its public APIs do not offer cross-process compare-and-set.
+        async with self._capability_update_lock:
+            current = await self._capability_get(target)
+            control = current["control"]
+            if not control["canToggle"]:
+                raise WorkspaceControlError(control["reason"], code="capability_locked")
+            if not hmac.compare_digest(expected, control["revision"]):
+                raise WorkspaceConflictError("Capability settings changed. Refresh and confirm again.")
+            try:
+                await workspace_capabilities.set_enabled(
+                    current["agentId"], control["kind"], control["id"], values["enabled"]
+                )
+            except (ImportError, AttributeError) as exc:
+                raise WorkspaceControlError(
+                    "Update Hermes and the Loopdy host plugin to manage this capability.",
+                    code="capability_unsupported",
+                ) from exc
+            except Exception as exc:
+                # Never reflect host exceptions: they can contain config or paths.
+                raise WorkspaceControlError(
+                    "Hermes could not confirm this change. Refresh to read the saved state before retrying.",
+                    code="capability_unconfirmed",
+                ) from exc
+            verified = await self._capability_get(target)
+            if verified["control"]["enabled"] is not values["enabled"]:
+                raise WorkspaceControlError(
+                    "The saved state did not match the requested change. Refresh before retrying.",
+                    code="capability_unconfirmed",
+                )
+            return verified
 
     async def skills_tools_create(self, payload: dict[str, Any]) -> dict[str, Any]:
         values = _object(payload, "skill payload")
@@ -490,6 +573,8 @@ class HermesWorkspaceBackend:
 
     async def skills_tools_update(self, payload: dict[str, Any]) -> dict[str, Any]:
         values = _object(payload, "skill payload")
+        if "capabilityKind" in values:
+            return await self._capability_set_enabled(values)
         if set(values) != {"agentId", "skillId", "content", "expectedSha256"}:
             raise WorkspaceControlError("Skill update request is invalid")
         agent_id = _agent_id(values.get("agentId"))
@@ -509,9 +594,10 @@ class HermesWorkspaceBackend:
             ):
                 raise WorkspaceConflictError("Skill changed before the update was saved")
             await self._skill_update(agent_id, skill_id, content)
-            return await self.skills_tools_get(
-                {"agentId": agent_id, "skillId": skill_id}
-            )
+            verified = await self.skills_tools_get({"agentId": agent_id, "skillId": skill_id})
+            if verified["content"] != content:
+                raise WorkspaceConflictError("Skill changed during the save. Reopen it before making further changes.")
+            return verified
 
     async def skills_tools_import(self, payload: dict[str, Any]) -> dict[str, Any]:
         values = _object(payload, "skill import payload")
@@ -985,6 +1071,7 @@ class HermesWorkspaceBackend:
             reverse=True,
         )
         sessions = []
+        project_catalogs: dict[str, dict[str, Any]] = {}
         stored_ids: set[str] = set()
         for source in sources:
             stored_id = _coordinate(source.get("id"), 160)
@@ -995,6 +1082,17 @@ class HermesWorkspaceBackend:
         for source in sources:
             stored_id = _coordinate(source.get("id"), 160)
             profile = _agent_id(source.get("profile"))
+            workspace_id = None
+            workspace_name = None
+            if source.get("cwd") not in (None, ""):
+                if profile not in project_catalogs:
+                    project_catalogs[profile] = _object(
+                        await self._projects_catalog(profile),
+                        "Hermes project catalog",
+                    )
+                workspace_id, workspace_name = _session_workspace_identity(
+                    source.get("cwd"), project_catalogs[profile]
+                )
             session_source = _coordinate(source.get("source", "local"), 64)
             chat_id = _optional_coordinate(source.get("chat_id"), 160)
             preferred_visible_id = (
@@ -1028,8 +1126,14 @@ class HermesWorkspaceBackend:
                 if inspect.isawaitable(resolved_active):
                     resolved_active = await resolved_active
                 is_active = resolved_active is True
+            goal = None
+            if session_source == "loopdy" and callable(self.session_goal_getter):
+                goal = self.session_goal_getter(profile, preferred_visible_id, stored_id)
+                if inspect.isawaitable(goal):
+                    goal = await goal
             sessions.append(
                 {
+                    **({"goal": goal} if goal is not None else {}),
                     "storedId": stored_id,
                     "profile": profile,
                     "source": session_source,
@@ -1049,6 +1153,8 @@ class HermesWorkspaceBackend:
                     ),
                     "isActive": is_active,
                     "isPinned": source.get("pinned") is True,
+                    "workspaceId": workspace_id,
+                    "workspaceName": workspace_name,
                 }
             )
         return {"sessions": sessions}
@@ -2106,7 +2212,7 @@ class HermesWorkspaceBackend:
             return await get_skill_content(name=skill_id, profile=agent_id)
         except Exception as exc:
             raise WorkspaceControlError(
-                str(getattr(exc, "detail", "Skill could not be loaded"))
+                "Skill could not be loaded. Refresh the catalog; if the problem persists, update Hermes and the Loopdy host plugin."
             ) from exc
 
     async def _skill_create(
@@ -2121,7 +2227,7 @@ class HermesWorkspaceBackend:
             ))
         except Exception as exc:
             raise WorkspaceControlError(
-                str(getattr(exc, "detail", "Skill could not be created"))
+                "Hermes rejected skill creation. Check the name, frontmatter and host security policy; an existing skill will not be overwritten."
             ) from exc
 
     async def _skill_update(self, agent_id: str, name: str, content: str) -> None:
@@ -2134,7 +2240,7 @@ class HermesWorkspaceBackend:
             ))
         except Exception as exc:
             raise WorkspaceControlError(
-                str(getattr(exc, "detail", "Skill could not be updated"))
+                "Hermes rejected the skill update. Check the frontmatter and host security policy, then reopen the current skill before retrying."
             ) from exc
 
     async def _skill_import_bundle(
@@ -2158,7 +2264,7 @@ class HermesWorkspaceBackend:
                 result = _create_skill(name, content, category)
                 if not result.get("success"):
                     raise WorkspaceControlError(
-                        str(result.get("error", "Skill could not be created"))
+                        "Hermes rejected the skill bundle. Check its name, frontmatter and host security policy."
                     )
                 try:
                     found = _find_skill(name)
@@ -2174,7 +2280,7 @@ class HermesWorkspaceBackend:
                             handle.write(data)
                     scan_error = _security_scan_skill(root)
                     if scan_error:
-                        raise WorkspaceControlError(scan_error)
+                        raise WorkspaceControlError("Hermes security policy rejected the skill bundle; the new bundle was removed.")
                 except Exception:
                     _delete_skill(name)
                     raise
@@ -2182,10 +2288,8 @@ class HermesWorkspaceBackend:
 
         await asyncio.to_thread(_install)
 
-    async def _plugins_catalog(self) -> list[dict[str, Any]]:
-        from hermes_cli.plugins import get_plugin_manager
-
-        return get_plugin_manager().list_plugins()
+    async def _plugins_catalog(self, agent_id: str) -> list[dict[str, Any]]:
+        return await workspace_capabilities.plugins(agent_id)
 
     async def _mcp_catalog(self, agent_id: str) -> dict[str, Any]:
         from hermes_cli.web_server import list_mcp_servers
@@ -2456,6 +2560,55 @@ def _project_primary_path(project: dict[str, Any]) -> str:
     if primary is None and isinstance(folders[0], dict):
         primary = folders[0].get("path")
     return _absolute_project_path(primary)
+
+
+def _session_workspace_identity(
+    cwd: Any, catalog: dict[str, Any]
+) -> tuple[str | None, str | None]:
+    if not isinstance(cwd, str) or not cwd.strip():
+        return None, None
+    candidate = Path(cwd).expanduser()
+    if not candidate.is_absolute():
+        return None, None
+    try:
+        canonical_cwd = candidate.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return None, None
+    rows = catalog.get("projects")
+    if not isinstance(rows, list) or len(rows) > 256:
+        raise WorkspaceControlError("Hermes project catalog is invalid")
+    matches: dict[tuple[str, str], int] = {}
+    for value in rows:
+        project = _object(value, "Hermes project")
+        if project.get("archived") is True:
+            continue
+        identity = (
+            _coordinate(project.get("id"), 160),
+            _text(project.get("name"), 160),
+        )
+        raw_paths = [project.get("primary_path")]
+        folders = project.get("folders")
+        if isinstance(folders, list):
+            if len(folders) > 64:
+                raise WorkspaceControlError("Hermes project catalog is invalid")
+            raw_paths.extend(
+                folder.get("path")
+                for folder in folders
+                if isinstance(folder, dict)
+            )
+        for raw_path in raw_paths:
+            try:
+                project_path = Path(_absolute_project_path(raw_path))
+                canonical_cwd.relative_to(project_path)
+            except (WorkspaceControlError, ValueError):
+                continue
+            depth = len(project_path.parts)
+            matches[identity] = max(depth, matches.get(identity, 0))
+    if not matches:
+        return None, None
+    deepest = max(matches.values())
+    owners = [identity for identity, depth in matches.items() if depth == deepest]
+    return owners[0] if len(owners) == 1 else (None, None)
 
 
 def _absolute_project_path(value: Any) -> str:
@@ -2818,6 +2971,8 @@ def _decode_skill_zip(data: bytes) -> tuple[str, str, list[tuple[str, bytes]]]:
             mode = entry.external_attr >> 16
             if stat.S_ISLNK(mode):
                 raise WorkspaceControlError("Skill ZIP cannot contain symbolic links")
+            if stat.S_IFMT(mode) not in {0, stat.S_IFREG} or entry.flag_bits & 1:
+                raise WorkspaceControlError("Skill ZIP cannot contain special or encrypted files")
             if entry.file_size > 512_000:
                 raise WorkspaceControlError("Skill ZIP contains an oversized file")
             expanded += entry.file_size
@@ -3301,11 +3456,23 @@ def _task_projection(value: Any, *, default_agent_id: str | None) -> dict[str, A
     display = _text(
         source.get("schedule_display"), 2_048, allow_empty=True
     ) or embedded_display or request
+    raw_prompt = source.get("prompt")
+    raw_script = source.get("script")
+    if isinstance(raw_prompt, str) and raw_prompt.strip():
+        instructions = _text(raw_prompt, 256_000)
+    elif (
+        source.get("no_agent") is True
+        and isinstance(raw_script, str)
+        and raw_script.strip()
+    ):
+        instructions = "Runs the configured automation."
+    else:
+        instructions = _text(raw_prompt, 256_000)
     result: dict[str, Any] = {
         "id": task_id,
         "agentId": agent_id,
         "name": _text(source.get("name"), 240),
-        "instructions": _text(source.get("prompt"), 256_000),
+        "instructions": instructions,
         "scheduleRequest": request,
         "scheduleDisplay": display,
         "delivery": _text(source.get("deliver", "local"), 512),

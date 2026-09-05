@@ -483,6 +483,22 @@ class LinkContractTests(unittest.TestCase):
             )
         with self.assertRaises(ValueError):
             activity_event(
+                event_id="handoff_event_fixture_0001",
+                session_id="session_coordinate_0001",
+                turn_id="turn_coordinate_0001",
+                kind="bot_handoff",
+                lifecycle="running",
+                title="Contacting Nova",
+                summary=None,
+                detail=None,
+                occurred_at=1_788_000_012,
+                arguments="x" * 64_001,
+                bot_run_id="agent_message_call_0001",
+                member_id="nova",
+                from_member_id="default",
+            )
+        with self.assertRaises(ValueError):
+            activity_event(
                 event_id="reason_event_fixture_01",
                 session_id="session_coordinate_0001",
                 turn_id="turn_coordinate_0001",
@@ -1112,6 +1128,30 @@ class LinkContractTests(unittest.TestCase):
         self.assertNotIn("token", json.dumps(payload).lower())
         with self.assertRaises(ValueError):
             parse_command_catalog_request({**request.wire_value(), "gatewayToken": "never"})
+
+    def test_skill_import_request_allows_one_bounded_base64_archive(self) -> None:
+        from loopdy_plugin.link_contracts import parse_workspace_request
+
+        encoded = base64.b64encode(b"z" * 200_000).decode("ascii")
+        request = parse_workspace_request({
+            "version": 1,
+            "type": "workspace.request",
+            "requestId": "workspace_skill_import_0001",
+            "operation": "skills_tools.import",
+            "payload": {
+                "agentId": "default",
+                "kind": "zip",
+                "dataBase64": encoded,
+            },
+            "sentAt": 1_788_000_059,
+        })
+
+        self.assertEqual(request.payload["dataBase64"], encoded)
+        with self.assertRaises(ValueError):
+            parse_workspace_request({
+                **request.wire_value(),
+                "payload": {**request.payload, "dataBase64": "not-base64!"},
+            })
 
     def test_workspace_request_is_an_explicit_bounded_control_not_a_gateway_proxy(self) -> None:
         from loopdy_plugin.link_contracts import (

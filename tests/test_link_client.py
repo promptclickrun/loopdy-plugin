@@ -1297,6 +1297,102 @@ class LinkClientTests(unittest.TestCase):
         self.assertEqual([item.message.text for item in received], [plaintext["text"]])
         self.assertEqual(socket.sent[0]["sequence"], 16)
 
+    def test_existing_host_accepts_a_higher_sequence_after_missing_other_host_traffic(self) -> None:
+        from loopdy_plugin.link_client import LoopdyLinkClient
+
+        _, config = self._configuration()
+        state = _State()
+        state.set(
+            "link.transport.host-device-fixture.received_sequences",
+            {"mobile-device-1": 10},
+        )
+        state.set("link.transport.host-device-fixture.last_received_sequence", 10)
+        client = LoopdyLinkClient(config, state=state)
+        socket = _Socket()
+        client._socket = socket
+        received = []
+        plaintext = {
+            "version": 1,
+            "type": "workspace.request",
+            "requestId": "request-after-host-gap-0021",
+            "operation": "sessions.list",
+            "payload": {},
+            "sentAt": int(time.time()),
+            "targetHostId": config.device_id,
+        }
+        wire = json.dumps(
+            {
+                "version": 1,
+                "type": "frame",
+                "id": "frame-after-host-gap-0021",
+                "senderDeviceId": "mobile-device-1",
+                "senderEpoch": 1,
+                "sequence": 21,
+                "ack": 0,
+                "ciphertext": client.cipher.seal(plaintext),
+            }
+        )
+
+        asyncio.run(client.handle_wire_message(wire, received.append))
+
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0].request.operation, "sessions.list")
+        self.assertEqual(
+            state.get("link.transport.host-device-fixture.received_sequences"),
+            {"mobile-device-1": 21},
+        )
+        self.assertEqual(socket.sent[-1]["type"], "receipt")
+
+        # Replaying the accepted coordinate remains idempotent and is never
+        # dispatched to Hermes a second time.
+        asyncio.run(client.handle_wire_message(wire, received.append))
+        self.assertEqual(len(received), 1)
+        self.assertEqual(socket.sent[-1]["type"], "receipt")
+
+    def test_existing_host_rejects_a_lower_sequence_as_replay_after_a_gap(self) -> None:
+        from loopdy_plugin.link_client import LoopdyLinkClient
+
+        _, config = self._configuration()
+        state = _State()
+        state.set(
+            "link.transport.host-device-fixture.received_sequences",
+            {"mobile-device-1": 21},
+        )
+        client = LoopdyLinkClient(config, state=state)
+        socket = _Socket()
+        client._socket = socket
+        received = []
+        payload = {
+            "version": 1,
+            "type": "workspace.request",
+            "requestId": "replayed-request-0019",
+            "operation": "sessions.list",
+            "payload": {},
+            "sentAt": int(time.time()),
+            "targetHostId": config.device_id,
+        }
+        wire = json.dumps(
+            {
+                "version": 1,
+                "type": "frame",
+                "id": "replayed-frame-0019",
+                "senderDeviceId": "mobile-device-1",
+                "senderEpoch": 1,
+                "sequence": 19,
+                "ack": 0,
+                "ciphertext": client.cipher.seal(payload),
+            }
+        )
+
+        asyncio.run(client.handle_wire_message(wire, received.append))
+
+        self.assertEqual(received, [])
+        self.assertEqual(
+            state.get("link.transport.host-device-fixture.received_sequences"),
+            {"mobile-device-1": 21},
+        )
+        self.assertEqual(socket.sent[-1]["type"], "receipt")
+
     def test_public_status_never_contains_runtime_secrets(self) -> None:
         from loopdy_plugin.link_client import LoopdyLinkClient
 

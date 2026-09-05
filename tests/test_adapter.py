@@ -1210,6 +1210,74 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(observed[0][1], (None, 0))
         self.assertEqual(observed[1][1], ("Stopped", 0))
 
+    def test_registered_command_keeps_hermes_busy_contract(self) -> None:
+        from gateway.session import build_session_key
+        from loopdy_plugin.link_client import InboundLinkTurn
+        from loopdy_plugin.link_contracts import UserMessage
+
+        for index, (text, behavior) in enumerate(
+            (
+                ("/btw Which module owns titles?", "interrupt"),
+                ("/btw Which module owns titles?", "steer"),
+                ("/btw Which module owns titles?", "queue"),
+                ("/model", "interrupt"),
+                ("/reset", "interrupt"),
+            )
+        ):
+            with self.subTest(text=text, behavior=behavior):
+                adapter = LoopdyAdapter(
+                    PlatformConfig(enabled=True),
+                    service=_Service(),
+                    link_client=_LinkClient(),
+                )
+                observed = []
+
+                async def handle(event):
+                    observed.append(event.text)
+
+                adapter.handle_message = handle
+                turn = InboundLinkTurn(
+                    message=UserMessage(
+                        message_id=f"message-command-coordinate-{index:04d}",
+                        session_id=f"session-command-coordinate-{index:04d}",
+                        agent_id="finance",
+                        actor_id="actor-coordinate-1",
+                        actor_name="Alex",
+                        device_name="Kitchen iPad",
+                        text=text,
+                        sent_at=1788000000,
+                        behavior=behavior,
+                    ),
+                    sender_id="link_verified_sender_coordinate",
+                    sender_device_id="mobile-private-coordinate",
+                    attachment_paths=(),
+                    attachment_types=(),
+                )
+                source = adapter.build_source(
+                    chat_id=turn.message.session_id,
+                    chat_name="Loopdy chat",
+                    chat_type="dm",
+                    user_id=turn.sender_id,
+                    user_name=turn.message.actor_name,
+                    message_id=turn.message.message_id,
+                )
+                source.profile = turn.message.agent_id
+                session_key = build_session_key(
+                    source,
+                    group_sessions_per_user=adapter.config.extra.get(
+                        "group_sessions_per_user", True
+                    ),
+                    thread_sessions_per_user=adapter.config.extra.get(
+                        "thread_sessions_per_user", False
+                    ),
+                    profile=adapter._session_key_profile(source),
+                )
+                adapter._active_sessions[session_key] = asyncio.Event()
+
+                asyncio.run(adapter.receive_link_turn(turn))
+
+                self.assertEqual(observed, [text])
+
     def test_link_reply_uses_the_verified_profile_bound_to_its_session(self) -> None:
         from loopdy_plugin.link_client import InboundLinkTurn
         from loopdy_plugin.link_contracts import UserMessage
@@ -1421,6 +1489,24 @@ class AdapterTests(unittest.TestCase):
         )
         self.assertEqual(link.payloads[-1]["text"], "The weather is sunny.")
 
+    def test_rapid_drafts_are_coalesced_but_final_is_complete_and_identity_stable(self) -> None:
+        link = _LinkClient()
+        adapter = LoopdyAdapter(PlatformConfig(enabled=True), service=_Service(), link_client=link)
+        metadata = {"reply_to_message_id": "throttle_turn", "agent_name": "Avery"}
+        async def scenario():
+            with patch("loopdy_plugin.adapter.time.monotonic", return_value=100):
+                for index in range(75):
+                    self.assertTrue((await adapter.send_draft("session-throttle", 42, f"Draft {index}", metadata)).success)
+            with patch("loopdy_plugin.adapter.time.monotonic", return_value=100.3):
+                self.assertTrue((await adapter.send_draft("session-throttle", 42, "Latest draft", metadata)).success)
+            self.assertTrue((await adapter.send("session-throttle", "Complete final response", metadata=metadata)).success)
+        asyncio.run(scenario())
+        self.assertEqual([p["delivery"] for p in link.payloads], ["draft", "draft", "final"])
+        self.assertEqual(link.payloads[-1]["text"], "Complete final response")
+        self.assertEqual(len({p["messageId"] for p in link.payloads}), 1)
+        self.assertEqual(adapter._link_draft_sent_at, {})
+
+    @patch("loopdy_plugin.adapter._LINK_DRAFT_MINIMUM_INTERVAL_SECONDS", 0)
     def test_native_draft_revisions_and_final_reuse_one_link_message_identity(self) -> None:
         link = _LinkClient()
         adapter = LoopdyAdapter(
@@ -1461,6 +1547,7 @@ class AdapterTests(unittest.TestCase):
         )
         self.assertEqual(len({payload["messageId"] for payload in link.payloads}), 1)
 
+    @patch("loopdy_plugin.adapter._LINK_DRAFT_MINIMUM_INTERVAL_SECONDS", 0)
     def test_native_draft_revision_ids_still_reuse_one_turn_message_identity(self) -> None:
         link = _LinkClient()
         adapter = LoopdyAdapter(

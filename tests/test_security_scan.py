@@ -7,7 +7,7 @@ from tools.plugin_guard import scan_plugin, should_allow_plugin_install
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
-PLUGIN_SOURCE = "promptclickrun/loopdy-plugin"
+PLUGIN_SOURCE = "promptclickrun/loopdy-ios/plugins/loopdy"
 
 
 class PluginSecurityScanTests(unittest.TestCase):

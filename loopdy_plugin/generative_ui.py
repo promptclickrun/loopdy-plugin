@@ -217,6 +217,10 @@ def validate_rendered_envelope(value: Any) -> dict[str, Any]:
 
     if not isinstance(value, dict):
         raise GenerativeUIError("invalid_payload", "Renderer result must be an object")
+    if value.get("schema") == "loopdy.card":
+        from .loopdy_cards import validate_card_result
+
+        return validate_card_result(value, now=datetime.now(timezone.utc))
     version = value.get("version")
     if version == 1:
         if value.get("schema") != "loopdy.generative_ui":

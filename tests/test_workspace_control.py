@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from contextlib import nullcontext
 import hashlib
+import io
+import zipfile
+from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
@@ -12,6 +16,7 @@ import tempfile
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import patch
+import zipfile
 
 from loopdy_plugin.attachments import AttachmentStore
 from loopdy_plugin.link_contracts import WORKSPACE_OPERATIONS, WorkspaceRequest
@@ -20,7 +25,10 @@ from loopdy_plugin.workspace_control import (
     WorkspaceConflictError,
     WorkspaceControlError,
     WorkspaceController,
+    _decode_skill_zip,
     _event_projection,
+    _decode_skill_zip,
+    _session_workspace_identity,
 )
 
 
@@ -37,6 +45,146 @@ class _Backend:
 
 
 class WorkspaceControllerTests(unittest.TestCase):
+    def test_session_project_identity_rejects_unbounded_folder_catalogs(self) -> None:
+        catalog = {
+            "projects": [{
+                "id": "project-1",
+                "name": "Project",
+                "primary_path": "/fixture/project",
+                "folders": [
+                    {"path": f"/fixture/project/folder-{index}"}
+                    for index in range(65)
+                ],
+            }]
+        }
+
+        with self.assertRaises(WorkspaceControlError):
+            _session_workspace_identity("/fixture/project", catalog)
+
+    def test_skill_zip_accepts_one_bounded_bundle(self) -> None:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr(
+                "weather/SKILL.md",
+                "---\nname: weather\ndescription: Use for weather.\n---\n\nInstructions.",
+            )
+            archive.writestr("weather/references/api.md", "API notes")
+
+        name, content, supporting = _decode_skill_zip(buffer.getvalue())
+
+        self.assertEqual(name, "weather")
+        self.assertIn("description: Use for weather.", content)
+        self.assertEqual(supporting, [("references/api.md", b"API notes")])
+
+    def test_skill_zip_rejects_traversal(self) -> None:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr(
+                "weather/SKILL.md",
+                "---\nname: weather\ndescription: Use for weather.\n---\n\nInstructions.",
+            )
+            archive.writestr("weather/../escape.txt", "no")
+
+        with self.assertRaisesRegex(WorkspaceControlError, "unsafe path"):
+            _decode_skill_zip(buffer.getvalue())
+
+    def test_skill_bundle_is_rescanned_after_supporting_files_are_written(self) -> None:
+        async def exercise(root: Path) -> list[str]:
+            from hermes_cli.web_routers import skills as skills_routes
+            from tools import skill_manager_tool
+
+            deleted: list[str] = []
+            backend = HermesWorkspaceBackend(service=SimpleNamespace())
+            with (
+                patch.object(skills_routes, "_profile_scope", lambda _: nullcontext()),
+                patch.object(skills_routes, "_clear_skills_prompt_cache", lambda: None),
+                patch.object(
+                    skill_manager_tool,
+                    "_create_skill",
+                    return_value={"success": True},
+                ),
+                patch.object(
+                    skill_manager_tool,
+                    "_find_skill",
+                    return_value={"path": root},
+                ),
+                patch.object(
+                    skill_manager_tool,
+                    "_security_scan_skill",
+                    return_value="blocked supporting file",
+                ),
+                patch.object(
+                    skill_manager_tool,
+                    "_delete_skill",
+                    side_effect=lambda name: deleted.append(name),
+                ),
+            ):
+                with self.assertRaisesRegex(WorkspaceControlError, "security policy rejected the skill bundle"):
+                    await backend._skill_import_bundle(
+                        "default",
+                        "weather",
+                        "---\nname: weather\ndescription: Weather.\n---\n\nInstructions.",
+                        None,
+                        [("scripts/fetch.py", b"print('weather')")],
+                    )
+            return deleted
+
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(asyncio.run(exercise(Path(directory))), ["weather"])
+
+    def test_skill_categories_match_the_hermes_single_segment_contract(self) -> None:
+        from loopdy_plugin.workspace_control import _optional_skill_category
+
+        self.assertEqual(_optional_skill_category("research.tools"), "research.tools")
+        for invalid in ("Research", "research tools", "research/tools"):
+            with self.subTest(invalid=invalid), self.assertRaises(WorkspaceControlError):
+                _optional_skill_category(invalid)
+
+    def test_concurrent_skill_updates_allow_only_one_revision_owner(self) -> None:
+        async def exercise() -> list[object]:
+            backend = HermesWorkspaceBackend(service=SimpleNamespace())
+            current = {
+                "content": "---\nname: weather\ndescription: Original.\n---\n\nOriginal."
+            }
+            update_started = asyncio.Event()
+            release_update = asyncio.Event()
+
+            async def read_skill(agent_id: str, skill_id: str) -> dict:
+                return dict(current)
+
+            async def write_skill(agent_id: str, name: str, content: str) -> None:
+                update_started.set()
+                await release_update.wait()
+                current["content"] = content
+
+            backend._skill_content = read_skill
+            backend._skill_update = write_skill
+            expected = hashlib.sha256(current["content"].encode("utf-8")).hexdigest()
+            first = asyncio.create_task(backend.skills_tools_update({
+                "agentId": "default",
+                "skillId": "weather",
+                "content": "---\nname: weather\ndescription: First.\n---\n\nFirst.",
+                "expectedSha256": expected,
+            }))
+            await update_started.wait()
+            second = asyncio.create_task(backend.skills_tools_update({
+                "agentId": "default",
+                "skillId": "weather",
+                "content": "---\nname: weather\ndescription: Second.\n---\n\nSecond.",
+                "expectedSha256": expected,
+            }))
+            await asyncio.sleep(0)
+            release_update.set()
+            return list(await asyncio.gather(first, second, return_exceptions=True))
+
+        results = asyncio.run(exercise())
+
+        self.assertEqual(sum(isinstance(result, dict) for result in results), 1)
+        self.assertEqual(
+            sum(isinstance(result, WorkspaceConflictError) for result in results),
+            1,
+        )
+
     def test_every_wire_operation_has_one_explicit_backend_handler(self) -> None:
         backend = _Backend()
         controller = WorkspaceController(backend=backend)
@@ -211,6 +359,8 @@ class _ProfileBackend(HermesWorkspaceBackend):
             session_workspace_getter=session_workspace_getter,
         )
         self.saved_config = None
+        self.session_updates = []
+        self.session_deletes = []
 
     async def _profile_records(self):
         return [
@@ -316,7 +466,7 @@ class _ProfileBackend(HermesWorkspaceBackend):
             }
         ]
 
-    async def _plugins_catalog(self):
+    async def _plugins_catalog(self, agent_id="default"):
         return [
             {
                 "key": "loopdy",
@@ -407,10 +557,19 @@ class _ProfileBackend(HermesWorkspaceBackend):
                     "message_count": 4,
                     "started_at": 1_788_000_000,
                     "last_active": 1_788_000_100,
+                    "pinned": True,
                     "system_prompt": "must never cross link",
                 }
             ]
         }
+
+    async def _session_update(self, session_id, body):
+        self.session_updates.append((session_id, body))
+        return {"ok": True}
+
+    async def _session_delete(self, session_id, agent_id):
+        self.session_deletes.append((session_id, agent_id))
+        return {"ok": True}
 
     async def _session_messages(
         self, stored_id, agent_id, *, include_compacted=False
@@ -1200,11 +1359,15 @@ class HermesWorkspaceBackendTests(unittest.TestCase):
     def test_capability_catalog_uses_profile_and_strips_private_configuration(self) -> None:
         backend = _ProfileBackend()
 
-        result = asyncio.run(backend.skills_tools_list({"agentId": "default"}))
+        with patch("loopdy_plugin.workspace_capabilities.toolsets", return_value=[]):
+            result = asyncio.run(backend.skills_tools_list({"agentId": "default"}))
 
         self.assertEqual(backend.skills_agent_id, "default")
         self.assertEqual(backend.mcp_agent_id, "default")
-        self.assertEqual(result, {
+        self.assertEqual(set(result["management"]), {"version", "read", "create", "update", "import"})
+        self.assertEqual(result["management"]["version"], 2)
+        self.assertEqual(result["tools"], [])
+        self.assertEqual({key: result[key] for key in ("agentId", "skills", "plugins", "mcpServers")}, {
             "agentId": "default",
             "skills": [{
                 "id": "weather",
@@ -1221,6 +1384,7 @@ class HermesWorkspaceBackendTests(unittest.TestCase):
                 "description": "Secure Loopdy Link channel.",
                 "enabled": True,
                 "capabilityCount": 6,
+                "controlReason": "",
             }],
             "mcpServers": [{
                 "id": "calendar",
@@ -2120,6 +2284,136 @@ class HermesWorkspaceBackendTests(unittest.TestCase):
         )
         self.assertEqual(result["defaults"], defaults)
 
+    def test_sessions_list_maps_cwd_to_deepest_profile_project_without_leaking_paths(self) -> None:
+        class ProjectSessionBackend(_ProfileBackend):
+            async def _session_catalog(self, agent_id):
+                return {
+                    "sessions": [
+                        {
+                            "id": "default-match",
+                            "profile": "default",
+                            "source": "loopdy",
+                            "chat_id": "default-match-chat",
+                            "title": "Default project",
+                            "preview": "Matched",
+                            "message_count": 1,
+                            "started_at": 1_788_000_000,
+                            "last_active": 1_788_000_100,
+                            "cwd": "/Users/private/home/../home",
+                        },
+                        {
+                            "id": "default-child",
+                            "profile": "default",
+                            "source": "loopdy",
+                            "chat_id": "default-child-chat",
+                            "title": "Child directory",
+                            "preview": "Matched through parent folder",
+                            "message_count": 1,
+                            "started_at": 1_788_000_000,
+                            "last_active": 1_788_000_090,
+                            "cwd": "/Users/private/home/child",
+                        },
+                        {
+                            "id": "research-match",
+                            "profile": "research",
+                            "source": "local",
+                            "chat_id": None,
+                            "title": "Research project",
+                            "preview": "Matched",
+                            "message_count": 1,
+                            "started_at": 1_788_000_000,
+                            "last_active": 1_788_000_080,
+                            "cwd": "/Users/private/research",
+                        },
+                    ]
+                }
+
+            async def _projects_catalog(self, agent_id):
+                self.project_catalog_agent_ids = getattr(
+                    self, "project_catalog_agent_ids", []
+                ) + [agent_id]
+                if agent_id == "research":
+                    return {"projects": [{
+                        "id": "project-research",
+                        "name": "Research",
+                        "archived": False,
+                        "primary_path": "/Users/private/research",
+                        "folders": [],
+                    }]}
+                return {
+                    "active_id": "project-home",
+                    "projects": [
+                        {
+                            "id": "project-home",
+                            "name": "Home",
+                            "archived": False,
+                            "primary_path": "/Users/private/home",
+                            "folders": [],
+                        },
+                        {
+                            "id": "project-home-child",
+                            "name": "Home Child",
+                            "archived": False,
+                            "primary_path": "/Users/private/home/child",
+                            "folders": [],
+                        },
+                    ],
+                }
+
+        backend = ProjectSessionBackend()
+        result = asyncio.run(backend.sessions_list({}))
+
+        self.assertEqual(
+            [(row["workspaceId"], row["workspaceName"]) for row in result["sessions"]],
+            [
+                ("project-home", "Home"),
+                ("project-home-child", "Home Child"),
+                ("project-research", "Research"),
+            ],
+        )
+        self.assertEqual(backend.project_catalog_agent_ids, ["default", "research"])
+        projected = json.dumps(result)
+        self.assertNotIn("/Users/private", projected)
+        self.assertNotIn("cwd", projected)
+
+    def test_sessions_list_fails_closed_for_ambiguous_or_archived_project_paths(self) -> None:
+        class AmbiguousProjectBackend(_ProfileBackend):
+            async def _session_catalog(self, agent_id):
+                value = await super()._session_catalog(agent_id)
+                value["sessions"][0]["cwd"] = "/Users/private/home"
+                return value
+
+            async def _projects_catalog(self, agent_id):
+                return {"projects": [
+                    {
+                        "id": "project-home-a",
+                        "name": "Home A",
+                        "archived": False,
+                        "primary_path": "/Users/private/home",
+                        "folders": [],
+                    },
+                    {
+                        "id": "project-home-b",
+                        "name": "Home B",
+                        "archived": False,
+                        "primary_path": "/Users/private/home",
+                        "folders": [],
+                    },
+                    {
+                        "id": "project-archived",
+                        "name": "Archived",
+                        "archived": True,
+                        "primary_path": "/Users/private/archive",
+                        "folders": [],
+                    },
+                ]}
+
+        result = asyncio.run(AmbiguousProjectBackend().sessions_list({"agentId": "default"}))
+
+        self.assertIsNone(result["sessions"][0]["workspaceId"])
+        self.assertIsNone(result["sessions"][0]["workspaceName"])
+        self.assertNotIn("/Users/private", json.dumps(result))
+
     def test_sessions_list_projects_stable_visible_and_stored_coordinates(self) -> None:
         backend = _ProfileBackend()
 
@@ -2139,9 +2433,63 @@ class HermesWorkspaceBackendTests(unittest.TestCase):
                 "startedAt": 1_788_000_000,
                 "lastActive": 1_788_000_100,
                 "isActive": False,
+                "isPinned": True,
+                "workspaceId": None,
+                "workspaceName": None,
             }
         ])
         self.assertNotIn("system_prompt", repr(result))
+
+    def test_sessions_update_and_delete_use_profile_scoped_durable_coordinates(self) -> None:
+        backend = _ProfileBackend()
+
+        updated = asyncio.run(backend.sessions_update({
+            "storedId": "stored-session-0001",
+            "agentId": "default",
+            "title": "Renamed session",
+            "pinned": True,
+            "archived": False,
+        }))
+        deleted = asyncio.run(backend.sessions_delete({
+            "storedId": "stored-session-0001",
+            "agentId": "default",
+        }))
+
+        self.assertEqual(updated, {
+            "storedId": "stored-session-0001",
+            "agentId": "default",
+            "updated": True,
+        })
+        self.assertEqual(deleted, {
+            "storedId": "stored-session-0001",
+            "agentId": "default",
+            "deleted": True,
+        })
+        self.assertEqual(backend.session_updates, [(
+            "stored-session-0001",
+            {
+                "profile": "default",
+                "title": "Renamed session",
+                "pinned": True,
+                "archived": False,
+            },
+        )])
+        self.assertEqual(backend.session_deletes, [
+            ("stored-session-0001", "default"),
+        ])
+
+    def test_sessions_update_rejects_blank_or_oversized_titles(self) -> None:
+        backend = _ProfileBackend()
+
+        for title in ("   ", "x" * 101):
+            with self.assertRaises(WorkspaceControlError):
+                asyncio.run(backend.sessions_update({
+                    "storedId": "stored-session-0001",
+                    "agentId": "default",
+                    "title": title,
+                }))
+
+        self.assertEqual(backend.session_updates, [])
 
     def test_sessions_list_reconciles_stale_persisted_activity_with_live_owner(self) -> None:
         observed = []
@@ -2452,6 +2800,27 @@ class HermesWorkspaceBackendTests(unittest.TestCase):
         self.assertEqual(result["task"]["id"], "cron-job-0001")
         self.assertNotIn("private.invalid", repr(result))
         self.assertNotIn("task.py", repr(result))
+
+    def test_scheduled_task_list_projects_script_only_jobs_without_exposing_paths(self) -> None:
+        class _ScriptOnlyBackend(_ProfileBackend):
+            async def _cron_list(self, agent_id):
+                row = self._job()
+                row.update({
+                    "prompt": "",
+                    "script": "/private/automation.py",
+                    "no_agent": True,
+                })
+                return [row]
+
+        result = asyncio.run(_ScriptOnlyBackend().scheduled_tasks_list({
+            "agentId": "default",
+        }))
+
+        self.assertEqual(
+            result["tasks"][0]["instructions"],
+            "Runs the configured automation.",
+        )
+        self.assertNotIn("automation.py", repr(result))
 
     def test_scheduled_task_delivery_targets_and_manual_channel_use_official_cron_fields(self) -> None:
         backend = _ProfileBackend()

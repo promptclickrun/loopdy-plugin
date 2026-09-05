@@ -1277,6 +1277,7 @@ def activity_event(
     subagent_id: str | None = None,
     bot_run_id: str | None = None,
     member_id: str | None = None,
+    from_member_id: str | None = None,
 ) -> dict[str, Any]:
     if kind not in {"reasoning", "tool", "subagent", "bot_handoff"}:
         raise ValueError("Loopdy Link activity kind is invalid")
@@ -1285,17 +1286,17 @@ def activity_event(
     if kind == "reasoning":
         valid_identity = all(
             value is None
-            for value in (tool_call_id, subagent_id, bot_run_id, member_id)
+            for value in (tool_call_id, subagent_id, bot_run_id, member_id, from_member_id)
         )
     elif kind == "tool":
         valid_identity = (
             tool_call_id is not None
-            and all(value is None for value in (subagent_id, bot_run_id, member_id))
+            and all(value is None for value in (subagent_id, bot_run_id, member_id, from_member_id))
         )
     elif kind == "subagent":
         valid_identity = (
             subagent_id is not None
-            and all(value is None for value in (tool_call_id, bot_run_id, member_id))
+            and all(value is None for value in (tool_call_id, bot_run_id, member_id, from_member_id))
         )
     else:
         valid_identity = (
@@ -1306,9 +1307,9 @@ def activity_event(
         )
     if not valid_identity:
         raise ValueError("Loopdy Link activity identity is invalid")
-    if kind != "tool" and (
-        arguments is not None or result is not None or tool_name is not None
-    ):
+    if kind not in {"tool", "bot_handoff"} and (arguments is not None or result is not None):
+        raise ValueError("Loopdy Link activity detail is invalid")
+    if kind != "tool" and tool_name is not None:
         raise ValueError("Loopdy Link tool detail is invalid")
     value: dict[str, Any] = {
         "version": 1,
@@ -1327,6 +1328,8 @@ def activity_event(
             value[key] = _activity_label(candidate, key, maximum)
     for key, candidate in (("arguments", arguments), ("result", result)):
         if candidate is not None:
+            if kind == "bot_handoff" and len(candidate.encode("utf-8")) > 64_000:
+                raise ValueError(f"Loopdy Link {key} is invalid")
             value[key] = _activity_detail(candidate, key, 65_536)
     if duration_ms is not None:
         duration = _nonnegative(duration_ms, "durationMs")
@@ -1339,6 +1342,7 @@ def activity_event(
         ("subagentId", subagent_id, 180),
         ("botRunId", bot_run_id, 180),
         ("memberId", member_id, 96),
+        ("fromMemberId", from_member_id, 96),
     ):
         if candidate is not None:
             value[key] = _opaque(candidate, key, 1, maximum)
@@ -1356,7 +1360,10 @@ def session_context(
     is_compacting: bool,
     updated_at: int,
     title: str | None = None,
-    usage_totals: dict[str, int] | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    cached_tokens: int | None = None,
+    total_tokens: int | None = None,
 ) -> dict[str, Any]:
     """Build the encrypted current-context projection for one Link chat."""
 
@@ -1381,13 +1388,16 @@ def session_context(
     }
     if title is not None:
         value["title"] = _activity_label(title, "title", 240)
-    if usage_totals is not None:
-        if not isinstance(usage_totals, dict) or set(usage_totals) - {
-            "inputTokens", "outputTokens", "cachedTokens", "totalTokens"
-        }:
-            raise ValueError("Loopdy Link context usage totals are invalid")
-        for key, total in usage_totals.items():
-            value[key] = _nonnegative(total, key)
+    # Token accounting is additive: a Hermes runtime that cannot report a
+    # metric omits its key rather than publishing a misleading zero.
+    for key, candidate in (
+        ("inputTokens", input_tokens),
+        ("outputTokens", output_tokens),
+        ("cachedTokens", cached_tokens),
+        ("totalTokens", total_tokens),
+    ):
+        if candidate is not None:
+            value[key] = _nonnegative(candidate, key)
     return value
 
 

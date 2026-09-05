@@ -1626,7 +1626,9 @@ def workspace_result(
     if status not in {"completed", "failed", "conflict"}:
         raise ValueError("Loopdy Link workspace result status is invalid")
     projected = (
-        _workspace_json_allowing_avatar_blobs(payload)
+        _workspace_json_allowing_dashboard_cards(payload)
+        if request.operation == "dashboard.load" and status == "completed"
+        else _workspace_json_allowing_avatar_blobs(payload)
         if request.operation in {
             "agents.create",
             "agents.update",
@@ -1890,6 +1892,43 @@ def _workspace_json(
         ).encode("utf-8")
     ) > 196_608:
         raise ValueError("Loopdy Link workspace payload is invalid")
+    return projected
+
+
+def _workspace_json_allowing_dashboard_cards(value: Any) -> Any:
+    """Validate optional card documents separately from their Inbox wrappers.
+
+    Only this response-owned path gets a separate bounded depth budget. All
+    card keys still pass secret screening, and the aggregate byte cap remains
+    unchanged. A bad optional card cannot make ordinary events unavailable.
+    """
+    if not isinstance(value, dict) or not isinstance(value.get("events"), list):
+        return _workspace_json(value, depth=0)
+    events = value["events"]
+    if len(events) > 500:
+        raise ValueError("Loopdy Link workspace payload is invalid")
+    stripped_events = []
+    cards = []
+    for index, event in enumerate(events):
+        if not isinstance(event, dict) or not isinstance(event.get("detail"), dict):
+            stripped_events.append(event)
+            continue
+        detail = dict(event["detail"])
+        card = detail.pop("generative_ui", None)
+        stripped_events.append({**event, "detail": detail})
+        if card is not None:
+            try:
+                screened = _workspace_json(card, depth=0)
+                cards.append((index, validate_rendered_envelope(screened)))
+            except (TypeError, ValueError):
+                continue
+    projected = _workspace_json({**value, "events": stripped_events}, depth=0)
+    for index, card in cards:
+        detail = projected["events"][index]["detail"]
+        detail["generative_ui"] = card
+        if len(json.dumps(projected, ensure_ascii=False, separators=(",", ":"),
+                          sort_keys=True).encode("utf-8")) > 196_608:
+            del detail["generative_ui"]
     return projected
 
 

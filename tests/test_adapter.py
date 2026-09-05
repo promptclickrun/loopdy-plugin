@@ -633,6 +633,13 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(len(service.store.events), 1)
         self.assertEqual(len(service.store.delivered), 1)
 
+    def test_corrupt_update_journal_does_not_break_link_connection(self) -> None:
+        def broken_journal():
+            raise RuntimeError("corrupt fixture")
+        manager = SimpleNamespace(record_runtime_loaded=broken_journal)
+        adapter = LoopdyAdapter(PlatformConfig(enabled=True), service=_Service(), link_client=_LinkClient(), plugin_update_manager=manager)
+        self.assertTrue(asyncio.run(adapter.connect()))
+
     def test_connect_does_not_report_loopdy_ready_before_link_socket_ready(self) -> None:
         link = _UnreadyLinkClient()
         adapter = LoopdyAdapter(

@@ -37,6 +37,12 @@ from .link_client import load_runtime_config
 from .link_contracts import generative_ui_event
 from .link_identity import pre_llm_context_from_state
 from .link_pairing import LINK_ENV_KEYS, pair_host
+from .plugin_update import (
+    PluginUpdateManager,
+    local_cli_device_id,
+    new_operation_id,
+    production_manager,
+)
 from .providers.apns import load_apns_config
 from .relay_client import RelayConfig
 from .targets import parse_target, validate_target
@@ -66,6 +72,7 @@ def register(
     broker = activity_broker or LinkActivityBroker()
     profile = str(getattr(ctx, "profile_name", "default") or "default")
     identity_state = getattr(ctx, "state", None)
+    update_manager = production_manager(profile)
 
     # Renderer tools are registered directly. Avoid registering a companion skill
     # here because plugin skills are advertised through the model's system prompt.
@@ -79,6 +86,7 @@ def register(
             service=active_service,
             link_state=identity_state,
             activity_broker=broker,
+            plugin_update_manager=update_manager,
         ),
         check_fn=check_requirements,
         validate_config=validate_config,
@@ -156,6 +164,7 @@ def register(
             service=active_service,
             profile=profile,
             identity_state=identity_state,
+            plugin_update_manager=update_manager,
         ),
     )
     ctx.on_unload(partial(release_service, active_service))
@@ -465,6 +474,20 @@ def setup_cli(parser: Any) -> None:
 
     actions.add_parser("status", help="Show provider health and registered devices")
 
+    update = actions.add_parser(
+        "update",
+        help="Install the latest immutable Loopdy plugin revision",
+    )
+    update.add_argument(
+        "--restart",
+        action="store_true",
+        help="Explicitly authorize one gateway restart after installation",
+    )
+    actions.add_parser(
+        "update-status",
+        help="Read the latest durable plugin update status",
+    )
+
     provider = actions.add_parser("provider", help="Show or select the push provider")
     provider.add_argument("mode", nargs="?", choices=("managed", "direct", "relay"))
 
@@ -533,10 +556,35 @@ def handle_cli(
     service: Any,
     profile: str,
     identity_state: Any | None = None,
+    plugin_update_manager: PluginUpdateManager | None = None,
 ) -> None:
     action = str(getattr(args, "loopdy_action", "") or "")
     if action == "link":
         _handle_link_cli(args, identity_state=identity_state)
+        return
+    if action in {"update", "update-status"}:
+        manager = plugin_update_manager or production_manager(profile)
+        if action == "update-status":
+            _print_json(manager.status())
+            return
+        current = manager.status()
+        if current["phase"] not in {
+            "idle",
+            "complete",
+            "up_to_date",
+            "installed_restart_required",
+            "blocked",
+            "failed",
+        }:
+            _print_json(current)
+            return
+        _print_json(
+            manager.start(
+                operation_id=new_operation_id(),
+                device_id=local_cli_device_id(profile),
+                restart=bool(getattr(args, "restart", False)),
+            )
+        )
         return
     if action == "status":
         apns = service.store.load_apns_config()

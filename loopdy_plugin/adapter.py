@@ -74,6 +74,7 @@ from .generative_ui import (
 )
 from .link_crypto import encode_base64url
 from .personality_catalog import PersonalityCatalogManager
+from .plugin_update import PluginUpdateManager
 from .presentation import shape_notification
 from .service import LoopdyService
 from .store import LoopdyStore, form_action_response
@@ -300,6 +301,7 @@ class LoopdyAdapter(BasePlatformAdapter):
         activity_broker: Any | None = None,
         personality_manager: PersonalityCatalogManager | Any | None = None,
         workspace_controller: Any | None = None,
+        plugin_update_manager: PluginUpdateManager | None = None,
         voice_synthesizer: Callable[[VoiceSpeakRequest], SynthesizedVoiceAudio] = synthesize_voice_audio,
     ):
         # Restart and shutdown pings are operator lifecycle signals, not user
@@ -322,6 +324,7 @@ class LoopdyAdapter(BasePlatformAdapter):
                 session_goal_getter=self.goal_snapshot_for_session,
                 session_runtime_getter=self.runtime_snapshot_for_session,
                 connection_id_getter=self._link_workspace_connection_id,
+                plugin_update_manager=plugin_update_manager,
                 workspace_git_state_path=(
                     get_hermes_home()
                     / "plugin-data"
@@ -646,6 +649,19 @@ class LoopdyAdapter(BasePlatformAdapter):
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         _install_runtime_cwd_bridge(getattr(self, "gateway_runner", None))
+        plugin_update_manager = getattr(
+            getattr(self.workspace_controller, "backend", None),
+            "plugin_update_manager",
+            None,
+        )
+        if plugin_update_manager is not None:
+            # Adapter connection is a real gateway lifecycle. Plugin Doctor
+            # and CLI discovery register the plugin but never reach here.
+            try:
+                plugin_update_manager.record_runtime_loaded()
+            except Exception:
+                # Update status can fail closed without disabling ordinary Link.
+                pass
         health = self.service.health()
         if self.link_client is not None:
             self.link_client.start(
@@ -2041,6 +2057,13 @@ class LoopdyAdapter(BasePlatformAdapter):
                         result["context"] = context
             if self.link_client is not None:
                 await self._send_link_payload(result)
+                manager = getattr(getattr(self.workspace_controller, "backend", None), "plugin_update_manager", None)
+                if manager is not None and result["status"] == "completed":
+                    try:
+                        await asyncio.to_thread(manager.record_link_response, payload.sender_device_id)
+                    except Exception:
+                        # Optional update bookkeeping cannot break workspace delivery.
+                        pass
             return
         if isinstance(payload, InboundLinkGenerativeUIFormSubmission):
             response = await asyncio.to_thread(

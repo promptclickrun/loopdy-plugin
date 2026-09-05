@@ -127,6 +127,7 @@ class HermesWorkspaceBackend:
         session_goal_getter: Any | None = None,
         session_runtime_getter: Any | None = None,
         connection_id_getter: Any | None = None,
+        plugin_update_manager: Any | None = None,
         workspace_git: WorkspaceGitService | Any | None = None,
         workspace_git_state_path: Path | str | None = None,
         attachment_store: AttachmentStore | None = None,
@@ -140,6 +141,7 @@ class HermesWorkspaceBackend:
         self.session_goal_getter = session_goal_getter
         self.session_runtime_getter = session_runtime_getter
         self.connection_id_getter = connection_id_getter
+        self.plugin_update_manager = plugin_update_manager
         self.workspace_git = workspace_git
         self.workspace_git_state_path = Path(
             workspace_git_state_path
@@ -189,6 +191,46 @@ class HermesWorkspaceBackend:
             }
             agents.append(agent)
         return {"agents": agents}
+
+    async def plugin_update_start(self, payload: dict[str, Any]) -> dict[str, Any]:
+        values = _object(payload, "plugin update payload")
+        if set(values) != {"operation_id", "confirm_restart"}:
+            raise WorkspaceControlError("Plugin update payload is invalid")
+        if values.get("confirm_restart") is not True:
+            raise WorkspaceControlError("Gateway restart was not explicitly confirmed")
+        operation_id = values.get("operation_id")
+        if not isinstance(operation_id, str):
+            raise WorkspaceControlError("Plugin update operation ID is invalid")
+        manager = self.plugin_update_manager
+        identity = self.connection_id_getter
+        if manager is None or not callable(identity):
+            raise WorkspaceControlError("Plugin update is unavailable on this host")
+        device_id = identity()
+        return await asyncio.to_thread(
+            manager.start,
+            operation_id=operation_id,
+            device_id=device_id,
+            restart=True,
+        )
+
+    async def plugin_update_status(self, payload: dict[str, Any]) -> dict[str, Any]:
+        values = _object(payload, "plugin update payload")
+        if set(values) - {"operation_id"}:
+            raise WorkspaceControlError("Plugin update status payload is invalid")
+        operation_id = values.get("operation_id")
+        if operation_id is not None and not isinstance(operation_id, str):
+            raise WorkspaceControlError("Plugin update operation ID is invalid")
+        manager = self.plugin_update_manager
+        identity = self.connection_id_getter
+        if manager is None or not callable(identity):
+            raise WorkspaceControlError("Plugin update is unavailable on this host")
+        device_id = identity()
+
+        def read_status() -> dict[str, Any]:
+            manager.record_link_response(device_id, operation_id)
+            return manager.status(operation_id=operation_id, device_id=device_id)
+
+        return await asyncio.to_thread(read_status)
 
     async def agents_create(self, payload: dict[str, Any]) -> dict[str, Any]:
         draft = _agent_draft(payload)
@@ -3814,6 +3856,8 @@ def _approval_projection(value: Any, *, now: int) -> dict[str, Any]:
 class WorkspaceController:
     _HANDLERS = {
         "agents.list": "agents_list",
+        "plugin_update.start": "plugin_update_start",
+        "plugin_update.status": "plugin_update_status",
         "agents.create": "agents_create",
         "agents.update": "agents_update",
         "agents.avatar.get": "agents_avatar_get",

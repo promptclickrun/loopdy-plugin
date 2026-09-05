@@ -8,15 +8,37 @@ from pathlib import Path
 from cryptography.hazmat.primitives.asymmetric import ec
 
 from loopdy_plugin.link_client import LinkRuntimeConfig, LoopdyLinkClient
-from loopdy_plugin.link_contracts import WORKSPACE_OPERATIONS, WorkspaceRequest, parse_workspace_request, workspace_result
+from loopdy_plugin.link_contracts import WORKSPACE_OPERATIONS, parse_workspace_request, workspace_capabilities
 from tests.test_link_request_isolation import _Socket, _State
 
 
 class LinkRecoveryContractTests(unittest.IsolatedAsyncioTestCase):
-    def test_workspace_response_advertises_actual_supported_operations(self) -> None:
-        request = WorkspaceRequest("request-capabilities-0001", "sessions.list", {}, 1_788_000_000)
-        result = workspace_result(request=request, status="completed", payload={}, sent_at=1_788_000_001)
-        capabilities = result.get("capabilities")
+    def test_only_explicit_revocation_stops_automatic_reconnect(self) -> None:
+        from websockets.datastructures import Headers
+        from websockets.exceptions import ConnectionClosedError, InvalidStatus
+        from websockets.frames import Close
+        from websockets.http11 import Response
+        from loopdy_plugin.link_client import _connection_authentication_failed
+
+        temporary = InvalidStatus(Response(
+            status_code=403, reason_phrase="Forbidden", headers=Headers(),
+            body=b'{"version":1,"error":"nonce_replayed"}',
+        ))
+        revoked = InvalidStatus(Response(
+            status_code=403, reason_phrase="Forbidden", headers=Headers(),
+            body=b'{"version":1,"error":"device_revoked"}',
+        ))
+        self.assertFalse(_connection_authentication_failed(temporary))
+        self.assertTrue(_connection_authentication_failed(revoked))
+        self.assertTrue(_connection_authentication_failed(
+            ConnectionClosedError(Close(4003, "authorization revoked"), None)
+        ))
+        self.assertFalse(_connection_authentication_failed(
+            ConnectionClosedError(Close(1008, "temporary policy rejection"), None)
+        ))
+
+    def test_advertised_capabilities_match_actual_supported_operations(self) -> None:
+        capabilities = workspace_capabilities()
         assert isinstance(capabilities, dict), "Workspace result lacks capability metadata"
         self.assertEqual(capabilities["protocolVersion"], 1)
         self.assertEqual(capabilities["operations"], sorted(WORKSPACE_OPERATIONS))

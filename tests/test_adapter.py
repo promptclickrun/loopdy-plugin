@@ -2167,6 +2167,70 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(link.payloads[0]["type"], "personalities.catalog")
         self.assertEqual(link.payloads[0]["revision"], 7)
 
+    def test_workspace_metadata_is_not_sent_to_an_unnegotiated_legacy_client(self) -> None:
+        from loopdy_plugin.link_client import InboundLinkWorkspaceRequest
+        from loopdy_plugin.link_contracts import WorkspaceRequest
+
+        controller = SimpleNamespace(execute=AsyncMock(return_value={"agents": []}))
+        link = _LinkClient()
+        adapter = LoopdyAdapter(PlatformConfig(enabled=True), service=_Service(),
+                                link_client=link, workspace_controller=controller)
+        request = WorkspaceRequest("workspace-legacy-metadata-0001", "agents.list", {}, 1_788_000_000)
+        asyncio.run(adapter.receive_link_payload(InboundLinkWorkspaceRequest(
+            request=request, sender_device_id="mobile-legacy-fixture",
+        )))
+        self.assertNotIn("capabilities", link.payloads[-1])
+        self.assertNotIn("context", link.payloads[-1])
+
+    def test_safe_probe_negotiates_metadata_per_device_and_history_reports_current_context(self) -> None:
+        from loopdy_plugin.link_client import InboundLinkWorkspaceRequest
+        from loopdy_plugin.link_contracts import WorkspaceRequest
+
+        class Controller:
+            def __init__(self):
+                self.requests = []
+
+            async def execute(self, request):
+                self.requests.append(request)
+                if request.operation == "agents.list":
+                    return {"agents": []}
+                return {"storedId": "canonical-session-fixture", "agentId": "default", "messages": []}
+
+        link = _LinkClient()
+        controller = Controller()
+        adapter = LoopdyAdapter(PlatformConfig(enabled=True), service=_Service(),
+                                link_client=link, workspace_controller=controller)
+        provider = lambda _: {
+            "model": "fixture-model", "contextUsed": 17, "contextMax": 100,
+            "contextPercent": 17, "compressions": 0, "isCompacting": False,
+        }
+        with patch.object(adapter, "_context_window_snapshot", side_effect=provider) as context:
+            async def scenario():
+                probe = WorkspaceRequest("workspace-metadata-probe-0001", "agents.list",
+                                         {"linkProtocol": 1}, 1_788_000_000)
+                await adapter.receive_link_payload(InboundLinkWorkspaceRequest(
+                    request=probe, sender_device_id="mobile-metadata-fixture",
+                ))
+                self.assertEqual(controller.requests[-1].payload, {})
+                self.assertIn("capabilities", link.payloads[-1])
+                history = WorkspaceRequest("workspace-metadata-history-0001", "sessions.history",
+                                           {"storedId": "visible-session-fixture", "agentId": "default"},
+                                           1_788_000_001)
+                await adapter.receive_link_payload(InboundLinkWorkspaceRequest(
+                    request=history, sender_device_id="mobile-metadata-fixture",
+                ))
+                envelope = link.payloads[-1]["context"]
+                self.assertEqual(envelope["sessionId"], "visible-session-fixture")
+                self.assertTrue(envelope["available"])
+                self.assertEqual(envelope["snapshot"]["contextUsed"], 17)
+                context.assert_called_with("canonical-session-fixture")
+                await adapter.receive_link_payload(InboundLinkWorkspaceRequest(
+                    request=history, sender_device_id="another-legacy-fixture",
+                ))
+                self.assertNotIn("capabilities", link.payloads[-1])
+                self.assertNotIn("context", link.payloads[-1])
+            asyncio.run(scenario())
+
     def test_workspace_request_uses_the_explicit_controller_and_returns_a_bound_result(self) -> None:
         from loopdy_plugin.link_client import InboundLinkWorkspaceRequest
         from loopdy_plugin.link_contracts import WorkspaceRequest

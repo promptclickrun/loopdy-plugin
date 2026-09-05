@@ -1682,20 +1682,29 @@ def _expired_host_relay(registration: RelayReady) -> bool:
 
 
 def _connection_authentication_failed(error: BaseException) -> bool:
-    """Use the verified WSS peer's HTTP/close status, never exception text.
+    """Stop only for the relay's explicit device/epoch revocation contract.
 
-    Both revoked credentials and other definitive authentication denials need
-    operator intervention. Network errors, 429/5xx and replacement code 4000
-    are not authentication denials.
+    A generic HTTP 403 can be a retriable nonce or edge-policy failure. Never
+    infer credential revocation from that status or from exception prose.
     """
-    response = getattr(error, "response", None)
-    status = getattr(response, "status_code", None)
-    if status is None:
-        status = getattr(error, "status_code", None)
-    if status in {401, 403}:
-        return True
     received = getattr(error, "rcvd", None)
-    return getattr(received, "code", None) == 1008
+    if getattr(received, "code", None) == 4003:
+        return True
+    response = getattr(error, "response", None)
+    if getattr(response, "status_code", None) not in {401, 403}:
+        return False
+    body = getattr(response, "body", None)
+    if not isinstance(body, (bytes, bytearray, str)) or len(body) > 4096:
+        return False
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeError):
+        return False
+    code = payload.get("error") if isinstance(payload, dict) else None
+    return isinstance(code, str) and code in {
+        "device_revoked", "authorization_epoch_stale", "host_grant_revoked",
+        "device_not_found",
+    }
 
 
 def _connection_was_replaced(error: BaseException) -> bool:

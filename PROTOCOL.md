@@ -106,11 +106,12 @@ expire while a backpressured frame remains pending; it is not proof of failure o
 permission to duplicate a business mutation. Receipts and controls keep flowing.
 Legacy sockets continue using the relay's 1013 close-and-retry fallback.
 
-Definitive HTTP 401/403 authentication denials and received WebSocket policy close
-1008 stop normal automatic reconnect and publish `authentication_error` with a
-fixed re-pairing instruction. Transient network/5xx/429 failures retain normal
-retry, and same-device replacement code 4000 remains terminal only for the older
-runtime. No local device credentials or pending obligations are deleted.
+Explicit device/epoch revocation codes in bounded HTTP 401/403 JSON responses,
+and the relay's WebSocket authorization-revoked code 4003, stop automatic reconnect
+and publish `authentication_error`. Generic 403 edge/nonce failures and policy
+close 1008 do not establish revoked credentials and retain normal retry, as do
+network/5xx/429 failures. Same-device replacement code 4000 remains terminal only
+for the older runtime. No local device credentials or pending obligations are deleted.
 
 ## Loopdy Card version 1
 

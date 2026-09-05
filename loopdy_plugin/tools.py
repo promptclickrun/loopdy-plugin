@@ -574,7 +574,9 @@ def register(
                 "Call this renderer directly when it is visible in the current tool list. When Hermes has progressively "
                 "disclosed it and it is absent, use the official tool_search, tool_describe, "
                 "and tool_call bridge to invoke this exact renderer; do not substitute or "
-                "wrap another tool."
+                "wrap another tool. For scheduler-owned Loopdy Inbox delivery, your final response must be "
+                "exactly the returned JSON envelope, with no prose or code fence. The renderer tool result "
+                "alone is not delivered by cron. In a normal interactive chat, do not repeat the JSON."
             ),
             "parameters": _card_parameters(),
         },

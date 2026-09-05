@@ -1,0 +1,100 @@
+{
+  "operation": "dashboard.load",
+  "payload": {
+    "events": [
+      {
+        "approvalId": null,
+        "createdAt": 1788000000,
+        "detail": {
+          "agent_name": "Default",
+          "generative_ui": {
+            "card_id": "bf3cc2d664a5e7d1067c5e50173d5e64",
+            "content_hash": "bf3cc2d664a5e7d1067c5e50173d5e643642e41e8a0f6f9c2703e962ad43563a",
+            "created_at": "2026-08-29T10:40:00Z",
+            "data_sources": [],
+            "elements": {
+              "card": {
+                "children": [
+                  "metrics",
+                  "status"
+                ],
+                "props": {
+                  "subtitle": "Local verification",
+                  "title": "Build health"
+                },
+                "type": "card"
+              },
+              "failed": {
+                "children": [],
+                "props": {
+                  "format": {
+                    "style": "integer"
+                  },
+                  "label": "Failed",
+                  "semantic": "neutral",
+                  "value": {
+                    "literal": 0
+                  }
+                },
+                "type": "metric"
+              },
+              "metrics": {
+                "children": [
+                  "passed",
+                  "failed"
+                ],
+                "props": {
+                  "alignment": "leading",
+                  "spacing": "medium"
+                },
+                "type": "hstack"
+              },
+              "passed": {
+                "children": [],
+                "props": {
+                  "format": {
+                    "style": "integer"
+                  },
+                  "label": "Passed",
+                  "semantic": "positive",
+                  "value": {
+                    "literal": 12
+                  }
+                },
+                "type": "metric"
+              },
+              "status": {
+                "children": [],
+                "props": {
+                  "semantic": "positive",
+                  "value": {
+                    "literal": "Ready"
+                  }
+                },
+                "type": "badge"
+              }
+            },
+            "origin": "live",
+            "root": "card",
+            "schema": "loopdy.card",
+            "spoken_summary": "All twelve checks passed and the build is ready for review.",
+            "title": "Build health",
+            "version": 1
+          },
+          "message": "Build health"
+        },
+        "eventId": "channel.message:briefing",
+        "isPinned": false,
+        "isRead": false,
+        "profile": "default",
+        "sessionId": null,
+        "type": "channel.message"
+      }
+    ]
+  },
+  "requestId": "fixture-request",
+  "sentAt": 1788000000,
+  "status": "completed",
+  "type": "workspace.result",
+  "version": 1
+}

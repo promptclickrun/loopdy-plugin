@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -48,6 +48,8 @@ from .link_contracts import (
     PickerSelection,
     SessionForkRequest,
     VoiceSpeakRequest,
+    WorkspaceRequest,
+    _session_coordinate,
     assistant_message,
     choice_picker_payload,
     command_catalog_payload,
@@ -56,10 +58,12 @@ from .link_contracts import (
     notification_event,
     picker_result,
     personality_catalog_payload,
+    session_context,
     session_fork_result,
     verified_fork_prefix,
     voice_audio_chunks,
     voice_speak_error,
+    workspace_capabilities,
     workspace_result,
 )
 from .generative_ui import (
@@ -86,6 +90,7 @@ _services_lock = threading.Lock()
 logger = logging.getLogger(__name__)
 _MAX_LINK_SESSION_PROFILE_BINDINGS = 4096
 _MAX_LINK_DRAFT_IDENTITIES = 512
+_MAX_LINK_METADATA_DEVICES = 256
 _RUNTIME_CWD_BRIDGE_MARKER = "_loopdy_runtime_cwd_bridge_installed"
 _suppress_link_control_ephemeral: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "suppress_link_control_ephemeral",
@@ -326,6 +331,7 @@ class LoopdyAdapter(BasePlatformAdapter):
         self._voice_tasks: set[asyncio.Task[None]] = set()
         self._pending_picker_requests: dict[str, _PendingPickerRequest] = {}
         self._active_pickers: dict[str, _ActivePicker] = {}
+        self._link_metadata_devices: OrderedDict[str, None] = OrderedDict()
         self._link_session_profiles: OrderedDict[str, str] = OrderedDict()
         self._link_session_workspaces: OrderedDict[tuple[str, str], str] = OrderedDict()
         self._link_draft_messages: OrderedDict[tuple[str, int], str] = OrderedDict()
@@ -654,6 +660,7 @@ class LoopdyAdapter(BasePlatformAdapter):
             await self.link_client.stop()
         self._pending_picker_requests.clear()
         self._active_pickers.clear()
+        self._link_metadata_devices.clear()
         self._link_session_workspaces.clear()
         self._link_draft_messages.clear()
         self._link_active_drafts.clear()
@@ -1670,6 +1677,55 @@ class LoopdyAdapter(BasePlatformAdapter):
             raise ValueError("Loopdy Link response agent does not match its session")
         return explicit or verified or _active_profile_id()
 
+    async def _workspace_history_context(
+        self, request: WorkspaceRequest, result: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Read current context only after profile-scoped history succeeded.
+
+        The controller resolves visible aliases through its authorized catalog;
+        only its returned storedId is a provider coordinate. The wire snapshot
+        retains the requested coordinate, not that internal alias resolution.
+        """
+        try:
+            requested = _session_coordinate(request.payload.get("storedId"))
+        except ValueError:
+            return None
+        envelope = {"sessionId": requested, "available": False, "snapshot": None}
+        agent_id = request.payload.get("agentId")
+        if not isinstance(agent_id, str) or not agent_id or result.get("agentId") != agent_id:
+            return envelope
+        try:
+            stored_id = _session_coordinate(result.get("storedId"))
+            # A known live binding must agree with the successful controller.
+            for coordinate in (requested, stored_id):
+                bound = self._link_session_profiles.get(coordinate)
+                if bound is not None and bound != agent_id:
+                    return envelope
+            current = await asyncio.to_thread(self._context_window_snapshot, stored_id)
+            if not isinstance(current, dict):
+                return envelope
+            snapshot = session_context(
+                session_id=requested,
+                model=current["model"],
+                context_used=current["contextUsed"],
+                context_max=current["contextMax"],
+                context_percent=current["contextPercent"],
+                compressions=current["compressions"],
+                is_compacting=current["isCompacting"],
+                updated_at=current.get("updatedAt", int(time.time())),
+                title=current.get("title"),
+                usage_totals={
+                    key: current[key]
+                    for key in ("inputTokens", "outputTokens", "cachedTokens", "totalTokens")
+                    if key in current
+                },
+            )
+        except Exception:
+            # Provider absence/failure is not a failed history load. Never log
+            # payloads or exception text from this optional private boundary.
+            return envelope
+        return {"sessionId": requested, "available": True, "snapshot": snapshot}
+
     async def receive_link_payload(
         self,
         payload: (
@@ -1686,13 +1742,29 @@ class LoopdyAdapter(BasePlatformAdapter):
         ),
     ) -> None:
         if isinstance(payload, InboundLinkWorkspaceRequest):
+            request = payload.request
+            # Opt in only via the existing read-only operation; the v1 envelope
+            # and controller operation permissions are unchanged.
+            if (request.operation == "agents.list"
+                    and type(request.payload.get("linkProtocol")) is int
+                    and request.payload["linkProtocol"] == 1):
+                request = replace(request, payload={
+                    key: value for key, value in request.payload.items()
+                    if key != "linkProtocol"
+                })
+                self._link_metadata_devices[payload.sender_device_id] = None
+            negotiated = payload.sender_device_id in self._link_metadata_devices
+            if negotiated:
+                self._link_metadata_devices.move_to_end(payload.sender_device_id)
+            while len(self._link_metadata_devices) > _MAX_LINK_METADATA_DEVICES:
+                self._link_metadata_devices.popitem(last=False)
             connection_token = _link_workspace_connection.set(
                 payload.sender_device_id
             )
             try:
                 if self.workspace_controller is None:
                     raise RuntimeError("Workspace controls are unavailable")
-                result_payload = await self.workspace_controller.execute(payload.request)
+                result_payload = await self.workspace_controller.execute(request)
                 result = workspace_result(
                     request=payload.request,
                     status="completed",
@@ -1728,6 +1800,12 @@ class LoopdyAdapter(BasePlatformAdapter):
                 )
             finally:
                 _link_workspace_connection.reset(connection_token)
+            if negotiated:
+                result["capabilities"] = workspace_capabilities()
+                if result["status"] == "completed" and request.operation == "sessions.history":
+                    context = await self._workspace_history_context(request, result["payload"])
+                    if context is not None:
+                        result["context"] = context
             if self.link_client is not None:
                 await self._send_link_payload(result)
             return

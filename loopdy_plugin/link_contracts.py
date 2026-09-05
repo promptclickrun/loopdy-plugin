@@ -1356,6 +1356,7 @@ def session_context(
     is_compacting: bool,
     updated_at: int,
     title: str | None = None,
+    usage_totals: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Build the encrypted current-context projection for one Link chat."""
 
@@ -1380,6 +1381,13 @@ def session_context(
     }
     if title is not None:
         value["title"] = _activity_label(title, "title", 240)
+    if usage_totals is not None:
+        if not isinstance(usage_totals, dict) or set(usage_totals) - {
+            "inputTokens", "outputTokens", "cachedTokens", "totalTokens"
+        }:
+            raise ValueError("Loopdy Link context usage totals are invalid")
+        for key, total in usage_totals.items():
+            value[key] = _nonnegative(total, key)
     return value
 
 
@@ -1627,7 +1635,6 @@ def workspace_result(
     result: dict[str, Any] = {
         "version": 1,
         "type": "workspace.result",
-        "capabilities": workspace_capabilities(),
         "requestId": request.request_id,
         "operation": request.operation,
         "status": status,

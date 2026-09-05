@@ -24,10 +24,12 @@ MAX_ATTACHMENT_CHUNK_BYTES = 64 * 1024
 MAX_ATTACHMENT_CHUNKS = 128
 MAX_AVATAR_WORKSPACE_PLAINTEXT_BYTES = 2_800_000
 MAX_ENCRYPTED_FRAME_CHARACTERS = 4_000_000
-PLUGIN_VERSION = "2.3.0"
+PLUGIN_VERSION = "2.4.0"
 WORKSPACE_OPERATIONS = frozenset(
     {
         "agents.list",
+        "plugin_update.start",
+        "plugin_update.status",
         "agents.create",
         "agents.update",
         "agents.avatar.get",
@@ -1556,7 +1558,7 @@ def workspace_capabilities() -> dict[str, Any]:
     return {
         "protocolVersion": 1,
         "pluginVersion": PLUGIN_VERSION,
-        "features": ["workspace-rejected-v1", "backpressure-v1"],
+        "features": ["workspace-rejected-v1", "backpressure-v1", "plugin-update-v1"],
         "operations": sorted(WORKSPACE_OPERATIONS),
     }
 

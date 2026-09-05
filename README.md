@@ -20,6 +20,28 @@ compatibility, but the app does not offer it for new selection.
 
 All modes support proactive messages even when no chat session is active.
 
+## Model-name catalog
+
+`model-names.json` is a data-only catalog for friendly model labels. In a compatible app, **Settings → Connectivity → Update Model Names** fetches the latest catalog from this repository without installing plugin code or restarting the gateway. A bundled fallback and the last valid cached catalog remain available when offline or when an update fails.
+
+The version-1 JSON object contains `version`, `revision`, and a `models` mapping from exact model IDs to display labels. For example, `"gpt-6-astra": "GPT-6 Astra"`. Keep model IDs unchanged. This catalog changes names, not which models a provider offers. Clients validate the full response (256 KiB maximum; 2,000 entries; IDs up to 256 characters and labels up to 100) before replacing their cached data.
+
+## Self-update
+
+After installing a version that includes the updater:
+
+```sh
+hermes loopdy update
+hermes loopdy update-status
+hermes loopdy update --restart
+```
+
+The updater resolves this repository's `main` to an exact commit, checks the recognized existing installation, scans and validates the candidate, backs up the prior plugin, and uses Hermes' pinned installer. Pairing, credentials and configuration remain in place. Added privileged capabilities require a separate attended host approval. Modified or unrecognized installations are refused instead of overwritten.
+
+Without `--restart`, the command reports installation separately from activation. With it, one gateway restart is requested. Status survives that restart; timeouts remain unconfirmed rather than causing another restart. A compatible app exposes **Update Loopdy Plugin** in Settings with an interruption warning and checks the same durable operation until the exact new plugin runtime and authenticated Link response are verified. Closing and reopening the app does not start another update.
+
+This optional update flow needs macOS launchd or Linux user systemd. Windows and unsupported/shared-installation layouts fail closed. Earlier plugin releases require one host-side installation before the new app control can work.
+
 ## Install
 
 Install and enable the plugin in the active Hermes profile:
@@ -51,9 +73,10 @@ Hermes' file installer reads Git content, so local plugin changes must be commit
 The plugin supports Hermes on Linux, macOS, and Windows. It uses Hermes' own
 cross-platform Python dependencies and profile/config writers, stores data under
 the active Hermes home directory, and opens outbound HTTPS/WebSocket connections
-only. It has no launchd, systemd, Windows Service, shell-script, or inbound-port
-requirement. Long-running process management remains the responsibility of the
-normal Hermes installation on that operating system.
+only. Normal chat requires no extra service or inbound port. Optional self-update
+uses a separate launchd job on macOS or a user systemd unit on Linux so it can
+survive gateway restart; self-update is unavailable on unsupported hosts.
+Long-running process management remains the responsibility of the normal Hermes installation.
 
 Create or sign in to the minimal passkey-backed Loopdy account in the app. Then start host pairing:
 

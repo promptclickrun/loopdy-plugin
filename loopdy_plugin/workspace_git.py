@@ -256,6 +256,7 @@ class WorkspaceGitService:
         expected_status_token: str,
         offset: int,
         limit: int,
+        reject_sensitive_content: bool = False,
     ) -> dict[str, Any]:
         workspace = self._get_workspace(workspace_id, "status")
         with self._locks[workspace.workspace_id]:
@@ -272,10 +273,15 @@ class WorkspaceGitService:
                 or not 1 <= limit <= 500
             ):
                 raise WorkspaceGitError("INVALID_REQUEST", "Diff page is invalid")
-            page = self._structured_diff_page(workspace, current, selected, side, offset, limit)
+            page = self._structured_diff_page(
+                workspace, current, selected, side, offset, limit,
+                reject_sensitive_content=reject_sensitive_content,
+            )
             if offset == 0:
                 preview = self._markdown_preview(workspace, selected, side)
                 if preview is not None:
+                    if reject_sensitive_content and SENSITIVE_CREDENTIAL_BYTES_RE.search(preview.encode("utf-8")):
+                        raise WorkspaceGitError("SECRET_SCAN_BLOCKED", "Diff content requires local review")
                     page["preview_content"] = preview
             final = self.status(workspace_id)
             self._require_status(expected_status_token, final)
@@ -702,6 +708,8 @@ class WorkspaceGitService:
         side: str,
         offset: int,
         limit: int,
+        *,
+        reject_sensitive_content: bool = False,
     ) -> dict[str, Any]:
         status_row = next(item for item in current["files"] if item["path"] == path)
         if side == "worktree" and status_row["kind"] == "untracked":
@@ -724,6 +732,10 @@ class WorkspaceGitService:
                     availability, rows = "binary", []
                 else:
                     availability, rows = _parse_unified_diff(raw)
+        if reject_sensitive_content and SENSITIVE_CREDENTIAL_BYTES_RE.search(
+            "\n".join(row["content"] for row in rows).encode("utf-8")
+        ):
+            raise WorkspaceGitError("SECRET_SCAN_BLOCKED", "Diff content requires local review")
         return _diff_page(path, side, availability, rows, offset, limit)
 
     def _markdown_preview(

@@ -11,6 +11,7 @@ import sys
 import time
 from dataclasses import replace
 from functools import partial
+from pathlib import Path
 from typing import Any
 
 from .adapter import (
@@ -476,6 +477,42 @@ def setup_cli(parser: Any) -> None:
 
     actions.add_parser("status", help="Show provider health and registered devices")
 
+    files = actions.add_parser(
+        "files",
+        help="Manage explicit read-only workspace file grants",
+    )
+    file_actions = files.add_subparsers(dest="loopdy_files_action", required=True)
+    grant = file_actions.add_parser("grant", help="Grant one host-local workspace root")
+    grant.add_argument("workspace_id")
+    grant.add_argument("--root", required=True)
+    grant.add_argument("--label", required=True)
+    revoke = file_actions.add_parser("revoke", help="Revoke one workspace root")
+    revoke.add_argument("workspace_id")
+    revoke.add_argument("--yes", action="store_true", help="Confirm revocation")
+    file_actions.add_parser("roots", help="List granted workspace labels")
+    list_files = file_actions.add_parser("list", help="List a granted directory")
+    list_files.add_argument("workspace_id")
+    list_files.add_argument("--path", default="")
+    list_files.add_argument("--offset", type=int, default=0)
+    list_files.add_argument("--limit", type=int, default=100)
+    list_files.add_argument("--query", default="")
+    list_files.add_argument("--revision")
+    read = file_actions.add_parser("read", help="Read one bounded file chunk")
+    read.add_argument("workspace_id")
+    read.add_argument("path")
+    read.add_argument("--offset", type=int, default=0)
+    read.add_argument("--limit", type=int, default=65_536)
+    read.add_argument("--revision")
+    file_status = file_actions.add_parser("status", help="Show read-only Git status")
+    file_status.add_argument("workspace_id")
+    diff = file_actions.add_parser("diff", help="Show a bounded read-only Git diff")
+    diff.add_argument("workspace_id")
+    diff.add_argument("path")
+    diff.add_argument("--side", choices=("staged", "worktree"), required=True)
+    diff.add_argument("--expected-status-token", required=True)
+    diff.add_argument("--offset", type=int, default=0)
+    diff.add_argument("--limit", type=int, default=300)
+
     update = actions.add_parser(
         "update",
         help="Install the latest immutable Loopdy plugin revision",
@@ -561,6 +598,9 @@ def handle_cli(
     plugin_update_manager: PluginUpdateManager | None = None,
 ) -> None:
     action = str(getattr(args, "loopdy_action", "") or "")
+    if action == "files":
+        _handle_files_cli(args)
+        return
     if action == "link":
         _handle_link_cli(args, identity_state=identity_state)
         return
@@ -679,6 +719,75 @@ def handle_cli(
         _print_json(service.test_notification(target=target, profile=profile))
         return
     raise ValueError("Unknown Loopdy command")
+
+
+def _handle_files_cli(args: Any) -> None:
+    from hermes_constants import get_hermes_home
+
+    from .workspace_files import WorkspaceFilesError, WorkspaceFilesService
+
+    action = str(getattr(args, "loopdy_files_action", "") or "")
+    try:
+        service = WorkspaceFilesService(
+            get_hermes_home() / "plugin-data" / "loopdy" / "workspace-files"
+        )
+        if action == "grant":
+            result = service.grant(
+                str(args.workspace_id),
+                root=Path(str(args.root)),
+                label=str(args.label),
+            )
+        elif action == "revoke":
+            if not bool(getattr(args, "yes", False)):
+                raise WorkspaceFilesError(
+                    "INVALID_REQUEST", "Pass --yes to confirm workspace revocation"
+                )
+            result = service.revoke(str(args.workspace_id))
+        elif action == "roots":
+            result = service.roots()
+        elif action == "list":
+            result = service.list_directory(
+                str(args.workspace_id),
+                path=str(args.path),
+                offset=int(args.offset),
+                limit=int(args.limit),
+                query=str(args.query),
+                revision=getattr(args, "revision", None),
+            )
+        elif action == "read":
+            result = service.read_file(
+                str(args.workspace_id),
+                path=str(args.path),
+                offset=int(args.offset),
+                limit=int(args.limit),
+                revision=getattr(args, "revision", None),
+            )
+        elif action == "status":
+            result = service.git_status(str(args.workspace_id))
+        elif action == "diff":
+            result = service.git_diff(
+                str(args.workspace_id),
+                path=str(args.path),
+                side=str(args.side),
+                expected_status_token=str(args.expected_status_token),
+                offset=int(args.offset),
+                limit=int(args.limit),
+            )
+        else:
+            raise WorkspaceFilesError(
+                "INVALID_REQUEST", "Unknown Loopdy Files command"
+            )
+    except WorkspaceFilesError as error:
+        _print_json(error.envelope())
+        raise SystemExit(1) from None
+    except Exception:
+        _print_json(
+            WorkspaceFilesError(
+                "FILES_UNAVAILABLE", "Workspace Files request failed"
+            ).envelope()
+        )
+        raise SystemExit(1) from None
+    _print_json(result)
 
 
 def _handle_link_cli(args: Any, *, identity_state: Any | None = None) -> None:

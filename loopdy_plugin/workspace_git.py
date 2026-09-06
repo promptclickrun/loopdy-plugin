@@ -48,7 +48,7 @@ _MAX_DIFF_FILE_BYTES = 2_000_000
 _MAX_DIFF_LINES = 100_000
 _MAX_DIFF_LINE_BYTES = 16_000
 _MAX_DIFF_RESPONSE_BYTES = 160_000
-_MAX_MARKDOWN_PREVIEW_BYTES = 65_536
+_MAX_TEXT_PREVIEW_BYTES = 65_536
 _FIXED_ENV = {
     "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
     "LANG": "C.UTF-8",
@@ -277,12 +277,27 @@ class WorkspaceGitService:
                 workspace, current, selected, side, offset, limit,
                 reject_sensitive_content=reject_sensitive_content,
             )
-            if offset == 0:
-                preview = self._markdown_preview(workspace, selected, side)
+            status_row = next(item for item in current["files"] if item["path"] == selected)
+            selected_status = status_row["index" if side == "staged" else "worktree"]
+            if offset == 0 and selected_status != "D":
+                preview = self._text_preview(workspace, selected, side)
                 if preview is not None:
                     if reject_sensitive_content and SENSITIVE_CREDENTIAL_BYTES_RE.search(preview.encode("utf-8")):
                         raise WorkspaceGitError("SECRET_SCAN_BLOCKED", "Diff content requires local review")
-                    page["preview_content"] = preview
+                    candidate = {**page, "lines": list(page["lines"]), "preview_content": preview}
+                    # Keep the complete preview and defer diff rows to later pages.
+                    # A nonempty page must advance; never return next_offset == offset.
+                    while True:
+                        encoded = json.dumps(
+                            candidate, ensure_ascii=False, separators=(",", ":"),
+                        ).encode("utf-8")
+                        if len(encoded) <= _MAX_DIFF_RESPONSE_BYTES:
+                            page = candidate
+                            break
+                        if len(candidate["lines"]) <= 1:
+                            break
+                        candidate["lines"].pop()
+                        candidate["next_offset"] = offset + len(candidate["lines"])
             final = self.status(workspace_id)
             self._require_status(expected_status_token, final)
             return page
@@ -738,19 +753,19 @@ class WorkspaceGitService:
             raise WorkspaceGitError("SECRET_SCAN_BLOCKED", "Diff content requires local review")
         return _diff_page(path, side, availability, rows, offset, limit)
 
-    def _markdown_preview(
+    def _text_preview(
         self,
         workspace: Workspace,
         path: str,
         side: str,
     ) -> str | None:
-        if PurePosixPath(path).suffix.lower() not in {".md", ".markdown"}:
+        if PurePosixPath(path).suffix.lower() not in {".md", ".markdown", ".txt"}:
             return None
         if side == "staged":
             try:
                 raw, overflow = self._git_bounded(
                     workspace,
-                    _MAX_MARKDOWN_PREVIEW_BYTES,
+                    _MAX_TEXT_PREVIEW_BYTES,
                     "show",
                     f":{path}",
                 )
@@ -760,15 +775,16 @@ class WorkspaceGitService:
             raw = _read_workspace_file(
                 workspace.root,
                 path,
-                _MAX_MARKDOWN_PREVIEW_BYTES,
+                _MAX_TEXT_PREVIEW_BYTES,
             )
             overflow = raw is None
         if raw is None or overflow:
             return None
         try:
-            return raw.decode("utf-8", "strict")
+            text = raw.decode("utf-8", "strict")
         except UnicodeDecodeError:
             return None
+        return text if _safe_text_preview(text) else None
 
     def _index_digest(self, workspace: Workspace) -> str:
         git_dir = Path(self._git_text(workspace, "rev-parse", "--git-dir"))
@@ -1390,7 +1406,17 @@ def _append_diff_row(rows: list[dict[str, Any]], row: dict[str, Any]) -> str | N
 
 
 def _safe_diff_content(value: str) -> bool:
-    return all(ord(character) >= 32 or character == "\t" for character in value)
+    return all(
+        character == "\t" or (ord(character) >= 32 and not 127 <= ord(character) <= 159)
+        for character in value
+    )
+
+
+def _safe_text_preview(value: str) -> bool:
+    return all(
+        character in "\n\r\t" or not (ord(character) < 32 or 127 <= ord(character) <= 159)
+        for character in value
+    )
 
 
 def _diff_page(

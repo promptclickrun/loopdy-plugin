@@ -13,15 +13,23 @@ from typing import Any, Iterable
 
 from gateway.platforms.base import BasePlatformAdapter
 
+from .link_contracts import MAX_AGENT_ATTACHMENT_BYTES
+
 
 MAX_ITEMS = 200
 MAX_TEXT_BYTES = 100_000
 MAX_ATTACHMENTS_PER_ITEM = 20
-MAX_ARTIFACT_BYTES = 25 * 1024 * 1024
+MAX_ARTIFACT_BYTES = MAX_AGENT_ATTACHMENT_BYTES
 MAX_FILENAME_BYTES = 240
 MAX_CACHE_BYTES_PER_PROFILE = 250 * 1024 * 1024
 MAX_CACHE_ITEMS_PER_PROFILE = 500
 IMAGE_MIME_PREFIX = "image/"
+
+
+class _OversizedAttachment(Exception):
+    def __init__(self, mime_type: str):
+        self.mime_type = mime_type
+        super().__init__("Attachment exceeds the agent media size limit")
 
 
 class AttachmentStore:
@@ -129,8 +137,13 @@ class AttachmentStore:
                 paths.append(path)
 
         attachments = []
+        oversized_mime_types = []
         for source_path in paths[:MAX_ATTACHMENTS_PER_ITEM]:
-            attachment = self._cache_file(profile, session_id, item_id, source_path)
+            try:
+                attachment = self._cache_file(profile, session_id, item_id, source_path)
+            except _OversizedAttachment as error:
+                oversized_mime_types.append(error.mime_type)
+                continue
             if attachment is not None:
                 attachments.append(attachment)
 
@@ -138,6 +151,9 @@ class AttachmentStore:
             BasePlatformAdapter.strip_media_directives_for_display(cleaned)
         )
         result = {"id": item_id, "text": display_text, "attachments": attachments}
+        if oversized_mime_types:
+            # Internal diagnostics only; workspace projections never expose local paths.
+            result["oversized_mime_types"] = oversized_mime_types
         if attachments:
             self._cache_item(profile, session_id, item_id, text_digest, display_text, attachments)
         return result
@@ -178,7 +194,10 @@ class AttachmentStore:
         try:
             path = Path(source_path)
             size = path.stat().st_size
-            if size < 0 or size > MAX_ARTIFACT_BYTES:
+            if size > MAX_ARTIFACT_BYTES:
+                mime_type = mimetypes.guess_type(_safe_filename(path.name))[0] or "application/octet-stream"
+                raise _OversizedAttachment(mime_type)
+            if size < 0:
                 return None
             with path.open("rb") as source:
                 content = source.read(MAX_ARTIFACT_BYTES + 1)

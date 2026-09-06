@@ -20,6 +20,20 @@ compatibility, but the app does not offer it for new selection.
 
 All modes support proactive messages even when no chat session is active.
 
+## Release 2.8.0 compatibility
+
+This release aligns the host with Loopdy app 1.8.0: exact-call generated image
+and video resolution, agent artifacts up to 25 MiB, complete Markdown/text
+Project previews, and statically registered card-template workspace operations.
+Phone uploads retain their separate 8 MiB/file and 24 MiB/message limits.
+See [Generated media](docs/GENERATED_MEDIA.md) for the host-side contract.
+
+The standalone plugin retains context/cache reporting through Hermes' public
+`post_api_request` and `on_session_reset` hooks, explicit read-only workspace
+Files grants, the restart-safe updater, and Marketplace release trust. Publishing
+this source does not install or activate it on a Hermes host. Compatible app and
+host activation remain separate release steps.
+
 ## Read-only workspace Files foundation
 
 The plugin can expose explicitly granted workspace folders through a read-only host CLI and authenticated plugin API. Browsing includes unchanged files, directory-local name search and revision-bound file reads. Git inspection reuses the fixed-command engine with mutation permissions disabled. No folder is exposed until a host operator grants it, and the feature does not access private Hermes Project/session databases.
@@ -220,6 +234,17 @@ persisting and pushing cards, while invalid or missing cards safely fall back to
 text. Never script or reconstruct an envelope; forward the exact official
 renderer return value. The installed `loopdy:generative-ui` skill contains both
 pathways, their decision rule, and scheduled/ordinary channel examples.
+
+A scheduled prompt must explicitly require the **final response** to be the
+exact renderer-returned JSON. A sentence such as "card delivered" is only text,
+not a delivery receipt. Keep `[SILENT]` as the complete final response when the
+job's existing silence policy applies; do not render a card in that branch.
+
+The `dashboard.load` response validates `events[].detail.generative_ui` as an
+independently bounded renderer document. Its containing arrays do not consume
+the card's depth budget. Secret-key screening, generic workspace limits, and the
+aggregate response byte cap remain in force. Invalid optional cards are omitted
+from the response copy without changing the stored event or unrelated data.
 
 ## Native Generative UI
 

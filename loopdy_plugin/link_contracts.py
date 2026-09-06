@@ -18,13 +18,20 @@ from .generative_ui import canonical_json, validate_rendered_envelope
 
 _OPAQUE = re.compile(r"^[A-Za-z0-9_-]+$")
 _MIME_TYPE = re.compile(r"^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$")
+# Device-to-host uploads retain the established per-file and aggregate limits.
 MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
 MAX_MESSAGE_ATTACHMENT_BYTES = 24 * 1024 * 1024
 MAX_ATTACHMENT_CHUNK_BYTES = 64 * 1024
 MAX_ATTACHMENT_CHUNKS = 128
+# Authenticated host-to-device agent artifacts use the host cache's larger,
+# separately bounded allowance without widening user-upload parsing.
+MAX_AGENT_ATTACHMENT_BYTES = 25 * 1024 * 1024
+MAX_AGENT_ATTACHMENT_CHUNKS = (
+    MAX_AGENT_ATTACHMENT_BYTES + MAX_ATTACHMENT_CHUNK_BYTES - 1
+) // MAX_ATTACHMENT_CHUNK_BYTES
 MAX_AVATAR_WORKSPACE_PLAINTEXT_BYTES = 2_800_000
 MAX_ENCRYPTED_FRAME_CHARACTERS = 4_000_000
-PLUGIN_VERSION = "2.4.0"
+PLUGIN_VERSION = "2.8.0"
 WORKSPACE_OPERATIONS = frozenset(
     {
         "agents.list",
@@ -40,6 +47,7 @@ WORKSPACE_OPERATIONS = frozenset(
         "sessions.delete",
         "attachments.resolve",
         "attachments.fetch",
+        "generated_media.resolve",
         "scheduled_tasks.list",
         "scheduled_tasks.delivery_targets",
         "scheduled_tasks.create",
@@ -55,6 +63,9 @@ WORKSPACE_OPERATIONS = frozenset(
         "skills_tools.create",
         "skills_tools.update",
         "skills_tools.import",
+        "cards.templates.list",
+        "cards.templates.install",
+        "cards.templates.remove",
         "marketplace.skills.install",
         "marketplace.skills.status",
         "projects.list",

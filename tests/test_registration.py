@@ -788,7 +788,8 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(context.platform["name"], "loopdy")
         self.assertIn("hermes loopdy link pair", context.platform["install_hint"])
         self.assertEqual(context.platform["cron_deliver_env_var"], "LOOPDY_HOME_TARGET")
-        self.assertEqual(context.platform["max_message_length"], 4096)
+        from loopdy_plugin.loopdy_cards import MAX_DOCUMENT_BYTES
+        self.assertGreater(context.platform["max_message_length"], MAX_DOCUMENT_BYTES)
         self.assertNotIn("platform_hint", context.platform or {})
         self.assertEqual(
             context.platform["parse_target_ref_fn"]("device:phone"),

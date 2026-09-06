@@ -66,6 +66,8 @@ class WorkspaceFilesApiTests(unittest.TestCase):
 import json, os, sys
 from pathlib import Path
 from fastapi.testclient import TestClient
+# Stock plugin discovery must establish imports in this clean subprocess.
+from hermes_cli.web_server import app
 from loopdy_plugin.workspace_files import WorkspaceFilesService
 home = Path(os.environ["HERMES_HOME"])
 root = home.parent / "project"
@@ -73,7 +75,6 @@ root.mkdir()
 (root / "visible.txt").write_text("Fixture only.\n")
 service = WorkspaceFilesService(home / "plugin-data/loopdy/workspace-files")
 service.grant("demo", root=root, label="Demo")
-from hermes_cli.web_server import app
 from loopdy_plugin import workspace_files
 assert Path(workspace_files.__file__).resolve().parent.parent == Path(os.environ["CANDIDATE_ROOT"])
 mounted = sys.modules["hermes_dashboard_plugin_loopdy"]

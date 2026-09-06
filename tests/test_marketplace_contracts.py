@@ -172,7 +172,10 @@ class MarketplaceSkillWorkspaceContractTests(unittest.TestCase):
             signing_private_key=ec.generate_private_key(ec.SECP256R1()),
             account_key=b"k" * 32,
         )
-        self.assertIsNone(build_marketplace_gateway_client(config, values={}))
+        self.assertIsNotNone(build_marketplace_gateway_client(config, values={}))
+        self.assertIsNone(build_marketplace_gateway_client(
+            config, values={"LOOPDY_MARKETPLACE_TRUSTED_ED25519_KEYS": ""},
+        ))
         legacy = LoopdyLinkClient(config, state=State())
         capable = LoopdyLinkClient(
             config,

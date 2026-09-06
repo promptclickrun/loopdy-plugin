@@ -2067,7 +2067,8 @@ class LoopdyAdapter(BasePlatformAdapter):
             if self.link_client is not None:
                 await self._send_link_payload(result)
                 manager = getattr(getattr(self.workspace_controller, "backend", None), "plugin_update_manager", None)
-                if manager is not None and result["status"] == "completed":
+                if (manager is not None and result["status"] == "completed"
+                        and request.operation != "host_runtime.status"):
                     try:
                         await asyncio.to_thread(manager.record_link_response, payload.sender_device_id)
                     except Exception:

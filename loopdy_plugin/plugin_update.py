@@ -91,6 +91,16 @@ LOADED_REVISION = _metadata_revision(_PLUGIN_ROOT)
 RUNTIME_ID = "runtime_" + secrets.token_urlsafe(18).replace("-", "_")
 
 
+def runtime_identity() -> dict[str, str | None]:
+    """Read this process and install, without opening or trusting the journal."""
+    installed = _metadata_revision(_PLUGIN_ROOT)
+    return {
+        "runtime_id": RUNTIME_ID,
+        "active_revision": LOADED_REVISION or None,
+        "installed_revision": installed or None,
+    }
+
+
 class PluginUpdateError(RuntimeError):
     """A bounded updater failure suitable for conversion to a public status."""
 

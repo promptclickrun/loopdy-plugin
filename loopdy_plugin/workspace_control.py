@@ -24,8 +24,9 @@ from typing import Any
 
 from .attachments import AttachmentStore
 from .generative_ui import GenerativeUIError, validate_rendered_envelope
+from .generated_media import resolve_generated_media
 from .link_contracts import (
-    MAX_ATTACHMENT_BYTES,
+    MAX_AGENT_ATTACHMENT_BYTES,
     MAX_ATTACHMENT_CHUNK_BYTES,
     WORKSPACE_OPERATIONS,
     WorkspaceRequest,
@@ -678,6 +679,46 @@ class HermesWorkspaceBackend:
                 agent_id, name, content, category, supporting_files
             )
         return await self.skills_tools_get({"agentId": agent_id, "skillId": name})
+
+    async def cards_templates_list(self, payload: dict[str, Any]) -> dict[str, Any]:
+        values = _object(payload, "card template list payload")
+        if set(values) != {"agentId"}:
+            raise WorkspaceControlError("Card template list request is invalid")
+        agent_id = _card_template_agent_id(values.get("agentId"))
+        templates = self.service.store.list_card_templates(profile=agent_id)
+        return {
+            "agentId": agent_id,
+            "templates": [_card_template_projection(value) for value in templates],
+        }
+
+    async def cards_templates_install(self, payload: dict[str, Any]) -> dict[str, Any]:
+        values = _object(payload, "card template install payload")
+        if set(values) != {"agentId", "template"}:
+            raise WorkspaceControlError("Card template install request is invalid")
+        agent_id = _card_template_agent_id(values.get("agentId"))
+        template = _object(values.get("template"), "card template")
+        result = self.service.store.install_card_template(
+            profile=agent_id,
+            template=template,
+        )
+        return {
+            "agentId": agent_id,
+            "changed": result["changed"],
+            "template": _card_template_projection(result["template"]),
+        }
+
+    async def cards_templates_remove(self, payload: dict[str, Any]) -> dict[str, Any]:
+        values = _object(payload, "card template removal payload")
+        if set(values) != {"agentId", "templateId", "version", "sha256"}:
+            raise WorkspaceControlError("Card template removal request is invalid")
+        agent_id = _card_template_agent_id(values.get("agentId"))
+        result = self.service.store.remove_card_template(
+            profile=agent_id,
+            template_id=values.get("templateId"),
+            version=values.get("version"),
+            sha256=values.get("sha256"),
+        )
+        return {"agentId": agent_id, **result}
 
     async def marketplace_skills_install(
         self, payload: dict[str, Any]
@@ -1525,7 +1566,7 @@ class HermesWorkspaceBackend:
                     "byteCount": attachment["size"],
                 }
                 for attachment in item["attachments"]
-                if 0 < attachment["size"] <= MAX_ATTACHMENT_BYTES
+                if 0 < attachment["size"] <= MAX_AGENT_ATTACHMENT_BYTES
             ]
             projected.append({
                 "itemId": item["id"],
@@ -1540,13 +1581,15 @@ class HermesWorkspaceBackend:
             raise WorkspaceControlError("Attachment fetch payload is invalid")
         agent_id = _agent_id(values.get("agentId"))
         attachment_id = _coordinate(values.get("attachmentId"), 128)
-        offset = _nonnegative_integer(values.get("offset"), maximum=MAX_ATTACHMENT_BYTES)
+        offset = _nonnegative_integer(
+            values.get("offset"), maximum=MAX_AGENT_ATTACHMENT_BYTES
+        )
         attachment = await asyncio.to_thread(
             self.attachment_store.read,
             profile=agent_id,
             attachment_id=attachment_id,
         )
-        if attachment is None or not 0 < attachment["size"] <= MAX_ATTACHMENT_BYTES:
+        if attachment is None or not 0 < attachment["size"] <= MAX_AGENT_ATTACHMENT_BYTES:
             raise WorkspaceControlError("Attachment is unavailable")
         content = attachment["content"]
         if not isinstance(content, bytes) or len(content) != attachment["size"] or offset >= len(content):
@@ -1559,6 +1602,44 @@ class HermesWorkspaceBackend:
             "data": base64.b64encode(chunk).decode("ascii"),
             "nextOffset": next_offset if next_offset < len(content) else None,
         }
+
+    async def generated_media_resolve(self, payload: dict[str, Any]) -> dict[str, Any]:
+        values = _object(payload, "workspace payload")
+        if set(values) != {"agentId", "storedId", "turnId", "toolCallId"}:
+            raise WorkspaceControlError("Generated media resolve payload is invalid")
+        agent_id = _agent_id(values.get("agentId"))
+        stored_id = _coordinate(values.get("storedId"), 160)
+        turn_id = _coordinate(values.get("turnId"), 180)
+        tool_call_id = _coordinate(values.get("toolCallId"), 180)
+        raw = _object(
+            await self._session_messages(
+                stored_id,
+                agent_id,
+                include_compacted=True,
+            ),
+            "Hermes session history",
+        )
+        rows = raw.get("messages")
+        # The authenticated history service owns history bounds. This operation
+        # returns only one exact tool result's bounded attachment metadata, so an
+        # unrelated transcript length must not disable recent media generation.
+        if raw.get("session_id", stored_id) != stored_id or not isinstance(rows, list):
+            raise WorkspaceControlError("Generated media history is unavailable")
+        try:
+            return await asyncio.to_thread(
+                resolve_generated_media,
+                profile=agent_id,
+                stored_id=stored_id,
+                turn_id=turn_id,
+                tool_call_id=tool_call_id,
+                rows=rows,
+                attachment_store=self.attachment_store,
+            )
+        except ValueError as error:
+            raise WorkspaceControlError(
+                "Generated media is not ready",
+                code="generated_media_not_ready",
+            ) from error
 
     async def scheduled_tasks_list(self, payload: dict[str, Any]) -> dict[str, Any]:
         values = _object(payload, "workspace payload")
@@ -2658,6 +2739,30 @@ def _empty_payload(payload: Any) -> None:
         raise WorkspaceControlError("Workspace payload must be empty")
 
 
+def _card_template_projection(template: Any) -> dict[str, Any]:
+    value = _object(template, "card template")
+    keys = (
+        "id",
+        "version",
+        "name",
+        "summary",
+        "author",
+        "license",
+        "minimum_card_version",
+        "sha256",
+    )
+    if any(key not in value for key in keys):
+        raise WorkspaceControlError("Card template projection is invalid")
+    return {key: value[key] for key in keys}
+
+
+def _card_template_agent_id(value: Any) -> str:
+    try:
+        return _agent_id(value)
+    except WorkspaceControlError as error:
+        raise ValueError("Card template agent ownership is invalid") from error
+
+
 def _project_primary_path(project: dict[str, Any]) -> str:
     direct = project.get("primary_path")
     if isinstance(direct, str) and direct.strip():
@@ -2896,6 +3001,7 @@ def _project_git_wire(value: Any) -> Any:
         "files_page": "filesPage",
         "conflicts_page": "conflictsPage",
         "next_offset": "nextOffset",
+        "preview_content": "previewContent",
         "old_line": "oldLine",
         "new_line": "newLine",
         "confirmation_token": "confirmationToken",
@@ -3910,6 +4016,7 @@ class WorkspaceController:
         "sessions.delete": "sessions_delete",
         "attachments.resolve": "attachments_resolve",
         "attachments.fetch": "attachments_fetch",
+        "generated_media.resolve": "generated_media_resolve",
         "scheduled_tasks.list": "scheduled_tasks_list",
         "scheduled_tasks.delivery_targets": "scheduled_tasks_delivery_targets",
         "scheduled_tasks.create": "scheduled_tasks_create",
@@ -3925,6 +4032,9 @@ class WorkspaceController:
         "skills_tools.create": "skills_tools_create",
         "skills_tools.update": "skills_tools_update",
         "skills_tools.import": "skills_tools_import",
+        "cards.templates.list": "cards_templates_list",
+        "cards.templates.install": "cards_templates_install",
+        "cards.templates.remove": "cards_templates_remove",
         "marketplace.skills.install": "marketplace_skills_install",
         "marketplace.skills.status": "marketplace_skills_status",
         "projects.list": "projects_list",

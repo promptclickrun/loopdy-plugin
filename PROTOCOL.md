@@ -1,5 +1,14 @@
 # Loopdy protocol
 
+Plugin release `2.8.0` aligns with app 1.8.0 while retaining the standalone
+workspace Files and public-hook context usage foundations. It adds exact-call
+`generated_media.resolve`, separates 25 MiB host artifacts from unchanged phone
+upload limits, emits complete text previews as `previewContent`, and declares
+card-template operations in the static parser and dispatcher. Link and relay
+wire versions remain `1`; this does not widen legacy `socket.ready` envelopes.
+
+See [Generated media](docs/GENERATED_MEDIA.md) for resolution and transfer bounds.
+
 Marketplace additions include negotiated card and skill host capabilities,
 approved profile-scoped skill installation, and private-draft publishing
 guidance.

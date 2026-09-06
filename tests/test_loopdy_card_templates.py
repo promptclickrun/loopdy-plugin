@@ -71,6 +71,7 @@ class _PluginContext:
     def register_approval_transport(self, *_args) -> None: pass
     def register_hook(self, *_args) -> None: pass
     def register_cli_command(self, **_kwargs) -> None: pass
+    def register_skill(self, *_args, **_kwargs) -> None: pass
     def on_unload(self, *_args) -> None: pass
 
 

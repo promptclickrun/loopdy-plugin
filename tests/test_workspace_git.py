@@ -30,6 +30,102 @@ def git(root: Path, *args: str) -> str:
 
 
 class WorkspaceGitTests(unittest.TestCase):
+    def test_text_preview_crosses_real_backend_with_canonical_field(self) -> None:
+        import asyncio
+        from loopdy_plugin.workspace_control import HermesWorkspaceBackend
+
+        for suffix in ("md", "markdown", "txt"):
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory() as directory:
+                root, service = self.make_repo(directory, visibility="private")
+                path = f"preview.{suffix}"
+                content = "# Full file\n\n" + "Unchanged context\n" * 15 + "Final marker\n"
+                (root / path).write_text(content, encoding="utf-8")
+                git(root, "add", "--", path)
+                git(root, "commit", "-m", "preview baseline")
+                staged = content.replace("Full file", "Staged file")
+                worktree = content.replace("Full file", "Worktree file")
+                (root / path).write_text(staged, encoding="utf-8")
+                git(root, "add", "--", path)
+                (root / path).write_text(worktree, encoding="utf-8")
+
+                class Backend(HermesWorkspaceBackend):
+                    async def _projects_catalog(self, agent_id):
+                        return {"active_id": "fixture", "projects": [{
+                            "id": "fixture", "name": "Fixture", "archived": False,
+                            "primary_path": str(root),
+                            "folders": [{"path": str(root), "is_primary": True}],
+                        }]}
+
+                backend = Backend(service=object(), workspace_git=service,
+                    session_workspace_getter=lambda _agent, _session: str(root))
+                token = service.status("fixture")["status_token"]
+                for side, expected in (("staged", staged), ("worktree", worktree)):
+                    page = asyncio.run(backend.projects_git_diff({
+                        "agentId": "default", "sessionId": "session_preview_0001",
+                        "workspaceId": "fixture", "path": path, "side": side,
+                        "statusToken": token, "offset": 0, "limit": 200,
+                    }))
+                    self.assertEqual(page.get("previewContent"), expected)
+                    self.assertNotIn("preview_content", page)
+                    self.assertEqual(page["availability"], "available")
+                    self.assertFalse(any(row["content"] == "Final marker" for row in page["lines"]))
+
+    def test_text_preview_omits_binary_and_control_content(self) -> None:
+        from loopdy_plugin.workspace_control import _project_git_wire
+        for data in (b"before\x00after", b"before\x1bafter", "before\u0085after".encode()):
+            with self.subTest(data=data), tempfile.TemporaryDirectory() as directory:
+                root, service = self.make_repo(directory)
+                (root / "unsafe.md").write_bytes(data)
+                page = service.diff("fixture", path="unsafe.md", side="worktree",
+                    expected_status_token=service.status("fixture")["status_token"], offset=0, limit=200)
+                self.assertNotIn("preview_content", page)
+                self.assertNotIn("previewContent", _project_git_wire(page))
+
+    def test_diff_marks_unsafe_control_text_unavailable_instead_of_failing_native_decode(self) -> None:
+        for text in ("before\u007fafter", "before\u0080after"):
+            with self.subTest(text=text), tempfile.TemporaryDirectory() as directory:
+                root, service = self.make_repo(directory)
+                (root / "controls.txt").write_text(text, encoding="utf-8")
+                page = service.diff("fixture", path="controls.txt", side="worktree",
+                    expected_status_token=service.status("fixture")["status_token"], offset=0, limit=200)
+                self.assertEqual(page["availability"], "binary")
+                self.assertEqual(page["lines"], [])
+                self.assertNotIn("preview_content", page)
+
+    def test_text_preview_keeps_large_diff_pages_inside_wire_budget(self) -> None:
+        from loopdy_plugin.workspace_control import _project_git_wire
+        from loopdy_plugin.link_contracts import _workspace_json
+        with tempfile.TemporaryDirectory() as directory:
+            root, service = self.make_repo(directory)
+            path = "large.md"
+            (root / path).write_text(("old" * 3000 + "\n") * 15, encoding="utf-8")
+            git(root, "add", "--", path)
+            git(root, "commit", "-m", "large previous content")
+            content = ("new" * 3000 + "\n") * 7
+            (root / path).write_text(content, encoding="utf-8")
+            token = service.status("fixture")["status_token"]
+            offset = 0
+            rows = []
+            while True:
+                page = service.diff("fixture", path=path, side="worktree",
+                    expected_status_token=token, offset=offset, limit=200)
+                if offset == 0:
+                    self.assertEqual(page.get("preview_content"), content)
+                wire = _project_git_wire(page)
+                _workspace_json(wire, depth=0)
+                self.assertLessEqual(len(json.dumps(wire).encode("utf-8")), 160_000)
+                rows.extend(wire["lines"])
+                following = wire["nextOffset"]
+                if following is None:
+                    break
+                self.assertGreater(following, offset)
+                self.assertEqual(following, offset + len(wire["lines"]))
+                offset = following
+            additions = [row["content"] for row in rows if row["kind"] == "addition"]
+            deletions = [row["content"] for row in rows if row["kind"] == "deletion"]
+            self.assertEqual(additions, content.splitlines())
+            self.assertEqual(len(deletions), 15)
+
     def make_repo(self, directory: str, *, visibility: str = "public") -> tuple[Path, WorkspaceGitService]:
         root = Path(directory) / "repo"
         root.mkdir()

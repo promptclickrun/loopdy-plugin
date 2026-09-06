@@ -9,12 +9,14 @@ import json
 import logging
 import re
 import shlex
+import sqlite3
 import threading
 import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from .generated_media import record_generated_media_call
 from .link_contracts import (
     activity_event,
     session_context,
@@ -1058,6 +1060,19 @@ def publish_hook_activity(
             return
         lifecycle = _tool_lifecycle(payload.get("status"))
         duration = _duration(payload.get("duration_ms"))
+        if lifecycle == "succeeded":
+            try:
+                record_generated_media_call(
+                    profile=profile,
+                    stored_id=session_id,
+                    turn_id=turn_id,
+                    tool_call_id=tool_call_id,
+                    tool_name=tool_name,
+                    arguments=payload.get("args"),
+                    link_session_id=link_session_id,
+                )
+            except (OSError, sqlite3.Error, ValueError):
+                logger.warning("Generated media identity could not be retained")
         if tool_name in {"message_agent", "terminal"}:
             request = _collaboration_request(tool_name, payload.get("args"))
             if request is not None:

@@ -3,7 +3,7 @@
   "label": "Loopdy",
   "description": "Authenticated local push providers, device settings, event inbox, and approvals for Loopdy.",
   "icon": "MessageSquare",
-  "version": "2.1.0",
+  "version": "2.8.0",
   "tab": {
     "path": "/loopdy",
     "position": "end",

@@ -28,6 +28,22 @@
   build directories, traversal paths, control characters, and symlink children are excluded. The
   host process's normal filesystem read/search permissions remain authoritative.
 
+## Generated media
+
+Generated media resolution accepts only profile, stored-session, turn, and
+exact tool-call coordinates, never a client-supplied path or URL. It reads that
+profile's stored Hermes history, verifies an unambiguous supported generation
+call/result, and reuses Hermes' media-delivery path policy and the existing
+profile-scoped attachment cache. The plugin-owned identity ledger retains at
+most 512 recent call coordinates; it contains no prompts, results, or media bytes.
+
+Host-to-device artifacts are bounded to 25 MiB each and transferred in at most
+64 KiB chunks. Generated results expose at most eight artifacts and 32 MiB total.
+Phone-upload limits remain 8 MiB/file and 24 MiB/message. Oversize diagnostics
+retain MIME types internally, not source paths; wire metadata contains opaque
+attachment IDs, safe filenames, MIME types and byte counts. See
+[Generated media](docs/GENERATED_MEDIA.md) for states and ownership details.
+
 ## Workspace Files grants
 
 Workspace Files is a separate read-only plugin feature, exposed through the existing authenticated host API and a host CLI. Explicit local grants bind opaque IDs to pinned root directories; there is no automatic grant from Hermes Projects, no remote grant endpoint, and no private Project/session API dependency. Authenticated host API clients can inspect the grants in that host/profile; this is not yet a per-device encrypted Link permission. Existing Link behavior is unchanged.

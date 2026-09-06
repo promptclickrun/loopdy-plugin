@@ -125,6 +125,90 @@ class _ActivityBroker:
 
 
 class RegistrationTests(unittest.TestCase):
+    def test_registered_todo_hook_projects_current_and_legacy_tool_snapshots(self) -> None:
+        from loopdy_plugin.activity_bridge import LinkActivityBroker
+        from loopdy_plugin.registration import register
+
+        class CapturingBroker(LinkActivityBroker):
+            def __init__(self):
+                super().__init__()
+                self.payloads = []
+
+            def publish(self, payload):
+                self.payloads.append(payload)
+                return True
+
+        for tool_name in ("todo_list", "todo"):
+            with self.subTest(tool_name=tool_name):
+                broker = CapturingBroker()
+                context = _Context()
+                register(context, service=_Service(), activity_broker=broker)
+                broker.bind_link_session("stored-todo-session", "visible-todo-session")
+                for revision, status in enumerate(("pending", "in_progress", "completed"), 1):
+                    snapshot = {
+                        "todos": [{"id": "task-1", "content": "Verify task rail", "status": status}],
+                        "revision": revision,
+                    }
+                    payload = {
+                        "session_id": "stored-todo-session",
+                        "turn_id": "stored-todo-session:turn:todo01",
+                        "tool_call_id": f"todo-call-{revision}",
+                        # Hermes unwraps deferred tool_call before invoking hooks.
+                        "tool_name": tool_name,
+                        "args": {"todos": snapshot["todos"], "merge": True},
+                        "status": "ok",
+                        "result": json.dumps(snapshot) if revision % 2 else snapshot,
+                    }
+                    context.hooks["post_tool_call"](**payload)
+                    context.hooks["post_tool_call"](**payload)
+                events = [item for item in broker.payloads if item["type"] == "session.todos"]
+                self.assertEqual([event["revision"] for event in events], [1, 2, 3])
+                self.assertEqual(
+                    [event["todos"][0]["status"] for event in events],
+                    ["pending", "in_progress", "completed"],
+                )
+                self.assertTrue(all(event["sessionId"] == "visible-todo-session" for event in events))
+
+    def test_registered_todo_hook_rejects_failed_unbound_and_unrelated_results(self) -> None:
+        from loopdy_plugin.activity_bridge import LinkActivityBroker
+        from loopdy_plugin.registration import register
+
+        class CapturingBroker(LinkActivityBroker):
+            def __init__(self):
+                super().__init__()
+                self.payloads = []
+
+            def publish(self, payload):
+                self.payloads.append(payload)
+                return True
+
+        broker = CapturingBroker()
+        context = _Context()
+        register(context, service=_Service(), activity_broker=broker)
+        broker.bind_link_session("stored-todo-session", "visible-todo-session")
+        snapshot = {"todos": [{"id": "task-1", "content": "Keep private", "status": "pending"}], "revision": 1}
+        base = {
+            "session_id": "stored-todo-session",
+            "turn_id": "stored-todo-session:turn:todo01",
+            "tool_call_id": "todo-call-1",
+            "tool_name": "todo_list",
+            "status": "ok",
+            "result": snapshot,
+        }
+        for change in (
+            {"status": "failed"},
+            {"status": "cancelled"},
+            {"session_id": "unbound-session"},
+            {"tool_name": "terminal"},
+            {"tool_name": "tool_call", "args": {"name": "unrelated_tool"}},
+            {"result": "not json"},
+            {"result": {"todos": snapshot["todos"], "revision": True}},
+            {"result": {"todos": [{"id": "task-1", "status": "invalid"}], "revision": 1}},
+        ):
+            with self.subTest(change=change):
+                context.hooks["post_tool_call"](**(base | change))
+        self.assertFalse(any(item["type"] == "session.todos" for item in broker.payloads))
+
     def test_registered_api_hook_projects_usage_without_notification(self):
         from loopdy_plugin.registration import register
         from loopdy_plugin.activity_bridge import LinkActivityBroker

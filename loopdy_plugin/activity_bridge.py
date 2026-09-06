@@ -965,7 +965,8 @@ def publish_hook_activity(
             # cannot prove it did. Re-read Hermes instead of parsing either.
             publish_goal(session_id)
         if (
-            _coordinate(payload.get("tool_name"), 80) == "todo"
+            # Hermes now emits todo_list, including deferred bridge calls.
+            _coordinate(payload.get("tool_name"), 80) in {"todo", "todo_list"}
             and _tool_lifecycle(payload.get("status")) == "succeeded"
         ):
             snapshot = _todo_snapshot(payload.get("result"))

@@ -20,6 +20,12 @@ compatibility, but the app does not offer it for new selection.
 
 All modes support proactive messages even when no chat session is active.
 
+## Read-only workspace Files foundation
+
+The plugin can expose explicitly granted workspace folders through a read-only host CLI and authenticated plugin API. Browsing includes unchanged files, directory-local name search and revision-bound file reads. Git inspection reuses the fixed-command engine with mutation permissions disabled. No folder is exposed until a host operator grants it, and the feature does not access private Hermes Project/session databases.
+
+This is the **plugin foundation**, not an enabled mobile Files screen. App and encrypted Link wiring follow review and merge. Capable POSIX hosts are supported first; hosts without secure descriptor-relative traversal fail closed. See [Workspace Files](docs/WORKSPACE_FILES.md) for the contract, security limits and examples.
+
 ## Model-name catalog
 
 `model-names.json` is a data-only catalog for friendly model labels. In a compatible app, **Settings → Connectivity → Update Model Names** fetches the latest catalog from this repository without installing plugin code or restarting the gateway. A bundled fallback and the last valid cached catalog remain available when offline or when an update fails.

@@ -50,9 +50,11 @@ from loopdy_plugin.workspace_git import (  # noqa: E402
     WorkspaceGitError,
     WorkspaceGitService,
 )
+from loopdy_plugin.workspace_files_api import router as workspace_files_router  # noqa: E402
 
 
 router = APIRouter()
+router.include_router(workspace_files_router)
 _WORKSPACE_GIT_STATE_PATH = data_path().with_name("workspace-git.sqlite3")
 _service = None
 _workspace_git_service = None

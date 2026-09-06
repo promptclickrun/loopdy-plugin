@@ -28,6 +28,12 @@
   build directories, traversal paths, control characters, and symlink children are excluded. The
   host process's normal filesystem read/search permissions remain authoritative.
 
+## Workspace Files grants
+
+Workspace Files is a separate read-only plugin feature, exposed through the existing authenticated host API and a host CLI. Explicit local grants bind opaque IDs to pinned root directories; there is no automatic grant from Hermes Projects, no remote grant endpoint, and no private Project/session API dependency. Authenticated host API clients can inspect the grants in that host/profile; this is not yet a per-device encrypted Link permission. Existing Link behavior is unchanged.
+
+The implementation requires secure POSIX descriptor-relative traversal and refuses unsupported hosts. It rejects traversal, symlinks, unsafe hard links, special files and sensitive control/credential paths; it scans each bounded file for known credential patterns before returning any chunk. Pattern scanning is not universal secret detection, especially for opaque binary/compressed files. A host operator must grant only an appropriate project directory. Root replacement, stale versions and revocation fail closed; already delivered content cannot be recalled. See [Workspace Files](docs/WORKSPACE_FILES.md) for bounds, authentication, pagination and deferred client integration.
+
 ## Secrets and local state
 
 The owner-only SQLite database stores device push tokens, provider metadata, preferences, event summaries, delivery receipts, and pending approval bindings. Device tokens are addresses, but they are still treated as secrets. API and CLI diagnostics expose only a short SHA-256 fingerprint.

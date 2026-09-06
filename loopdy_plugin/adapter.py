@@ -350,6 +350,8 @@ class LoopdyAdapter(BasePlatformAdapter):
         self._link_draft_sent_at: OrderedDict[tuple[str, str], float] = OrderedDict()
         self._link_delivery_lock = asyncio.Lock()
         self.link_configuration_error = ""
+        self.marketplace_configuration_error = ""
+        marketplace_client = None
         if self.link_client is None:
             try:
                 runtime_config = load_runtime_config()
@@ -357,6 +359,19 @@ class LoopdyAdapter(BasePlatformAdapter):
                 runtime_config = None
                 self.link_configuration_error = str(exc)[:160]
             if runtime_config is not None:
+                from .marketplace import (
+                    CARD_TEMPLATE_CAPABILITY,
+                    MARKETPLACE_SKILL_CAPABILITY,
+                    build_marketplace_gateway_client,
+                )
+
+                capabilities = [CARD_TEMPLATE_CAPABILITY]
+                try:
+                    marketplace_client = build_marketplace_gateway_client(runtime_config)
+                except Exception as exc:
+                    self.marketplace_configuration_error = str(exc)[:160]
+                if marketplace_client is not None:
+                    capabilities.append(MARKETPLACE_SKILL_CAPABILITY)
                 self.link_client = LoopdyLinkClient(
                     runtime_config,
                     state=link_state,
@@ -366,6 +381,28 @@ class LoopdyAdapter(BasePlatformAdapter):
                         / "loopdy"
                         / "link-inbound"
                     ),
+                    capabilities=capabilities,
+                )
+        elif getattr(self.link_client, "config", None) is not None:
+            from .marketplace import build_marketplace_gateway_client
+
+            try:
+                marketplace_client = build_marketplace_gateway_client(
+                    self.link_client.config
+                )
+            except Exception as exc:
+                self.marketplace_configuration_error = str(exc)[:160]
+        if marketplace_client is not None:
+            from .marketplace import MarketplaceSkillInstaller
+
+            backend = getattr(self.workspace_controller, "backend", None)
+            if (
+                isinstance(backend, HermesWorkspaceBackend)
+                and backend.marketplace_skill_installer is None
+            ):
+                backend.marketplace_skill_installer = MarketplaceSkillInstaller(
+                    store=self.service.store,
+                    release_client=marketplace_client,
                 )
 
     @property

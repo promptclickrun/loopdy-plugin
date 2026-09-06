@@ -11,7 +11,10 @@ import sys
 import time
 from dataclasses import replace
 from functools import partial
+from pathlib import Path
 from typing import Any
+
+from hermes_constants import get_hermes_home
 
 from .adapter import (
     LoopdyAdapter,
@@ -31,12 +34,14 @@ from .activity_bridge import (
     finish_failed_turn_activity,
     publish_hook_activity,
 )
+from .attachments import AttachmentStore
 from .hooks import normalize_hook
 from .generative_ui import parse_v2_json, validate_rendered_envelope
 from .link_client import load_runtime_config
 from .link_contracts import generative_ui_event
 from .link_identity import pre_llm_context_from_state
 from .link_pairing import LINK_ENV_KEYS, pair_host
+from .marketplace import MarketplaceGatewayClient, MarketplacePublisher
 from .plugin_update import (
     PluginUpdateManager,
     local_cli_device_id,
@@ -69,11 +74,34 @@ HOOKS = (
 logger = logging.getLogger("hermes.plugins.loopdy")
 
 
+def register_marketplace_publish_skill(ctx: Any) -> None:
+    """Register Loopdy's read-only publishing guidance with Hermes."""
+
+    description = (
+        "Use when publishing Loopdy themes, cards, or skills. "
+        "Prepare a private draft for review in Loopdy."
+    )
+    ctx.register_skill(
+        "loopdy-marketplace-publish",
+        Path(__file__).resolve().parents[1]
+        / "skills"
+        / "loopdy-marketplace-publish"
+        / "SKILL.md",
+        description=description,
+        frontmatter={
+            "name": "loopdy-marketplace-publish",
+            "description": description,
+        },
+    )
+
+
 def register(
     ctx: Any,
     *,
     service: Any | None = None,
     activity_broker: LinkActivityBroker | Any | None = None,
+    marketplace_gateway_client: Any | None = None,
+    attachment_store: AttachmentStore | Any | None = None,
 ) -> None:
     active_service = service or get_service()
     broker = activity_broker or LinkActivityBroker()
@@ -81,9 +109,37 @@ def register(
     identity_state = getattr(ctx, "state", None)
     update_manager = production_manager(profile)
 
-    # Renderer tools are registered directly. Avoid registering a companion skill
-    # here because plugin skills are advertised through the model's system prompt.
-    register_tools(ctx, store=active_service.store, profile=profile)
+    selected_attachment_store = attachment_store or AttachmentStore(
+        get_hermes_home()
+        / "plugin-data"
+        / "loopdy"
+        / "agent-attachments.sqlite3"
+    )
+    selected_gateway_client = marketplace_gateway_client
+    if selected_gateway_client is None:
+        try:
+            runtime_config = load_runtime_config()
+        except (TypeError, ValueError):
+            runtime_config = None
+        if runtime_config is not None:
+            # Draft creation needs the paired host's signed-device identity;
+            # release trust anchors are independently required for installs.
+            selected_gateway_client = MarketplaceGatewayClient(
+                config=runtime_config,
+                trust_keys={},
+            )
+    register_tools(
+        ctx,
+        store=active_service.store,
+        profile=profile,
+        marketplace_publisher=MarketplacePublisher(
+            agent_id=profile,
+            store=active_service.store,
+            attachment_store=selected_attachment_store,
+            gateway_client=selected_gateway_client,
+        ),
+    )
+    register_marketplace_publish_skill(ctx)
 
     ctx.register_platform(
         name="loopdy",

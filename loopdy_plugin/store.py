@@ -606,6 +606,120 @@ class LoopdyStore:
             )
         return {"changed": True, "templateId": identifier}
 
+    def record_marketplace_skill_install(
+        self,
+        *,
+        profile: str,
+        item_id: str,
+        version: int,
+        sha256: str,
+        skill_name: str,
+        content_sha256: str | None,
+        files: Mapping[str, str],
+        request_id: str,
+        verification_mode: str = "legacy_exact",
+    ) -> dict[str, Any]:
+        owner = _identifier(profile, "profile")
+        item = _protocol_identifier(item_id, "item_id")
+        release_version = _positive_revision(version)
+        release_hash = _content_hash(sha256)
+        mode = _marketplace_verification_mode(verification_mode)
+        installed_hash = None if content_sha256 is None else _content_hash(content_sha256)
+        skill = _required_text(skill_name, "skill_name", 64)
+        request = _protocol_identifier(request_id, "request_id")
+        normalized_files = {
+            _required_text(path, "skill_file_path", 512): _content_hash(digest)
+            for path, digest in sorted(files.items())
+        }
+        if mode == "hermes_hub" and (installed_hash is not None or normalized_files):
+            raise ValueError("Hermes Hub receipts must not claim installed content digests")
+        if mode == "legacy_exact" and installed_hash is None:
+            raise ValueError("Legacy exact receipts require an installed content digest")
+        files_json = _json(normalized_files)
+        now = int(time.time())
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            conflicting = connection.execute(
+                "SELECT item_id FROM marketplace_skill_installs "
+                "WHERE profile=? AND skill_name=? AND item_id<>?",
+                (owner, skill, item),
+            ).fetchone()
+            if conflicting is not None:
+                raise ValueError("Marketplace skill name belongs to another item")
+            connection.execute(
+                """
+                INSERT INTO marketplace_skill_installs (
+                    profile, item_id, version, sha256, skill_name,
+                    content_sha256, installed_content_sha256, verification_mode,
+                    files_json, request_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(profile, item_id) DO UPDATE SET
+                    version=excluded.version,
+                    sha256=excluded.sha256,
+                    skill_name=excluded.skill_name,
+                    content_sha256=excluded.content_sha256,
+                    installed_content_sha256=excluded.installed_content_sha256,
+                    verification_mode=excluded.verification_mode,
+                    files_json=excluded.files_json,
+                    request_id=excluded.request_id,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    owner,
+                    item,
+                    release_version,
+                    release_hash,
+                    skill,
+                    installed_hash or "",
+                    installed_hash,
+                    mode,
+                    files_json,
+                    request,
+                    now,
+                    now,
+                ),
+            )
+        result = self.get_marketplace_skill_install(profile=owner, item_id=item)
+        if result is None:
+            raise RuntimeError("Marketplace skill receipt was not persisted")
+        return result
+
+    def get_marketplace_skill_install(
+        self,
+        *,
+        profile: str,
+        item_id: str,
+    ) -> dict[str, Any] | None:
+        owner = _identifier(profile, "profile")
+        item = _protocol_identifier(item_id, "item_id")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM marketplace_skill_installs WHERE profile=? AND item_id=?",
+                (owner, item),
+            ).fetchone()
+        if row is None:
+            return None
+        mode = _marketplace_verification_mode(
+            str(row["verification_mode"] or "legacy_exact")
+        )
+        installed_hash = row["installed_content_sha256"]
+        if installed_hash is None and mode == "legacy_exact":
+            legacy_hash = str(row["content_sha256"] or "")
+            installed_hash = legacy_hash if legacy_hash else None
+        result: dict[str, Any] = {
+            "agentId": str(row["profile"]),
+            "itemId": str(row["item_id"]),
+            "version": int(row["version"]),
+            "sha256": str(row["sha256"]),
+            "skillName": str(row["skill_name"]),
+            "requestId": str(row["request_id"]),
+            "verificationMode": mode,
+        }
+        if installed_hash is not None:
+            result["contentSha256"] = _content_hash(installed_hash)
+            result["files"] = _load_json(str(row["files_json"]), {})
+        return result
+
     def provider_mode(self) -> str:
         with self._connect() as connection:
             row = connection.execute(
@@ -3437,8 +3551,40 @@ class LoopdyStore:
                     );
                     CREATE INDEX IF NOT EXISTS card_templates_profile_name_idx
                     ON card_templates(profile, name, template_id);
+                    CREATE TABLE IF NOT EXISTS marketplace_skill_installs (
+                        profile TEXT NOT NULL,
+                        item_id TEXT NOT NULL,
+                        version INTEGER NOT NULL,
+                        sha256 TEXT NOT NULL,
+                        skill_name TEXT NOT NULL,
+                        content_sha256 TEXT NOT NULL,
+                        installed_content_sha256 TEXT,
+                        verification_mode TEXT NOT NULL DEFAULT 'legacy_exact',
+                        files_json TEXT NOT NULL,
+                        request_id TEXT NOT NULL,
+                        created_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        PRIMARY KEY (profile, item_id),
+                        UNIQUE (profile, skill_name)
+                    );
                     """
                 )
+                marketplace_columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(marketplace_skill_installs)"
+                    ).fetchall()
+                }
+                if "installed_content_sha256" not in marketplace_columns:
+                    connection.execute(
+                        "ALTER TABLE marketplace_skill_installs "
+                        "ADD COLUMN installed_content_sha256 TEXT"
+                    )
+                if "verification_mode" not in marketplace_columns:
+                    connection.execute(
+                        "ALTER TABLE marketplace_skill_installs ADD COLUMN verification_mode "
+                        "TEXT NOT NULL DEFAULT 'legacy_exact'"
+                    )
                 event_columns = {
                     row[1] for row in connection.execute("PRAGMA table_info(events)").fetchall()
                 }
@@ -3838,6 +3984,13 @@ def _content_hash(value: Any) -> str:
     normalized = str(value or "").strip()
     if len(normalized) != 64 or any(character not in "0123456789abcdef" for character in normalized):
         raise ValueError("content_hash must be 64 lowercase hexadecimal characters")
+    return normalized
+
+
+def _marketplace_verification_mode(value: Any) -> str:
+    normalized = str(value or "").strip()
+    if normalized not in {"legacy_exact", "hermes_hub"}:
+        raise ValueError("Marketplace verification mode is invalid")
     return normalized
 
 

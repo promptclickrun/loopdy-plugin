@@ -246,6 +246,40 @@ profile-scoped plugin store. The generic template tools are
 `loopdy_render_card`. Templates cannot install native code or expand the v1
 component catalog. No production template catalog URL is configured.
 
+### Loopdy Marketplace host support
+
+Marketplace support adds the static `marketplace.skills.install` and
+`marketplace.skills.status` workspace operations. Install requests contain only
+the selected agent, immutable item/version/digest, short-lived approval, and
+request IDs; they cannot supply a URL or filesystem destination. The host
+redeems approval with its existing signed Link identity, fetches release bytes
+only from the paired Link origin, verifies the exact Ed25519-signed manifest and
+artifact digest, and installs through Hermes' profile-aware Skills Hub CLI.
+Name conflicts and locally installed skills are never replaced. A receipt is
+returned only after Hermes reports the marketplace skill in the selected
+profile.
+
+The plugin bundles the public release trust anchor for the official Loopdy
+marketplace. `LOOPDY_MARKETPLACE_TRUSTED_ED25519_KEYS`, when explicitly set,
+replaces that set with a JSON object mapping key IDs to padded standard-base64
+32-byte Ed25519 public keys. Set an empty string to disable marketplace release
+trust. Invalid overrides fail closed; they do not fall back to bundled keys.
+These are public verification keys, never private signing material. A paired
+Link socket advertises `cards-templates-v1`; it adds
+`marketplace-skills-hub-v1` only when at least one valid trust anchor is
+configured. No fixture key is trusted. Backend enablement and plugin activation
+remain separate from merging this source for the coordinated release.
+
+The read-only namespaced skill `loopdy:loopdy-marketplace-publish` guides
+agent-assisted private draft preparation. For a selected theme attachment or
+saved card template, `loopdy_marketplace_prepare_upload` supports a no-network
+`validateOnly` pass followed by private draft creation and exact readback in
+**Loopdy Marketplace > My Uploads**. It exposes no submit or publish operation.
+Skill uploads use the app's reviewed package picker because Hermes does not
+provide a supported non-preprocessed raw skill export API. Secrets, unsafe
+paths, live card sources, undeclared scripts, invalid theme palettes, binaries,
+archives, and size-limit violations block upload.
+
 See the repository [Loopdy Cards guide](docs/LOOPDY_CARDS.md) and the
 [wire protocol](PROTOCOL.md#loopdy-card-version-1) for the complete example,
 component table, static-data policy, visible error states, lifecycle, and legacy

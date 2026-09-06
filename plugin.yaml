@@ -24,6 +24,7 @@ optional_env:
   - LOOPDY_LINK_SIGNING_PRIVATE_KEY
   - LOOPDY_LINK_AGREEMENT_PRIVATE_KEY
   - LOOPDY_LINK_ACCOUNT_KEY
+  - LOOPDY_MARKETPLACE_TRUSTED_ED25519_KEYS
 provides_hooks:
   - pre_llm_call
   - post_llm_call
@@ -53,6 +54,7 @@ provides_tools:
   - loopdy_search_card_templates
   - loopdy_get_card_template
   - loopdy_render_card_template
+  - loopdy_marketplace_prepare_upload
 platforms:
   - linux
   - macos

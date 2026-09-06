@@ -830,7 +830,8 @@ class RegistrationTests(unittest.TestCase):
                 "kanban_task_blocked",
             },
         )
-        self.assertEqual(context.skills, {})
+        self.assertEqual(set(context.skills), {"loopdy-marketplace-publish"})
+        self.assertTrue(context.skills["loopdy-marketplace-publish"]["path"].is_file())
 
         self.assertIsNone(
             context.hooks["pre_llm_call"](

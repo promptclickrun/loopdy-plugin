@@ -379,8 +379,15 @@ def load_marketplace_trust_keys(
 
     import os
 
+    from .marketplace_trust import PRODUCTION_RELEASE_KEYS
+
     source = os.environ if values is None else values
-    encoded = str(source.get("LOOPDY_MARKETPLACE_TRUSTED_ED25519_KEYS") or "").strip()
+    setting = "LOOPDY_MARKETPLACE_TRUSTED_ED25519_KEYS"
+    encoded = (
+        str(source.get(setting) or "").strip()
+        if setting in source
+        else json.dumps(PRODUCTION_RELEASE_KEYS)
+    )
     if not encoded:
         return {}
     try:

@@ -259,13 +259,16 @@ Name conflicts and locally installed skills are never replaced. A receipt is
 returned only after Hermes reports the marketplace skill in the selected
 profile.
 
-Release verification remains opt-in until a public trust anchor is bundled.
-`LOOPDY_MARKETPLACE_TRUSTED_ED25519_KEYS` accepts a JSON object mapping key IDs
-to padded standard-base64 32-byte Ed25519 public keys. These are public
-verification keys, never private signing material. A paired Link socket
-advertises `cards-templates-v1`; it adds `marketplace-skills-hub-v1` only when
-at least one valid trust anchor is configured. This source tree enables no
-fixture or default key.
+The plugin bundles the public release trust anchor for the official Loopdy
+marketplace. `LOOPDY_MARKETPLACE_TRUSTED_ED25519_KEYS`, when explicitly set,
+replaces that set with a JSON object mapping key IDs to padded standard-base64
+32-byte Ed25519 public keys. Set an empty string to disable marketplace release
+trust. Invalid overrides fail closed; they do not fall back to bundled keys.
+These are public verification keys, never private signing material. A paired
+Link socket advertises `cards-templates-v1`; it adds
+`marketplace-skills-hub-v1` only when at least one valid trust anchor is
+configured. No fixture key is trusted. Backend enablement and plugin activation
+remain separate from merging this source for the coordinated release.
 
 The read-only namespaced skill `loopdy:loopdy-marketplace-publish` guides
 agent-assisted private draft preparation. For a selected theme attachment or

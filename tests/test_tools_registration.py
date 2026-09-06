@@ -95,6 +95,11 @@ class ToolRegistrationTests(unittest.TestCase):
                 self.assertNotIn("renderer", description)
                 self.assertIn("exact-session", description)
                 continue
+            if tool_name == "loopdy_marketplace_prepare_upload":
+                self.assertIn("private marketplace", description)
+                self.assertIn("cannot submit or publish", description)
+                self.assertTrue(renderer_schema["parameters"]["properties"]["validateOnly"])
+                continue
             self.assertIn("direct callable native Loopdy renderer", description)
             self.assertIn("visible in the current tool list", description)
             self.assertIn("tool_search", description)

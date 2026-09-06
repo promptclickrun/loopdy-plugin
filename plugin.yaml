@@ -27,6 +27,8 @@ optional_env:
 provides_hooks:
   - pre_llm_call
   - post_llm_call
+  - post_api_request
+  - on_session_reset
   - pre_tool_call
   - post_tool_call
   - on_session_end

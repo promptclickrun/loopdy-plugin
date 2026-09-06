@@ -57,6 +57,8 @@ class LinkActivityBroker:
         self._context_task: asyncio.Task[None] | None = None
         self._active: OrderedDict[tuple[str, str], str] = OrderedDict()
         self._bound_sessions: OrderedDict[str, str] = OrderedDict()
+        self._api_usage: OrderedDict[tuple[str, str], dict[str, int]] = OrderedDict()
+        self._api_usage_order: dict[tuple[str, str], dict[str, Any]] = {}
         self._child_routes: OrderedDict[str, tuple[str, str, str]] = OrderedDict()
         self._handoffs_by_process: OrderedDict[str, tuple[str, str, str]] = OrderedDict()
 
@@ -111,6 +113,8 @@ class LinkActivityBroker:
                 self._context_task = None
                 self._active.clear()
                 self._bound_sessions.clear()
+                self._api_usage.clear()
+                self._api_usage_order.clear()
                 self._child_routes.clear()
                 self._handoffs_by_process.clear()
 
@@ -136,12 +140,12 @@ class LinkActivityBroker:
         link_session_id: str,
     ) -> None:
         coordinate = (session_id, turn_id)
+        self.bind_link_session(session_id, link_session_id)
         with self._lock:
             self._active.pop(coordinate, None)
             self._active[coordinate] = link_session_id
             while len(self._active) > self.maximum_active_turns:
                 self._active.popitem(last=False)
-        self.bind_link_session(session_id, link_session_id)
 
     def bind_link_session(self, session_id: str, link_session_id: str) -> None:
         """Bind one verified Link chat to its canonical Hermes conversation."""
@@ -151,10 +155,93 @@ class LinkActivityBroker:
         if not hermes_session or not link_session:
             return
         with self._lock:
+            previous_route = self._bound_sessions.get(hermes_session)
+            if previous_route is not None and previous_route != link_session:
+                self._clear_api_usage_locked(hermes_session)
             self._bound_sessions.pop(hermes_session, None)
             self._bound_sessions[hermes_session] = link_session
             while len(self._bound_sessions) > self.maximum_bound_sessions:
-                self._bound_sessions.popitem(last=False)
+                evicted_session, _ = self._bound_sessions.popitem(last=False)
+                self._clear_api_usage_locked(evicted_session)
+
+    def record_api_usage(self, **payload: Any) -> None:
+        """Retain only the latest public usage snapshot for a bound session/model."""
+
+        session_id = _coordinate(payload.get("session_id"), 128)
+        model = _model_coordinate(payload.get("model"))
+        usage = _api_usage_projection(payload.get("usage"))
+        if not session_id or not model:
+            return
+        key = (session_id, model)
+        order = _api_usage_event_order(payload)
+        turn_id = payload.get("turn_id")
+        with self._lock:
+            if session_id not in self._bound_sessions:
+                return
+            previous_order = self._api_usage_order.get(key)
+            if previous_order is not None and _api_usage_is_stale(
+                previous_order, order
+            ):
+                return
+            self._api_usage.pop(key, None)
+            # An unavailable or rejected latest snapshot deliberately replaces
+            # older numbers with absence; an empty dict is the bounded marker.
+            self._api_usage[key] = usage or {}
+            self._api_usage_order[key] = order
+            while len(self._api_usage) > self.maximum_bound_sessions:
+                evicted_key, _ = self._api_usage.popitem(last=False)
+                self._api_usage_order.pop(evicted_key, None)
+            active_turn = (
+                turn_id.strip()
+                if isinstance(turn_id, str) and turn_id.strip()
+                else ""
+            )
+            should_publish = bool(
+                active_turn and (session_id, active_turn) in self._active
+            )
+        if should_publish:
+            self.publish_context_window(session_id, active_turn, force=True)
+
+    def usage_snapshot(self, session_id: Any, model: Any) -> dict[str, int] | None:
+        """Return a copy only for the exact currently bound session and model."""
+
+        session = _coordinate(session_id, 128)
+        canonical_model = _model_coordinate(model)
+        if not session or not canonical_model:
+            return None
+        key = (session, canonical_model)
+        with self._lock:
+            if session not in self._bound_sessions:
+                return None
+            usage = self._api_usage.get(key)
+            if not usage:
+                return None
+            self._api_usage.move_to_end(key)
+            return dict(usage)
+
+    def reset_api_usage(
+        self,
+        session_id: Any = None,
+        *,
+        old_session_id: Any = None,
+        new_session_id: Any = None,
+        **_payload: Any,
+    ) -> None:
+        """Clear usage at a public boundary without changing existing chat routes."""
+
+        old_session = _coordinate(old_session_id, 128) or _coordinate(session_id, 128)
+        new_session = _coordinate(new_session_id, 128)
+        with self._lock:
+            if old_session:
+                self._clear_api_usage_locked(old_session)
+            if new_session and new_session != old_session:
+                self._clear_api_usage_locked(new_session)
+
+    def _clear_api_usage_locked(self, session_id: str) -> None:
+        for key in tuple(self._api_usage):
+            if key[0] == session_id:
+                self._api_usage.pop(key, None)
+                self._api_usage_order.pop(key, None)
 
     def register_child_route(
         self, child_session_id: str, parent_link_session_id: str, parent_turn_id: str
@@ -391,6 +478,10 @@ class LinkActivityBroker:
             return False
         if not isinstance(snapshot, dict):
             return False
+        snapshot = dict(snapshot)
+        usage = self.usage_snapshot(session_id, snapshot.get("model"))
+        if usage is not None:
+            _merge_context_usage(snapshot, usage)
         signature = (
             snapshot.get("title"),
             snapshot.get("model"),
@@ -1249,6 +1340,121 @@ def _coordinate(value: Any, maximum: int) -> str:
     if not 1 <= len(normalized) <= maximum or not _IDENTIFIER.fullmatch(normalized):
         return ""
     return normalized
+
+
+def _model_coordinate(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    normalized = value.strip()
+    if (
+        not 1 <= len(normalized) <= 160
+        or not normalized.isprintable()
+        or any(character.isspace() for character in normalized)
+    ):
+        return ""
+    return normalized
+
+
+def _api_usage_projection(value: Any) -> dict[str, int] | None:
+    if not isinstance(value, dict):
+        return None
+    projected: dict[str, int] = {}
+    fields = {
+        "prompt_tokens": "inputTokens",
+        "output_tokens": "outputTokens",
+        "cache_read_tokens": "cachedTokens",
+        "total_tokens": "totalTokens",
+    }
+    for source in (
+        "prompt_tokens",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens",
+        "total_tokens",
+    ):
+        if source not in value or value[source] is None:
+            continue
+        count = value[source]
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            return None
+        target = fields.get(source)
+        if target is not None:
+            projected[target] = count
+    return projected or None
+
+
+def _api_usage_event_order(payload: dict[str, Any]) -> dict[str, Any]:
+    def identifier(value: Any) -> str:
+        if not isinstance(value, str):
+            return ""
+        candidate = value.strip()
+        return (
+            candidate
+            if 1 <= len(candidate) <= 180 and candidate.isprintable()
+            else ""
+        )
+
+    def count(value: Any) -> int | None:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+        return value
+
+    def timestamp(value: Any) -> float | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        candidate = float(value)
+        return candidate if 0 <= candidate <= 100_000_000_000 else None
+
+    return {
+        "request_id": identifier(payload.get("api_request_id")),
+        "turn_id": identifier(payload.get("turn_id")),
+        "api_call_count": count(payload.get("api_call_count")),
+        "started_at": timestamp(payload.get("started_at")),
+        "ended_at": timestamp(payload.get("ended_at")),
+    }
+
+
+def _api_usage_is_stale(
+    previous: dict[str, Any], candidate: dict[str, Any]
+) -> bool:
+    request_id = candidate.get("request_id")
+    if request_id and request_id == previous.get("request_id"):
+        return True
+    previous_ended = previous.get("ended_at")
+    candidate_ended = candidate.get("ended_at")
+    if previous_ended is not None and candidate_ended is not None:
+        if candidate_ended < previous_ended:
+            return True
+        if candidate_ended > previous_ended:
+            return False
+    turn_id = candidate.get("turn_id")
+    if turn_id and turn_id == previous.get("turn_id"):
+        previous_count = previous.get("api_call_count")
+        candidate_count = candidate.get("api_call_count")
+        if previous_count is not None and candidate_count is not None:
+            return candidate_count < previous_count
+        previous_started = previous.get("started_at")
+        candidate_started = candidate.get("started_at")
+        if previous_started is not None and candidate_started is not None:
+            return candidate_started < previous_started
+    return False
+
+
+def _merge_context_usage(
+    snapshot: dict[str, Any], usage: dict[str, int]
+) -> None:
+    snapshot.update(usage)
+    prompt_tokens = usage.get("inputTokens")
+    if prompt_tokens is None:
+        return
+    snapshot["contextUsed"] = prompt_tokens
+    maximum = snapshot.get("contextMax")
+    if isinstance(maximum, int) and not isinstance(maximum, bool) and maximum > 0:
+        snapshot["contextPercent"] = min(
+            100, round((prompt_tokens / maximum) * 100)
+        )
 
 
 def _turn_coordinate(value: Any) -> str:

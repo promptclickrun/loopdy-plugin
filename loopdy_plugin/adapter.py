@@ -583,70 +583,28 @@ class LoopdyAdapter(BasePlatformAdapter):
         if title:
             snapshot["title"] = title
 
-        # Token accounting is optional. Hermes runtimes that do not expose a
-        # usage counter omit the key so Loopdy renders the window-only summary
-        # instead of a misleading zero.
-        def optional_token(*candidates: Any) -> int | None:
-            for holder, name in candidates:
-                if holder is None:
-                    continue
-                raw = getattr(holder, name, None)
-                if raw is None:
-                    continue
-                try:
-                    parsed = int(raw)
-                except (TypeError, ValueError):
-                    continue
-                if parsed >= 0:
-                    return parsed
-            return None
-
-        usage = getattr(agent, "token_usage", None) or getattr(
-            compressor, "token_usage", None
-        )
-        for key, candidates in (
-            (
-                "inputTokens",
-                (
-                    (usage, "input_tokens"),
-                    (usage, "prompt_tokens"),
-                ),
-            ),
-            (
-                "outputTokens",
-                (
-                    (usage, "output_tokens"),
-                    (usage, "completion_tokens"),
-                    (compressor, "last_completion_tokens"),
-                    (entry, "last_completion_tokens"),
-                ),
-            ),
-            (
-                "cachedTokens",
-                (
-                    (usage, "cached_tokens"),
-                    (usage, "cache_read_input_tokens"),
-                    (compressor, "last_cached_tokens"),
-                ),
-            ),
-            (
-                "totalTokens",
-                (
-                    (usage, "total_tokens"),
-                    (compressor, "total_tokens"),
-                    (entry, "total_tokens"),
-                ),
-            ),
-        ):
-            value = optional_token(*candidates)
-            if value is not None:
-                snapshot[key] = value
-
-        if "totalTokens" not in snapshot:
-            input_tokens = snapshot.get("inputTokens")
-            output_tokens = snapshot.get("outputTokens")
-            if input_tokens is not None and output_tokens is not None:
-                snapshot["totalTokens"] = input_tokens + output_tokens
+        # Per-request usage belongs to the activity broker's public-hook state.
+        # Keep it separate from Hermes runner internals so reconnect snapshots
+        # can reuse the same verified session/model projection.
+        usage_reader = getattr(self.activity_broker, "usage_snapshot", None)
+        try:
+            usage = usage_reader(session_id, model) if callable(usage_reader) else None
+        except Exception as exc:
+            logger.warning("Loopdy usage snapshot failed (%s)", type(exc).__name__)
+            usage = None
+        if isinstance(usage, dict):
+            for key in (
+                "inputTokens", "outputTokens", "cachedTokens", "totalTokens"
+            ):
+                value = usage.get(key)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    snapshot[key] = value
+            prompt_tokens = snapshot.get("inputTokens")
+            if prompt_tokens is not None:
+                snapshot["contextUsed"] = prompt_tokens
+                snapshot["contextPercent"] = min(
+                    100, round((prompt_tokens / maximum) * 100)
+                )
 
         return snapshot
 

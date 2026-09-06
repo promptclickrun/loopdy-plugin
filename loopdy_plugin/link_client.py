@@ -9,6 +9,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -62,6 +63,7 @@ from .link_identity import LinkIdentityRegistry
 
 logger = logging.getLogger("hermes.plugins.loopdy.link")
 _SOCKET_PATH = "/v1/socket"
+_CAPABILITY = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _PROCESS_TRANSPORT_LOCKS: dict[str, threading.Lock] = {}
 _PROCESS_TRANSPORT_LOCKS_GUARD = threading.Lock()
 
@@ -391,6 +393,7 @@ class LoopdyLinkClient:
         attachment_root: Path | None = None,
         delivery_timeout: float = 20.0,
         readiness_timeout: float = 15.0,
+        capabilities: Iterable[str] = (),
     ):
         self.config = config
         self.state = state or _MemoryState()
@@ -418,6 +421,20 @@ class LoopdyLinkClient:
         )
         self._delivery_timeout = max(0.001, float(delivery_timeout))
         self._readiness_timeout = max(0.001, float(readiness_timeout))
+        negotiated = ["socket-ready-v1", "backpressure-v1"]
+        for value in capabilities:
+            if (
+                not isinstance(value, str)
+                or not _CAPABILITY.fullmatch(value)
+                or value in negotiated
+            ):
+                if value in negotiated:
+                    continue
+                raise ValueError("Loopdy Link capability is invalid")
+            negotiated.append(value)
+        if len(negotiated) > 16:
+            raise ValueError("Loopdy Link capability catalog is too large")
+        self.capabilities = tuple(negotiated)
         self._accepted: dict[str, asyncio.Future[None]] = {}
         self._live_activity_accepted: dict[str, asyncio.Future[None]] = {}
         self._inbound_callback_queue: asyncio.Queue[
@@ -936,7 +953,7 @@ class LoopdyLinkClient:
             # Explicitly negotiate the readiness frame. Older Hermes hosts
             # treat all text messages as encrypted frames and must not receive
             # this control message unexpectedly.
-            headers["x-loopdy-capabilities"] = "socket-ready-v1,backpressure-v1"
+            headers["x-loopdy-capabilities"] = ",".join(self.capabilities)
             try:
                 async with connect(
                     self.config.socket_url,

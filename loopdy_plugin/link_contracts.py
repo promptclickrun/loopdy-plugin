@@ -55,6 +55,8 @@ WORKSPACE_OPERATIONS = frozenset(
         "skills_tools.create",
         "skills_tools.update",
         "skills_tools.import",
+        "marketplace.skills.install",
+        "marketplace.skills.status",
         "projects.list",
         "projects.set_active",
         "projects.create",

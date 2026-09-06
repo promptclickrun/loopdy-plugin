@@ -131,6 +131,7 @@ class HermesWorkspaceBackend:
         workspace_git: WorkspaceGitService | Any | None = None,
         workspace_git_state_path: Path | str | None = None,
         attachment_store: AttachmentStore | None = None,
+        marketplace_skill_installer: Any | None = None,
     ):
         self.service = service
         self.clock = clock
@@ -156,6 +157,7 @@ class HermesWorkspaceBackend:
             / "loopdy"
             / "agent-attachments.sqlite3"
         )
+        self.marketplace_skill_installer = marketplace_skill_installer
         self._project_git_services: OrderedDict[
             tuple[str, str, str, str], WorkspaceGitService
         ] = OrderedDict()
@@ -676,6 +678,46 @@ class HermesWorkspaceBackend:
                 agent_id, name, content, category, supporting_files
             )
         return await self.skills_tools_get({"agentId": agent_id, "skillId": name})
+
+    async def marketplace_skills_install(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        installer = self.marketplace_skill_installer
+        if installer is None or not callable(getattr(installer, "install", None)):
+            raise WorkspaceControlError(
+                "Marketplace skill installation is unavailable",
+                code="capability_unavailable",
+            )
+        try:
+            return await installer.install(payload)
+        except Exception as exc:
+            from .marketplace import MarketplaceInstallError
+
+            if isinstance(exc, MarketplaceInstallError):
+                raise WorkspaceControlError(
+                    str(exc), code="marketplace_install_failed"
+                ) from exc
+            raise
+
+    async def marketplace_skills_status(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        installer = self.marketplace_skill_installer
+        if installer is None or not callable(getattr(installer, "status", None)):
+            raise WorkspaceControlError(
+                "Marketplace skill status is unavailable",
+                code="capability_unavailable",
+            )
+        try:
+            return await installer.status(payload)
+        except Exception as exc:
+            from .marketplace import MarketplaceInstallError
+
+            if isinstance(exc, MarketplaceInstallError):
+                raise WorkspaceControlError(
+                    str(exc), code="marketplace_install_failed"
+                ) from exc
+            raise
 
     async def projects_list(self, payload: dict[str, Any]) -> dict[str, Any]:
         values = _object(payload, "workspace payload")
@@ -3883,6 +3925,8 @@ class WorkspaceController:
         "skills_tools.create": "skills_tools_create",
         "skills_tools.update": "skills_tools_update",
         "skills_tools.import": "skills_tools_import",
+        "marketplace.skills.install": "marketplace_skills_install",
+        "marketplace.skills.status": "marketplace_skills_status",
         "projects.list": "projects_list",
         "projects.set_active": "projects_set_active",
         "projects.create": "projects_create",

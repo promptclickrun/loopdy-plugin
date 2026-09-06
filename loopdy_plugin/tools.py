@@ -1,4 +1,5 @@
 import json
+import inspect
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -509,11 +510,97 @@ def _template_tool_description(action: str) -> str:
     )
 
 
+def _marketplace_publish_parameters() -> dict[str, Any]:
+    metadata = _strict_object(
+        {
+            "title": {"type": "string", "minLength": 1, "maxLength": 80},
+            "summary": {"type": "string", "minLength": 1, "maxLength": 240},
+            "description": {"type": "string", "maxLength": 8_000},
+            "tags": {
+                "type": "array",
+                "maxItems": 8,
+                "uniqueItems": True,
+                "items": {"type": "string", "minLength": 1, "maxLength": 24},
+            },
+            "publicAuthorName": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 80,
+            },
+            "license": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9.+-]{0,63}$",
+            },
+            "declaredCapabilities": {
+                "type": "array",
+                "maxItems": 16,
+                "uniqueItems": True,
+                "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "pattern": "^[A-Za-z][A-Za-z0-9._:-]{0,63}$",
+                },
+            },
+        },
+        [
+            "title",
+            "summary",
+            "description",
+            "tags",
+            "publicAuthorName",
+            "license",
+            "declaredCapabilities",
+        ],
+    )
+    return _strict_object(
+        {
+            "agentId": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+            },
+            "kind": {"type": "string", "enum": ["theme", "card", "skill"]},
+            "sourceId": {"type": "string", "minLength": 1, "maxLength": 128},
+            "validateOnly": {"type": "boolean"},
+            "metadata": metadata,
+            "idempotencyKey": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{16,96}$",
+            },
+        },
+        [
+            "agentId",
+            "kind",
+            "sourceId",
+            "validateOnly",
+            "metadata",
+            "idempotencyKey",
+        ],
+    )
+
+
+def _marketplace_publish_handler(publisher: Any):
+    async def handle(payload, **_kwargs):
+        if publisher is None or not callable(getattr(publisher, "prepare_upload", None)):
+            raise ValueError("Loopdy Marketplace publishing is unavailable")
+        result = publisher.prepare_upload(payload)
+        if inspect.isawaitable(result):
+            result = await result
+        if not isinstance(result, dict):
+            raise ValueError("Loopdy Marketplace publishing returned an invalid result")
+        return json.dumps(
+            result, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        )
+
+    return handle
+
+
 def register(
     ctx,
     *,
     store: Any = None,
     profile: str | None = None,
+    marketplace_publisher: Any = None,
     now: Callable[[], datetime] | None = None,
     request_id_factory: Callable[[], str] | None = None,
 ):
@@ -597,6 +684,23 @@ def register(
             ),
         },
         handler=_await_handler(store=store, profile=selected_profile, now=clock),
+    )
+    ctx.register_tool(
+        name="loopdy_marketplace_prepare_upload",
+        toolset="loopdy",
+        schema={
+            "name": "loopdy_marketplace_prepare_upload",
+            "description": (
+                "Validate one explicitly selected Loopdy theme attachment, installed card "
+                "template, or profile-owned skill and, only when the current user request "
+                "authorizes that exact source and destination, prepare a private marketplace "
+                "draft for review in Loopdy My Uploads. Use validateOnly first. This tool "
+                "cannot submit or publish a listing."
+            ),
+            "parameters": _marketplace_publish_parameters(),
+        },
+        handler=_marketplace_publish_handler(marketplace_publisher),
+        is_async=True,
     )
     if store is not None and all(
         hasattr(store, name)

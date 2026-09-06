@@ -25,9 +25,12 @@ from typing import Any
 from .attachments import AttachmentStore
 from .generative_ui import GenerativeUIError, validate_rendered_envelope
 from .generated_media import resolve_generated_media
+from .host_runtime import InstalledHermesVersion
+from . import plugin_update
 from .link_contracts import (
     MAX_AGENT_ATTACHMENT_BYTES,
     MAX_ATTACHMENT_CHUNK_BYTES,
+    PLUGIN_VERSION,
     WORKSPACE_OPERATIONS,
     WorkspaceRequest,
     _workspace_json,
@@ -57,6 +60,16 @@ class WorkspaceConflictError(ValueError):
 
 class _HermesMethodUnavailable(WorkspaceControlError):
     """The installed Hermes runtime does not expose a requested native RPC."""
+
+
+class _ProfileCatalogUnavailable(WorkspaceControlError):
+    """Only the exact missing profile-list import at the existing boundary."""
+
+
+_PROFILE_CAPABILITY_MESSAGE = (
+    "This Hermes gateway cannot list agent profiles. "
+    "Update Hermes, restart the gateway, then reconnect Loopdy."
+)
 
 
 _REASONING_VALUES = frozenset(
@@ -164,10 +177,17 @@ class HermesWorkspaceBackend:
         ] = OrderedDict()
         self._skill_update_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._capability_update_lock = asyncio.Lock()
+        self._agent_catalog_compatibility = "unknown"
+        self._installed_hermes_version = InstalledHermesVersion()
 
     async def agents_list(self, payload: dict[str, Any]) -> dict[str, Any]:
         _empty_payload(payload)
-        records = await self._profile_records()
+        self._agent_catalog_compatibility = "unknown"
+        try:
+            records = await self._profile_records()
+        except _ProfileCatalogUnavailable:
+            self._agent_catalog_compatibility = "incompatible"
+            raise
         if not isinstance(records, list) or len(records) > 128:
             raise WorkspaceControlError("Hermes returned an invalid agent catalog")
         agents = []
@@ -193,7 +213,51 @@ class HermesWorkspaceBackend:
                 "hasAvatar": record.get("has_avatar") is True,
             }
             agents.append(agent)
+        self._agent_catalog_compatibility = "compatible"
         return {"agents": agents}
+
+    async def host_runtime_status(self, payload: dict[str, Any]) -> dict[str, Any]:
+        _empty_payload(payload)
+        installed_version = await self._installed_hermes_version.get()
+        identity = await asyncio.to_thread(plugin_update.runtime_identity)
+        installed = identity["installed_revision"]
+        active = identity["active_revision"]
+        restart = "unknown"
+        if installed and active:
+            restart = "not_required" if installed == active else "required"
+        compatibility = self._agent_catalog_compatibility
+        unavailable = compatibility == "incompatible"
+        return {
+            "schemaVersion": 1,
+            "runtimeId": identity["runtime_id"],
+            "observedAt": int(self.clock()),
+            "hermes": {
+                # A separately invoked CLI cannot identify the running gateway.
+                # Its local behindness text is not a fresh upstream check.
+                "runningVersion": None,
+                "cliVersion": installed_version,
+                "updateState": "unknown",
+                "updateCheckedAt": None,
+                "restartState": "unknown",
+            },
+            "plugin": {
+                "runningVersion": PLUGIN_VERSION,
+                "installedRevision": installed,
+                "activeRevision": active,
+                "restartState": restart,
+            },
+            "compatibility": {
+                "state": compatibility,
+                "checkedOperations": [] if compatibility == "unknown" else ["agents.list"],
+                "unavailableOperations": ["agents.list"] if unavailable else [],
+                "issues": [{
+                    "code": "hermes_capability_missing",
+                    "operation": "agents.list",
+                    "message": _PROFILE_CAPABILITY_MESSAGE,
+                    "suggestedAction": "update_hermes",
+                }] if unavailable else [],
+            },
+        }
 
     async def plugin_update_start(self, payload: dict[str, Any]) -> dict[str, Any]:
         values = _object(payload, "plugin update payload")
@@ -2161,9 +2225,20 @@ class HermesWorkspaceBackend:
 
     async def _profile_records(self) -> list[dict[str, Any]]:
         def load() -> list[dict[str, Any]]:
+            try:
+                from hermes_cli.profiles import list_profile_names
+            except ImportError as exc:
+                # Do not classify a missing module or a transitive import as
+                # an incompatible profile API. Never return the exception text.
+                if exc.name == "hermes_cli.profiles" and str(exc).startswith(
+                    "cannot import name 'list_profile_names' from 'hermes_cli.profiles'"
+                ):
+                    raise _ProfileCatalogUnavailable(
+                        _PROFILE_CAPABILITY_MESSAGE, code="hermes_capability_missing"
+                    ) from None
+                raise
             from hermes_cli.profiles import (
                 get_profile_dir,
-                list_profile_names,
                 profile_exists,
                 read_profile_meta,
             )
@@ -4004,6 +4079,7 @@ def _approval_projection(value: Any, *, now: int) -> dict[str, Any]:
 class WorkspaceController:
     _HANDLERS = {
         "agents.list": "agents_list",
+        "host_runtime.status": "host_runtime_status",
         "plugin_update.start": "plugin_update_start",
         "plugin_update.status": "plugin_update_status",
         "agents.create": "agents_create",

@@ -35,6 +35,7 @@ PLUGIN_VERSION = "2.8.0"
 WORKSPACE_OPERATIONS = frozenset(
     {
         "agents.list",
+        "host_runtime.status",
         "plugin_update.start",
         "plugin_update.status",
         "agents.create",
@@ -1571,7 +1572,10 @@ def workspace_capabilities() -> dict[str, Any]:
     return {
         "protocolVersion": 1,
         "pluginVersion": PLUGIN_VERSION,
-        "features": ["workspace-rejected-v1", "backpressure-v1", "plugin-update-v1"],
+        "features": [
+            "workspace-rejected-v1", "backpressure-v1", "plugin-update-v1",
+            "host-runtime-diagnostics-v1",
+        ],
         "operations": sorted(WORKSPACE_OPERATIONS),
     }
 

@@ -104,7 +104,9 @@ def register(
         ),
         parse_target_ref_fn=parse_target,
         validate_target_ref_fn=validate_target,
-        max_message_length=4096,
+        # Match the native assistant-text bound, leaving complete 64 KiB card
+        # envelopes intact. The adapter splits ordinary Inbox text more tightly.
+        max_message_length=100_000,
         emoji="L",
         pii_safe=True,
         allow_update_command=False,

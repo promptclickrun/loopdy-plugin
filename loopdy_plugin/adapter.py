@@ -290,6 +290,9 @@ class LoopdyAdapter(BasePlatformAdapter):
 
     supports_async_delivery = True
     interactive_resume = False
+    # Own message sizing: card envelopes must reach validation intact, while
+    # ordinary Inbox text is split below rather than cut by Hermes cron delivery.
+    splits_long_messages = True
 
     def __init__(
         self,
@@ -938,6 +941,17 @@ class LoopdyAdapter(BasePlatformAdapter):
                     error=f"Loopdy Link delivery failed ({type(exc).__name__})",
                 )
         event = _channel_event(content, metadata=metadata)
+        # A validated card is atomic even when its JSON exceeds the text limit.
+        if "generative_ui" not in event.detail and len(content) > 50_000:
+            result = SendResult(success=True)
+            for offset in range(0, len(content), 50_000):
+                result = await self.send(
+                    chat_id, content[offset:offset + 50_000],
+                    reply_to=reply_to, metadata=metadata,
+                )
+                if not result.success:
+                    return result
+            return result
         target = str(chat_id or self.home_target or "all").strip()
         if self.link_client is not None and target in {"all", "home"}:
             return await self._deliver_link_notification(event, target=target)

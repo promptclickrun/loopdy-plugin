@@ -16,16 +16,19 @@ class _Service:
         return {"configured": True}
 
 
-class _ContextProviderBroker:
+class _ContextProviderBroker(LinkActivityBroker):
     def __init__(self) -> None:
+        super().__init__()
         self.provider = None
         self.session_store = None
 
     def attach_context_provider(self, provider) -> None:
         self.provider = provider
+        super().attach_context_provider(provider)
 
     def attach_session_store(self, session_store) -> None:
         self.session_store = session_store
+        super().attach_session_store(session_store)
 
 
 async def _wait_until(predicate, *, timeout: float = 1.0) -> None:
@@ -107,20 +110,20 @@ class ContextWindowTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        agent.token_usage = SimpleNamespace(
-            input_tokens=120_000,
-            output_tokens=8_400,
-            cached_tokens=24_000,
-            total_tokens=128_400,
-        )
+        broker.bind_link_session(entry.session_id, "link-session-1")
+        broker.record_api_usage(session_id=entry.session_id, model=agent.model,
+                                api_request_id="request-1", usage={
+                                    "prompt_tokens":120_000, "output_tokens":8_400,
+                                    "cache_read_tokens":24_000,"total_tokens":128_400,
+                                })
         self.assertEqual(
             broker.provider(entry.session_id),
             {
                 "title": "Readable live title",
                 "model": "anthropic/claude-fable-5",
-                "contextUsed": 154_200,
+                "contextUsed": 120_000,
                 "contextMax": 272_000,
-                "contextPercent": 57,
+                "contextPercent": round(120_000 / 272_000 * 100),
                 "compressions": 2,
                 "isCompacting": False,
                 "inputTokens": 120_000,

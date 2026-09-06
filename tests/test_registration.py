@@ -125,6 +125,22 @@ class _ActivityBroker:
 
 
 class RegistrationTests(unittest.TestCase):
+    def test_registered_api_hook_projects_usage_without_notification(self):
+        from loopdy_plugin.registration import register
+        from loopdy_plugin.activity_bridge import LinkActivityBroker
+
+        context, service, broker = _Context(), _Service(), LinkActivityBroker()
+        register(context, service=service, activity_broker=broker)
+        broker.bind_link_session("hermes-usage", "link-usage")
+        context.hooks["post_api_request"](
+            session_id="hermes-usage", model="model-usage", api_request_id="request-usage",
+            usage={"prompt_tokens":100,"output_tokens":5,"cache_read_tokens":75,"total_tokens":105},
+        )
+        self.assertEqual(broker.usage_snapshot("hermes-usage", "model-usage")["cachedTokens"], 75)
+        self.assertEqual(service.events, [])
+        context.hooks["on_session_reset"](session_id="hermes-usage")
+        self.assertIsNone(broker.usage_snapshot("hermes-usage", "model-usage"))
+
     def test_loopdy_native_presentation_context_matches_static_card_contract(self) -> None:
         from loopdy_plugin.registration import register
 
@@ -804,6 +820,8 @@ class RegistrationTests(unittest.TestCase):
                 "post_tool_call",
                 "pre_llm_call",
                 "post_llm_call",
+                "post_api_request",
+                "on_session_reset",
                 "on_session_end",
                 "subagent_start",
                 "subagent_stop",

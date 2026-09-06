@@ -58,7 +58,14 @@ NOTIFICATION_HOOKS = (
     "kanban_task_completed",
     "kanban_task_blocked",
 )
-HOOKS = ("pre_llm_call", "post_llm_call", "post_tool_call", *NOTIFICATION_HOOKS)
+DIRECT_OBSERVER_HOOKS = ("post_api_request", "on_session_reset")
+HOOKS = (
+    "pre_llm_call",
+    "post_llm_call",
+    "post_tool_call",
+    *DIRECT_OBSERVER_HOOKS,
+    *NOTIFICATION_HOOKS,
+)
 logger = logging.getLogger("hermes.plugins.loopdy")
 
 
@@ -144,6 +151,12 @@ def register(
         "post_tool_call",
         partial(_post_tool_call, service=active_service, activity_broker=broker),
     )
+    record_api_usage = getattr(broker, "record_api_usage", None)
+    if callable(record_api_usage):
+        ctx.register_hook("post_api_request", record_api_usage)
+    reset_api_usage = getattr(broker, "reset_api_usage", None)
+    if callable(reset_api_usage):
+        ctx.register_hook("on_session_reset", reset_api_usage)
     for hook_name in NOTIFICATION_HOOKS:
         ctx.register_hook(
             hook_name,

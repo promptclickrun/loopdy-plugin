@@ -162,8 +162,12 @@ class GeneratedMediaTests(unittest.TestCase):
             self.resolve(rows)
 
     def test_file_policy_remains_authoritative(self):
-        rows = self.rows([("call_a", "image_generate", "MEDIA:/etc/passwd")])
-        self.assertEqual(self.resolve(rows)["attachments"], [])
+        # Use a real image outside the grant, never a host system file.
+        with tempfile.TemporaryDirectory() as outside:
+            image = Path(outside) / "outside.png"
+            image.write_bytes(b"\x89PNG\r\n\x1a\nfixture")
+            rows = self.rows([("call_a", "image_generate", f"MEDIA:{image}")])
+            self.assertEqual(self.resolve(rows)["attachments"], [])
 
     def test_oversized_video_is_explicit_and_not_returned(self):
         video = self.root / "large.mp4"

@@ -81,7 +81,9 @@ class WorkspaceFilesTests(unittest.TestCase):
             (root / "escape").symlink_to(Path(base))
             os.link(root / "safe.txt", root / "hard.txt")
             os.mkfifo(root / "pipe")
-            for path in ("../out", "/etc/passwd", "./safe.txt", "folder//safe", "C:\\safe", ".env", ".git/config", "secret.txt", "link.txt", "escape/file", "pipe", "hard.txt"):
+            outside = Path(base).resolve() / "out"
+            outside.write_text("Outside the workspace grant")
+            for path in ("../out", str(outside), "./safe.txt", "folder//safe", "C:\\safe", ".env", ".git/config", "secret.txt", "link.txt", "escape/file", "pipe", "hard.txt"):
                 with self.subTest(path=path), self.assertRaises(WorkspaceFilesError):
                     service.read_file("demo", path=path, offset=0, limit=65536)
             listing = service.list_directory("demo", path="", offset=0, limit=100, query="")

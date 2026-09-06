@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 import os
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -49,7 +50,9 @@ class WorkspaceFilesApiTests(unittest.TestCase):
                 data = client.post("/workspace-files/read", json={"workspace_id":"demo", "path":"unchanged.md", "offset":0, "limit":65536})
                 self.assertEqual(data.status_code, 200, data.text)
                 self.assertEqual(data.json()["text"], "# Hello\n")
-                for path in ("../outside", "/etc/passwd", ".git/config"):
+                outside = root.parent / "outside"
+                outside.write_text("Outside the workspace grant")
+                for path in ("../outside", str(outside), ".git/config"):
                     bad = client.post("/workspace-files/read", json={"workspace_id":"demo", "path":path})
                     self.assertGreaterEqual(bad.status_code, 400)
                     self.assertNotIn(str(root), bad.text)
@@ -100,7 +103,7 @@ print("stock mount, exact source, unauthorized denial, file read, disable gate v
             (home / "plugins/loopdy").symlink_to(ROOT, target_is_directory=True)
             (home / "config.yaml").write_text("plugins:\n  enabled: [loopdy]\n")
             env = {k:v for k,v in os.environ.items() if not any(word in k.upper() for word in ("TOKEN", "SECRET", "PASSWORD", "API_KEY"))}
-            env.update(HERMES_HOME=str(home), HERMES_DASHBOARD_SESSION_TOKEN="workspace-files-auth-fixture",
+            env.update(HERMES_HOME=str(home), HERMES_DASHBOARD_SESSION_TOKEN=secrets.token_urlsafe(32),
                        CANDIDATE_ROOT=str(ROOT), PYTHONDONTWRITEBYTECODE="1")
             result = subprocess.run([sys.executable, "-c", script], env=env, cwd=directory,
                                     capture_output=True, text=True, timeout=60)

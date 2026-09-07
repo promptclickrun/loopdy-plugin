@@ -513,6 +513,14 @@ Supported event types are:
 - `job.failed`
 - `channel.message`
 
+## Optional completed-turn timing
+
+A completed reasoning activity may include the existing optional `durationMs` field with the whole host turn's measured elapsed time. The plugin measures with a monotonic clock from the first accepted turn-start hook to completion. Duplicate terminal hooks do not extend the duration. Unknown or out-of-range measurements are omitted; a missing start is not reconstructed from later wall-clock time.
+
+The plugin retains completed measurements in its private state database and joins them to history only by an exact, unique canonical final-assistant timestamp for the same session. Eligible `sessions.history` messages may include optional `turn_duration_ms`, an integer from 0 through 86,400,000. Ambiguous joins, missing timing and storage-read failures omit this presentation field without hiding the transcript. No message-content matching or approximate timestamp join is permitted.
+
+Native history decoding accepts finite numeric timestamps, including fractional seconds, and tolerates absent or malformed duration fields. Completed-turn presentation prefers recorded duration, then matching live completion timing. Legacy fallback uses actual human/final-message timestamps only, never synthetic row IDs or the current rendering clock. Timing metadata must survive local persistence and transcript reconciliation; it does not change canonical message identities or copied content.
+
 ## Optional Wiki file creation
 
 Roots may advertise `supportsCreation: true` alongside the existing optional root metadata. Clients require this explicit flag on the current authorized root before creating a file; an omitted or false flag means upgrade/unsupported, not permission to attempt an older host operation. `writable` and the connection's read-only preference remain independent gates.

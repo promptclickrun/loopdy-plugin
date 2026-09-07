@@ -1227,12 +1227,13 @@ def finish_failed_turn_activity(
     turn_id = _turn_coordinate(payload.get("turn_id"))
     if not session_id or not turn_id:
         return
-    link_session_id = broker.resolved_session_id(session_id, turn_id)
-    if not link_session_id:
-        return
+    # Timing belongs to the turn, not the socket route cleared by detach().
     finish_timing: Any = getattr(broker, "finish_turn_timing", None)
     accepted, duration = finish_timing(session_id, turn_id, payload) if callable(finish_timing) else (True, None)
     if not accepted:
+        return
+    link_session_id = broker.resolved_session_id(session_id, turn_id)
+    if not link_session_id:
         return
     failed = bool(payload.get("failed") or payload.get("interrupted"))
     lifecycle = "failed" if failed else "succeeded"

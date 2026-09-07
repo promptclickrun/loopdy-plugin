@@ -106,3 +106,9 @@ and purges the per-account Durable Object. The app clears its local account file
 notification keys, credentials, and in-memory models only after remote deletion succeeds.
 
 Report vulnerabilities according to the repository's root `SECURITY.md`.
+
+## Wiki connection authority
+
+Explicit authenticated `wiki.connect` may create only a new read-only folder grant scoped to the verified initiating device, selected profile, current host pairing authority, pinned root inode/device, and fresh generation. It does not accept caller-selected authority, grant IDs or writable mode, overwrite host grants, or adopt registrations across authority boundaries. Unauthorized overlapping roots are rejected to prevent parent/child bypass. Host administration retains policy modification and revoke. `wiki.resolve` and directory suggestions remain non-mutating.
+
+Connection rejects traversal, symlink ancestors, system/credential/control directories, configured Hermes home and Wiki state (including enclosing folders). Hosts without the required descriptor-relative traversal omit Wiki capability advertisement and operations. Cold state initialization walks descriptors with no symlink following, creates missing directories privately, and never chmods foreign directories. Optional absolute root metadata is authorized encrypted account content; selected references disclose their real source path alongside the requested text, not in relay-readable metadata.

@@ -9,7 +9,12 @@ from cryptography.hazmat.primitives.asymmetric import ec
 
 from loopdy_plugin.link_client import LinkRuntimeConfig, LoopdyLinkClient
 from loopdy_plugin.link_contracts import WORKSPACE_OPERATIONS, parse_workspace_request, workspace_capabilities
-from tests.test_link_request_isolation import _Socket, _State
+# Support both unittest's top-level discovery and package-addressed runs.
+# Do not resolve the ambiguous global `tests` package from Hermes' checkout.
+if __package__:
+    from .test_link_request_isolation import _Socket, _State
+else:
+    from test_link_request_isolation import _Socket, _State
 
 
 class LinkRecoveryContractTests(unittest.IsolatedAsyncioTestCase):

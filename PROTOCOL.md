@@ -512,3 +512,9 @@ Supported event types are:
 - `job.completed`
 - `job.failed`
 - `channel.message`
+
+## Optional Wiki folder registration
+
+`wiki.connect` extends the finite negotiated Wiki operation set and requires both advertised operation support and `wiki.v1`. Hosts without secure descriptor-relative traversal omit the feature and every Wiki operation. Its exact payload is the selected `agentId` and canonical absolute `folderPath`; caller device, authority, grant ID, and write-policy fields are rejected. The trusted workspace boundary supplies verified device/pairing ownership. It registers a safe existing directory read-only, or returns the unchanged exact authorized registration. Ambiguous or unauthorized overlapping registrations fail closed. It does not alias or change `wiki.resolve`, which remains lookup-only. New clients must not fall back to another registration mechanism when this operation is absent.
+
+Root DTOs include optional `folderPath` metadata alongside the existing ID, name, source kind, writable policy and generation. Older clients ignore the added field; newer clients tolerate its absence on preexisting records and responses. The path is disclosed only with authorized root metadata and can accompany an explicitly selected reference snapshot. State failures, denied folders, unsupported operation, and stale ownership have separate bounded error meanings.

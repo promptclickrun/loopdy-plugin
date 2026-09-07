@@ -26,6 +26,7 @@ from loopdy_plugin.wiki_service import WikiServiceError
 from loopdy_plugin.wiki_contract import available_wiki_operations
 from loopdy_plugin.wiki_transport import WikiTransport, WikiRequestContext, authority_id, production_factory
 from loopdy_plugin.workspace_control import WorkspaceController
+from loopdy_plugin.workspace_files import WorkspaceFilesError
 from test_adapter import _Service
 import test_link_client as link_fixtures
 from test_link_client import _State
@@ -132,6 +133,24 @@ class WikiIntegrationTests(unittest.TestCase):
                  baseRevision=read["revision"], operationId="hosted-read-only", totalBytes=0,
                  sha256=hashlib.sha256(b"").hexdigest())
         self.assertEqual(denied.exception.code, "READ_ONLY")
+
+    def test_credential_named_host_home_remains_ungrantable(self):
+        user_home = self.base / "user-home"
+        user_home.mkdir()
+        home = user_home / ".hermes"
+        notes = home / "notes"
+        notes.mkdir(parents=True)
+        transport = production_factory(host_home=home, config_getter=lambda: self.config)
+        service = transport.host_service()
+        with patch.object(Path, "home", return_value=user_home):
+            with self.assertRaises(WorkspaceFilesError) as denied:
+                service.grant("hosted-wiki", root=notes, label="Hosted Wiki", profile_id="default",
+                              device_ids=(self.context.device_id,), writable=False)
+            self.assertEqual(denied.exception.code, "INVALID_GRANT")
+            with self.assertRaises(WikiServiceError) as denied:
+                transport.execute("wiki.connect", {"agentId": "default", "folderPath": str(notes)}, context=self.context)
+            self.assertEqual(denied.exception.code, "WIKI_NOT_ALLOWED")
+        self.assertEqual(service.list_grants(), {"grants": []})
 
     def test_protected_host_grant_cannot_expand_access(self):
         home = self.base / "host-home"

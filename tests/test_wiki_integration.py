@@ -26,6 +26,7 @@ from loopdy_plugin.wiki_service import WikiServiceError
 from loopdy_plugin.wiki_contract import available_wiki_operations
 from loopdy_plugin.wiki_transport import WikiTransport, WikiRequestContext, authority_id, production_factory
 from loopdy_plugin.workspace_control import WorkspaceController
+from loopdy_plugin.workspace_files import WorkspaceFilesError
 from test_adapter import _Service
 import test_link_client as link_fixtures
 from test_link_client import _State
@@ -108,6 +109,111 @@ class WikiIntegrationTests(unittest.TestCase):
                  query="", revision=listing["revision"])
         self.assertEqual(changed.exception.code, "REVISION_STALE")
         self.assertEqual((home / "plugin-data").stat().st_mode & 0o777, 0o700)
+
+    def test_connect_reuses_host_grant_inside_protected_home(self):
+        home = self.base / "host-home"
+        notes = home / "Alfie Brain Wiki"
+        notes.mkdir(parents=True)
+        (notes / "index.md").write_text("# Hosted wiki\n")
+        transport = production_factory(host_home=home, config_getter=lambda: self.config)
+        service = transport.host_service()
+        granted = service.grant("hosted-wiki", root=notes, label="Hosted Wiki", profile_id="default",
+                                device_ids=(self.context.device_id,), writable=False)
+        before = service.list_grants()
+        def call(op, **fields):
+            return transport.execute(op, {"agentId": "default", **fields}, context=self.context)
+        connected = call("wiki.connect", folderPath=str(notes))
+        self.assertEqual(connected, granted)
+        self.assertEqual(call("wiki.resolve", folderPath=str(notes)), granted)
+        self.assertEqual(service.list_grants(), before)
+        read = call("wiki.read", wikiId=granted["wikiId"], path="index.md", offset=0, limit=65536)
+        self.assertEqual(read["text"], "# Hosted wiki\n")
+        with self.assertRaises(WikiServiceError) as denied:
+            call("wiki.save.begin", wikiId=granted["wikiId"], path="index.md",
+                 baseRevision=read["revision"], operationId="hosted-read-only", totalBytes=0,
+                 sha256=hashlib.sha256(b"").hexdigest())
+        self.assertEqual(denied.exception.code, "READ_ONLY")
+
+    def test_credential_named_host_home_remains_ungrantable(self):
+        user_home = self.base / "user-home"
+        user_home.mkdir()
+        home = user_home / ".hermes"
+        notes = home / "notes"
+        notes.mkdir(parents=True)
+        transport = production_factory(host_home=home, config_getter=lambda: self.config)
+        service = transport.host_service()
+        with patch.object(Path, "home", return_value=user_home):
+            with self.assertRaises(WorkspaceFilesError) as denied:
+                service.grant("hosted-wiki", root=notes, label="Hosted Wiki", profile_id="default",
+                              device_ids=(self.context.device_id,), writable=False)
+            self.assertEqual(denied.exception.code, "INVALID_GRANT")
+            with self.assertRaises(WikiServiceError) as denied:
+                transport.execute("wiki.connect", {"agentId": "default", "folderPath": str(notes)}, context=self.context)
+            self.assertEqual(denied.exception.code, "WIKI_NOT_ALLOWED")
+        self.assertEqual(service.list_grants(), {"grants": []})
+
+    def test_protected_host_grant_cannot_expand_access(self):
+        home = self.base / "host-home"
+        notes = home / "notes"
+        (notes / "child").mkdir(parents=True)
+        sibling = home / "unapproved"
+        sibling.mkdir()
+        linked = home / "linked"
+        linked.symlink_to(notes, target_is_directory=True)
+        transport = production_factory(host_home=home, config_getter=lambda: self.config)
+        service = transport.host_service()
+        service.grant("hosted-wiki", root=notes, label="Hosted Wiki", profile_id="default",
+                      device_ids=(self.context.device_id,), writable=False)
+        before = service.list_grants()
+        for folder, profile, context in (
+            (notes, "other", self.context),
+            (notes, "default", replace(self.context, device_id="another-device")),
+            (notes / "child", "default", self.context),
+            (sibling, "default", self.context),
+            (home, "default", self.context),
+            (service._state_dir, "default", self.context),
+            (linked, "default", self.context),
+        ):
+            with self.subTest(folder=folder, profile=profile, device=context.device_id):
+                with self.assertRaises(WikiServiceError) as denied:
+                    transport.execute("wiki.connect", {"agentId": profile, "folderPath": str(folder)}, context=context)
+                self.assertEqual(denied.exception.code, "WIKI_NOT_ALLOWED")
+        self.assertEqual(service.list_grants(), before)
+        service.revoke("hosted-wiki")
+        with self.assertRaises(WikiServiceError) as denied:
+            transport.execute("wiki.connect", {"agentId": "default", "folderPath": str(notes)}, context=self.context)
+        self.assertEqual(denied.exception.code, "WIKI_NOT_ALLOWED")
+        self.assertEqual(service.list_grants(), {"grants": []})
+
+    def test_protected_host_grant_checks_ambiguity_overlap_and_root_identity(self):
+        home = self.base / "host-home"
+        notes = home / "notes"
+        child = notes / "child"
+        child.mkdir(parents=True)
+        transport = production_factory(host_home=home, config_getter=lambda: self.config)
+        service = transport.host_service()
+        service.grant("hosted-wiki", root=notes, label="Hosted Wiki", profile_id="default",
+                      device_ids=(self.context.device_id,), writable=False)
+        service.grant("duplicate", root=notes, label="Duplicate", profile_id="default",
+                      device_ids=(self.context.device_id,), writable=False)
+        with self.assertRaises(WikiServiceError) as ambiguous:
+            transport.execute("wiki.connect", {"agentId": "default", "folderPath": str(notes)}, context=self.context)
+        self.assertEqual(ambiguous.exception.code, "WIKI_AMBIGUOUS")
+        service.revoke("duplicate")
+        service.grant("foreign-child", root=child, label="Foreign child", profile_id="other",
+                      device_ids=(self.context.device_id,), writable=False)
+        with self.assertRaises(WikiServiceError) as overlap:
+            transport.execute("wiki.connect", {"agentId": "default", "folderPath": str(notes)}, context=self.context)
+        self.assertEqual(overlap.exception.code, "WIKI_NOT_ALLOWED")
+        service.revoke("foreign-child")
+        before = service.list_grants()
+        notes.rename(home / "moved-notes")
+        notes.mkdir()
+        for folder in (notes, home / "moved-notes"):
+            with self.subTest(folder=folder), self.assertRaises(WikiServiceError) as stale:
+                transport.execute("wiki.connect", {"agentId": "default", "folderPath": str(folder)}, context=self.context)
+            self.assertEqual(stale.exception.code, "WIKI_NOT_ALLOWED")
+        self.assertEqual(service.list_grants(), before)
 
     def test_connect_cannot_adopt_or_overwrite_existing_authority(self):
         before = self.execute("wiki.roots")
@@ -204,7 +310,15 @@ class WikiIntegrationTests(unittest.TestCase):
                     operation="wiki.connect", payload={"agentId": "default", "folderPath": str(self.root), **fields}, sentAt=1))
 
     def test_distinct_device_authorization_epochs_work_through_encrypted_adapter(self):
-        async def scenario():
+        async def scenario(reuse_host_grant):
+            home = self.base / ("encrypted-host" if reuse_host_grant else "fresh-host")
+            home.mkdir()
+            transport = production_factory(host_home=home, config_getter=lambda: self.config)
+            connected = (home if reuse_host_grant else self.base) / "encrypted-notes"
+            connected.mkdir()
+            if reuse_host_grant:
+                transport.host_service().grant("hosted-wiki", root=connected, label="Hosted Wiki",
+                    profile_id="default", device_ids=(self.context.device_id,), writable=False)
             client = LoopdyLinkClient(self.config, state=_State())
             sent = []
             class Socket:
@@ -219,10 +333,8 @@ class WikiIntegrationTests(unittest.TestCase):
             client._socket = Socket()
             client._connected.set()
             adapter = LoopdyAdapter(PlatformConfig(enabled=True), service=_Service(), link_client=client,
-                wiki_transport=self.transport,
-                workspace_controller=WorkspaceController(backend=SimpleNamespace(), wiki_transport=self.transport))
-            connected = self.base / "encrypted-notes"
-            connected.mkdir()
+                wiki_transport=transport,
+                workspace_controller=WorkspaceController(backend=SimpleNamespace(), wiki_transport=transport))
             request = {'version': 1, 'type': 'workspace.request', 'requestId': 'wiki-encrypted-connect-0001',
                        'operation': 'wiki.connect', 'payload': {'agentId': 'default', 'folderPath': str(connected)}, 'sentAt': 1,
                        'targetHostId': self.config.device_id}
@@ -236,10 +348,14 @@ class WikiIntegrationTests(unittest.TestCase):
             self.assertEqual(len(results), 1)
             self.assertEqual(results[0]['status'], 'completed', results[0])
             self.assertFalse(results[0]['payload']['writable'])
-            self.assertEqual(results[0]['payload'], self.execute('wiki.resolve', folderPath=str(connected)))
+            resolved = transport.execute('wiki.resolve', {'agentId': 'default', 'folderPath': str(connected)},
+                                         context=self.context)
+            self.assertEqual(results[0]['payload'], resolved)
             self.assertNotIn('capabilities', results[0])
             self.assertEqual(results[0]["payload"]["folderPath"], str(connected))
-        asyncio.run(scenario())
+        for reuse_host_grant in (False, True):
+            with self.subTest(reuse_host_grant=reuse_host_grant):
+                asyncio.run(scenario(reuse_host_grant))
 
     def test_exact_large_upload_replay_empty_save_and_serialization(self):
         content = b'\xef\xbb\xbf# Updated\r\n' + ('e\u0301 / \U0001f431\r\n' * 10000).encode('utf-8')

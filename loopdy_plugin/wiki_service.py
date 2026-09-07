@@ -526,9 +526,10 @@ class WikiService:
                 home = Path.home().resolve()
                 if _lexically_contains(candidate, home) or lineage[-1] in _directory_lineage(home):
                     raise WikiServiceError("WIKI_NOT_ALLOWED", "Home directories cannot be connected")
-                if any(_overlaps_root(candidate, lineage, root)
-                       for root in (*self._protected_roots, self._state_dir)):
+                if _overlaps_root(candidate, lineage, self._state_dir):
                     raise WikiServiceError("WIKI_NOT_ALLOWED", "Host control folders cannot be connected")
+                protected = any(_overlaps_root(candidate, lineage, root)
+                                for root in self._protected_roots)
                 system_trees = ("/etc", "/proc", "/dev", "/sys", "/run", "/boot", "/bin", "/sbin",
                                 "/usr", "/lib", "/lib64", "/System", "/Library", "/private/etc", "/private/var")
                 if any(_overlaps_root(candidate, lineage, Path(root)) for root in system_trees):
@@ -558,6 +559,10 @@ class WikiService:
             if exact:
                 self._revalidate(connection, exact[0])
                 return self._root_dto(exact[0])
+            # Host-local approval may authorize a specific Wiki within Hermes
+            # home. Reuse that grant above; never create a new one there.
+            if protected:
+                raise WikiServiceError("WIKI_NOT_ALLOWED", "This folder cannot be connected")
             if connection.execute("SELECT COUNT(*) FROM wiki_grants").fetchone()[0] >= _MAX_GRANTS:
                 raise WikiServiceError("QUOTA_EXCEEDED", "Wiki grant limit reached")
             wiki_id = "wiki-" + uuid.uuid4().hex

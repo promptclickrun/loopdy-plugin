@@ -1,0 +1,20 @@
+name: Companion discovery
+on:
+  pull_request:
+    paths:
+      - scripts/companion_discovery.py
+      - tests/test_companion_discovery.py
+      - .github/workflows/companion-discovery.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  discovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m unittest tests.test_companion_discovery -v

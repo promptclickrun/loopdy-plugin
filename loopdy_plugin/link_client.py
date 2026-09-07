@@ -36,6 +36,7 @@ from .link_contracts import (
     UserMessage,
     VoiceSpeakRequest,
     WorkspaceRequest,
+    AVAILABLE_WIKI_OPERATIONS,
     parse_attachment_chunk,
     parse_backpressure,
     parse_encrypted_frame,
@@ -347,6 +348,9 @@ class InboundLinkGenerativeUIFormSubmission:
 class InboundLinkWorkspaceRequest:
     request: WorkspaceRequest
     sender_device_id: str
+    target_host_id: str | None = None
+    authority_id: str | None = None
+    sender_epoch: int | None = None
 
 
 def canonical_device_request(
@@ -556,7 +560,8 @@ class LoopdyLinkClient:
         )
 
     async def send_payload(
-        self, payload: dict[str, Any], *, preserve_pending_on_failure: bool = False
+        self, payload: dict[str, Any], *, preserve_pending_on_failure: bool = False,
+        owner_check: Callable[[], None] | None = None,
     ) -> str:
         if self._authentication_failed:
             raise ConnectionError("Loopdy Link authorization requires re-pairing")
@@ -564,6 +569,8 @@ class LoopdyLinkClient:
             await asyncio.wait_for(self._connected.wait(), timeout=20.0)
             async with self._transport_lock:
                 await self._wait_for_prior_pending()
+                if owner_check is not None:
+                    owner_check()
                 sequence = int(self._transport_get("outbound_sequence", 0) or 0) + 1
                 frame = EncryptedFrame(
                     frame_id="frame_" + encode_base64url(os.urandom(18)),
@@ -884,9 +891,16 @@ class LoopdyLinkClient:
                     response=workspace_rejection(payload, sent_at=int(time.time())),
                 )
                 return False
+            from .wiki_transport import authority_id
             inbound = InboundLinkWorkspaceRequest(
                 request=request,
                 sender_device_id=frame.sender_device_id,
+                target_host_id=target_host_id,
+                authority_id=(
+                    authority_id(self.config)
+                    if request.operation in AVAILABLE_WIKI_OPERATIONS else None
+                ),
+                sender_epoch=frame.sender_epoch,
             )
         else:
             # Authenticated unfamiliar application payloads (including newer

@@ -197,6 +197,15 @@ class WorkspaceControllerTests(unittest.TestCase):
                 payload={"sequence": index},
                 sent_at=1_788_000_000 + index,
             )
+            if operation.startswith("wiki."):
+                # Wiki has a separate authenticated transport, never a generic
+                # backend fallback when optional host support is unavailable.
+                before = list(backend.calls)
+                with self.assertRaises(WorkspaceControlError) as denied:
+                    asyncio.run(controller.execute(request))
+                self.assertEqual(denied.exception.code, "WIKI_UNAVAILABLE")
+                self.assertEqual(backend.calls, before)
+                continue
             result = asyncio.run(controller.execute(request))
             expected_handler = operation.replace(".", "_")
             self.assertEqual(result["handler"], expected_handler)

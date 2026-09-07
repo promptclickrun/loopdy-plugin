@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 SKILL_ROOT = Path(__file__).resolve().parents[1] / "skills" / "generative-ui"
-REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
 class LoopdyCardSkillTests(unittest.TestCase):
@@ -65,9 +65,7 @@ class LoopdyCardSkillTests(unittest.TestCase):
             REPOSITORY_ROOT / "README.md",
             REPOSITORY_ROOT / "docs" / "LOOPDY_CARDS.md",
             REPOSITORY_ROOT / "docs" / "SECURITY_AND_PRIVACY.md",
-            REPOSITORY_ROOT / "docs" / "ARCHITECTURE.md",
-            REPOSITORY_ROOT / "plugins" / "loopdy" / "README.md",
-            REPOSITORY_ROOT / "plugins" / "loopdy" / "PROTOCOL.md",
+            REPOSITORY_ROOT / "PROTOCOL.md",
         )
         prohibited = (
             "Opening a live card",

@@ -130,6 +130,10 @@ class WorkspaceGitTests(unittest.TestCase):
         root = Path(directory) / "repo"
         root.mkdir()
         git(root, "init", "-b", "main")
+        # Production intentionally ignores global Git config and author env.
+        # Give each disposable repository its own synthetic commit identity.
+        git(root, "config", "user.name", "Loopdy Fixture")
+        git(root, "config", "user.email", "fixture@example.test")
         (root / "tracked.txt").write_text("one\n", encoding="utf-8")
         git(root, "add", "--", "tracked.txt")
         git(root, "commit", "-m", "initial")
@@ -908,7 +912,7 @@ class WorkspaceGitTests(unittest.TestCase):
                     self.prepare(service, operation, input_, status["status_token"])
 
             bare = Path(directory) / "remote.git"
-            git(Path(directory), "init", "--bare", str(bare))
+            git(Path(directory), "init", "--bare", "-b", "main", str(bare))
             git(root, "remote", "add", "origin", str(bare))
             git(root, "push", "-u", "origin", "main")
             (root / "tracked.txt").write_text("dirty but preserved\n", encoding="utf-8")
@@ -933,7 +937,7 @@ class WorkspaceGitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root, service = self.make_repo(directory, visibility="private")
             bare = Path(directory) / "remote.git"
-            git(Path(directory), "init", "--bare", str(bare))
+            git(Path(directory), "init", "--bare", "-b", "main", str(bare))
             git(root, "remote", "add", "origin", str(bare))
             git(root, "push", "-u", "origin", "main")
             peer = Path(directory) / "peer"
@@ -988,7 +992,7 @@ class WorkspaceGitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root, service = self.make_repo(directory, visibility="private")
             bare = Path(directory) / "remote.git"
-            git(Path(directory), "init", "--bare", str(bare))
+            git(Path(directory), "init", "--bare", "-b", "main", str(bare))
             git(root, "remote", "add", "origin", str(bare))
             git(root, "push", "-u", "origin", "main")
             (root / "pushed.txt").write_text("service push\n", encoding="utf-8")
@@ -1060,7 +1064,7 @@ class WorkspaceGitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root, service = self.make_repo(directory, visibility="private")
             bare = Path(directory) / "remote.git"
-            git(Path(directory), "init", "--bare", str(bare))
+            git(Path(directory), "init", "--bare", "-b", "main", str(bare))
             git(root, "remote", "add", "origin", str(bare))
             git(root, "push", "-u", "origin", "main")
             (root / "pushed.txt").write_text("service push\n", encoding="utf-8")
@@ -1110,7 +1114,7 @@ class WorkspaceGitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root, service = self.make_repo(directory, visibility="private")
             bare = Path(directory) / "remote.git"
-            git(Path(directory), "init", "--bare", str(bare))
+            git(Path(directory), "init", "--bare", "-b", "main", str(bare))
             git(root, "remote", "add", "origin", str(bare))
             git(root, "push", "-u", "origin", "main")
             (root / "pushed.txt").write_text("service push\n", encoding="utf-8")
@@ -1153,7 +1157,7 @@ class WorkspaceGitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root, service = self.make_repo(directory, visibility="private")
             bare = Path(directory) / "remote.git"
-            git(Path(directory), "init", "--bare", str(bare))
+            git(Path(directory), "init", "--bare", "-b", "main", str(bare))
             git(root, "remote", "add", "origin", str(bare))
             git(root, "push", "-u", "origin", "main")
             marker = Path(directory) / "upload-pack-fired"
@@ -1187,7 +1191,7 @@ class WorkspaceGitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root, service = self.make_repo(directory, visibility="private")
             bare = Path(directory) / "remote.git"
-            git(Path(directory), "init", "--bare", str(bare))
+            git(Path(directory), "init", "--bare", "-b", "main", str(bare))
             git(root, "remote", "add", "origin", str(bare))
             git(root, "push", "-u", "origin", "main")
             peer = Path(directory) / "peer"

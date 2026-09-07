@@ -13,6 +13,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from .events import EVENT_TYPES
+from .wiki_contract import (
+    WIKI_OPERATIONS,
+    available_wiki_operations,
+    bounded_result as bound_wiki_result,
+    validate_payload as validate_wiki_payload,
+)
 from .generative_ui import canonical_json, validate_rendered_envelope
 
 
@@ -32,8 +38,10 @@ MAX_AGENT_ATTACHMENT_CHUNKS = (
 MAX_AVATAR_WORKSPACE_PLAINTEXT_BYTES = 2_800_000
 MAX_ENCRYPTED_FRAME_CHARACTERS = 4_000_000
 PLUGIN_VERSION = "2.8.0"
+AVAILABLE_WIKI_OPERATIONS = available_wiki_operations()
 WORKSPACE_OPERATIONS = frozenset(
     {
+        *AVAILABLE_WIKI_OPERATIONS,
         "agents.list",
         "host_runtime.status",
         "plugin_update.start",
@@ -398,7 +406,11 @@ def parse_workspace_request(value: dict[str, Any]) -> WorkspaceRequest:
     operation = value.get("operation")
     if not isinstance(operation, str) or operation not in WORKSPACE_OPERATIONS:
         raise ValueError("Loopdy Link workspace operation is invalid")
-    if operation.startswith("projects.git."):
+    if operation in AVAILABLE_WIKI_OPERATIONS:
+        if type(value.get("version")) is not int:
+            raise ValueError("Wiki request is invalid")
+        payload = validate_wiki_payload(operation, value.get("payload"))
+    elif operation.startswith("projects.git."):
         payload = _project_git_workspace_payload(operation, value.get("payload"))
     elif operation in {"agents.create", "agents.update", "agents.avatar.set"}:
         payload = _workspace_json_allowing_avatar_blobs(value.get("payload"))
@@ -1569,14 +1581,18 @@ def generative_ui_form_result(
 
 
 def workspace_capabilities() -> dict[str, Any]:
+    wiki_operations = available_wiki_operations()
+    features = [
+        "workspace-rejected-v1", "backpressure-v1", "plugin-update-v1",
+        "host-runtime-diagnostics-v1",
+    ]
+    if wiki_operations:
+        features.append("wiki.v1")
     return {
         "protocolVersion": 1,
         "pluginVersion": PLUGIN_VERSION,
-        "features": [
-            "workspace-rejected-v1", "backpressure-v1", "plugin-update-v1",
-            "host-runtime-diagnostics-v1",
-        ],
-        "operations": sorted(WORKSPACE_OPERATIONS),
+        "features": features,
+        "operations": sorted(WORKSPACE_OPERATIONS - WIKI_OPERATIONS | wiki_operations),
     }
 
 
@@ -1642,6 +1658,8 @@ def workspace_result(
 ) -> dict[str, Any]:
     if status not in {"completed", "failed", "conflict"}:
         raise ValueError("Loopdy Link workspace result status is invalid")
+    if request.operation in AVAILABLE_WIKI_OPERATIONS:
+        payload = bound_wiki_result(payload)
     projected = (
         _workspace_json_allowing_dashboard_cards(payload)
         if request.operation == "dashboard.load" and status == "completed"
@@ -2296,6 +2314,7 @@ __all__ = [
     "UserMessage",
     "VoiceSpeakRequest",
     "WorkspaceRequest",
+    "AVAILABLE_WIKI_OPERATIONS",
     "WORKSPACE_OPERATIONS",
     "activity_event",
     "assistant_message",

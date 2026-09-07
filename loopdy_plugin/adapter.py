@@ -305,6 +305,7 @@ class LoopdyAdapter(BasePlatformAdapter):
         personality_manager: PersonalityCatalogManager | Any | None = None,
         workspace_controller: Any | None = None,
         plugin_update_manager: PluginUpdateManager | None = None,
+        wiki_transport: Any | None = None,
         voice_synthesizer: Callable[[VoiceSpeakRequest], SynthesizedVoiceAudio] = synthesize_voice_audio,
     ):
         # Restart and shutdown pings are operator lifecycle signals, not user
@@ -314,11 +315,17 @@ class LoopdyAdapter(BasePlatformAdapter):
         self.service = service or get_service()
         self.home_target = str((config.extra or {}).get("home_target") or "all").strip()
         self.link_client = link_client
+        self._wiki_uses_runtime_config = link_client is None
+        from .wiki_transport import production_factory
+        self.wiki_transport = wiki_transport or production_factory(
+            host_home=get_hermes_home(), config_getter=self._wiki_current_config,
+        )
         self.activity_broker = activity_broker
         self.personality_manager = personality_manager or PersonalityCatalogManager(
             config_path=get_hermes_home() / "config.yaml"
         )
         self.workspace_controller = workspace_controller or WorkspaceController(
+            wiki_transport=self.wiki_transport,
             backend=HermesWorkspaceBackend(
                 service=self.service,
                 session_workspace_setter=self._set_link_session_workspace,
@@ -404,6 +411,21 @@ class LoopdyAdapter(BasePlatformAdapter):
                     store=self.service.store,
                     release_client=marketplace_client,
                 )
+
+    def _wiki_current_config(self):
+        from .wiki_transport import authority_id
+        client = self.link_client
+        if client is None or getattr(client, "_authentication_failed", False):
+            return None
+        stopping = getattr(client, "_stopping", None)
+        if stopping is not None and stopping.is_set():
+            return None
+        config = client.config
+        if self._wiki_uses_runtime_config:
+            current = load_runtime_config()
+            if current is None or authority_id(current) != authority_id(config):
+                return None
+        return config
 
     @property
     def authorization_is_upstream(self) -> bool:
@@ -740,7 +762,8 @@ class LoopdyAdapter(BasePlatformAdapter):
         elif state in {"disconnected", "reconnecting"}:
             self._mark_disconnected()
 
-    async def _send_link_payload(self, payload: dict[str, Any]) -> str:
+    async def _send_link_payload(self, payload: dict[str, Any], *,
+                                 owner_check: Callable[[], None] | None = None) -> str:
         """Send control traffic after a verified reconnect, with one retry."""
         client = self.link_client
         if client is None:
@@ -757,8 +780,13 @@ class LoopdyAdapter(BasePlatformAdapter):
                 last_error = ConnectionError("Loopdy Link is not connected")
                 continue
             try:
+                if owner_check is not None:
+                    owner_check()
+                    return await client.send_payload(payload, owner_check=owner_check)
                 return await client.send_payload(payload)
             except Exception as exc:
+                if owner_check is not None:
+                    owner_check()
                 pending_frame = getattr(client, "pending_payload_frame_id", None)
                 if callable(pending_frame):
                     frame_id = pending_frame(payload)
@@ -2022,7 +2050,17 @@ class LoopdyAdapter(BasePlatformAdapter):
             try:
                 if self.workspace_controller is None:
                     raise RuntimeError("Workspace controls are unavailable")
-                result_payload = await self.workspace_controller.execute(request)
+                if request.operation.startswith("wiki."):
+                    from .wiki_transport import WikiRequestContext
+                    wiki_context = WikiRequestContext(
+                        target_host_id=payload.target_host_id,
+                        device_id=payload.sender_device_id,
+                        authority_id=payload.authority_id,
+                        sender_epoch=payload.sender_epoch,
+                    )
+                    result_payload = await self.workspace_controller.execute(request, wiki_context=wiki_context)
+                else:
+                    result_payload = await self.workspace_controller.execute(request)
                 result = workspace_result(
                     request=payload.request,
                     status="completed",
@@ -2065,7 +2103,17 @@ class LoopdyAdapter(BasePlatformAdapter):
                     if context is not None:
                         result["context"] = context
             if self.link_client is not None:
-                await self._send_link_payload(result)
+                if request.operation.startswith("wiki."):
+                    from .wiki_service import WikiServiceError
+                    from .wiki_transport import authority_id
+                    response_client = self.link_client
+                    def check_response_owner():
+                        if (self.link_client is not response_client
+                                or authority_id(self._wiki_current_config()) != payload.authority_id):
+                            raise WikiServiceError("WIKI_OWNER_CHANGED", "Wiki response owner changed")
+                    await self._send_link_payload(result, owner_check=check_response_owner)
+                else:
+                    await self._send_link_payload(result)
                 manager = getattr(getattr(self.workspace_controller, "backend", None), "plugin_update_manager", None)
                 if (manager is not None and result["status"] == "completed"
                         and request.operation != "host_runtime.status"):

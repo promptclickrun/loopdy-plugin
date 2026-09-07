@@ -455,6 +455,8 @@ def _queue_live_activity_update(service: Any, **update: Any) -> None:
 
 def setup_cli(parser: Any) -> None:
     actions = parser.add_subparsers(dest="loopdy_action", required=True)
+    from .wiki_cli import setup_wiki_cli
+    setup_wiki_cli(actions)
 
     actions.add_parser("status", help="Show provider health and registered devices")
 
@@ -579,6 +581,13 @@ def handle_cli(
     plugin_update_manager: PluginUpdateManager | None = None,
 ) -> None:
     action = str(getattr(args, "loopdy_action", "") or "")
+    if action == "wiki":
+        from .wiki_cli import handle_wiki_cli
+        from .wiki_transport import production_factory
+        handle_wiki_cli(args, transport=production_factory(
+            host_home=get_hermes_home(), config_getter=load_runtime_config,
+        ))
+        return
     if action == "files":
         _handle_files_cli(args)
         return

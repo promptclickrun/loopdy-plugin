@@ -31,12 +31,15 @@ from .link_contracts import (
     MAX_AGENT_ATTACHMENT_BYTES,
     MAX_ATTACHMENT_CHUNK_BYTES,
     PLUGIN_VERSION,
+    AVAILABLE_WIKI_OPERATIONS,
     WORKSPACE_OPERATIONS,
     WorkspaceRequest,
     _workspace_json,
 )
 from .workspace_git import WorkspaceGitError, WorkspaceGitService
 from . import workspace_capabilities
+from .wiki_service import WikiServiceError
+from .wiki_transport import WikiRequestContext, WikiTransport
 
 
 class WorkspaceControlError(RuntimeError):
@@ -4078,6 +4081,7 @@ def _approval_projection(value: Any, *, now: int) -> dict[str, Any]:
 
 class WorkspaceController:
     _HANDLERS = {
+        **{operation: "wiki" for operation in AVAILABLE_WIKI_OPERATIONS},
         "agents.list": "agents_list",
         "host_runtime.status": "host_runtime_status",
         "plugin_update.start": "plugin_update_start",
@@ -4132,14 +4136,29 @@ class WorkspaceController:
         "clarifications.respond": "clarifications_respond",
     }
 
-    def __init__(self, *, backend: Any):
+    def __init__(self, *, backend: Any, wiki_transport: WikiTransport | None = None):
         self.backend = backend
+        self.wiki_transport = wiki_transport
 
     @property
     def operations(self) -> frozenset[str]:
         return frozenset(self._HANDLERS)
 
-    async def execute(self, request: WorkspaceRequest) -> dict[str, Any]:
+    async def execute(self, request: WorkspaceRequest, *,
+                      wiki_context: WikiRequestContext | None = None) -> dict[str, Any]:
+        if request.operation in AVAILABLE_WIKI_OPERATIONS:
+            if self.wiki_transport is None:
+                raise WorkspaceControlError("Wiki is unavailable on this host", code="WIKI_UNAVAILABLE")
+            try:
+                result = await asyncio.to_thread(
+                    self.wiki_transport.execute, request.operation, dict(request.payload), context=wiki_context,
+                )
+                self.wiki_transport.check_context(wiki_context)
+                return result
+            except WikiServiceError as error:
+                raise WorkspaceControlError(error.message, code=error.code) from None
+            except Exception:
+                raise WorkspaceControlError("Wiki request could not be completed", code="WIKI_UNAVAILABLE") from None
         handler_name = self._HANDLERS.get(request.operation)
         if handler_name is None or request.operation not in WORKSPACE_OPERATIONS:
             raise WorkspaceControlError("Unsupported Loopdy workspace operation")

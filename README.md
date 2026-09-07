@@ -396,12 +396,18 @@ See [PROTOCOL.md](PROTOCOL.md) for request contracts and [SECURITY.md](SECURITY.
 
 ## Development
 
-Run the deterministic offline suite with the Python environment bundled with Hermes:
+From this repository's root, run the deterministic offline suite with the Python environment bundled with Hermes:
 
 ```bash
-PYTHONPATH=/path/to/hermes-agent:plugins/loopdy \
+PYTHONPATH=/path/to/hermes-agent:. \
   /path/to/hermes-agent/venv/bin/python \
-  -m unittest discover -s plugins/loopdy/tests -v
+  -m unittest discover -s tests -v
 
-hermes plugins doctor plugins/loopdy --ci
+hermes plugins doctor . --ci
 ```
+
+## Wiki connections
+
+A compatible app can use Add Wiki to browse/type an existing safe folder and Save a read-only registration through `wiki.connect`. The operation must be advertised alongside `wiki.v1`; older hosts report unavailable and require a plugin update. Hosts without secure descriptor-relative traversal, including Windows, omit the Wiki feature and operations. It never changes `wiki.resolve`, folder suggestions, Files grants, or existing Wiki grant permissions. Host-local Wiki administration still owns write-policy changes and revocation. New registration is bound to the authenticated requesting device, selected profile and current pairing generation. Nested Markdown is discovered by bounded recursive search.
+
+References opens with a bounded recursive file catalog for connected Wikis, even without a typed query. It visits at most eight roots and 32 directories per browse, includes up to 100 visible results, and reports incomplete discovery. Ordinary non-Markdown files offer **File location only**: JSON source path and size metadata, never decoded or ingested binary contents. Selection and send-time checks re-list the parent directory against the live grant, with at most ten revision-bound pages. The snapshot revision identifies parent directory metadata (including the file's identity/stat), not a content digest. Markdown retains explicit page/section content selection.

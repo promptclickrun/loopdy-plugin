@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import sqlite3
 import time
 import zipfile
 from collections import OrderedDict
@@ -1505,6 +1506,20 @@ class HermesWorkspaceBackend:
         if offset == 0 and raw.get("session_id", stored_id) == stored_id:
             runtime = await self._session_runtime(stored_id, agent_id)
         runtime_fields = {"runtime": runtime} if runtime else {}
+        duration_reader = getattr(getattr(self.service, "store", None), "turn_durations", None)
+        try:
+            durations = duration_reader(stored_id) if callable(duration_reader) else {}
+        except (OSError, sqlite3.Error):
+            durations = {}
+        if not isinstance(durations, dict) or raw.get("session_id", stored_id) != stored_id:
+            durations = {}
+        # Only exact, unique canonical timestamps can join sidecar completions.
+        timestamp_counts: dict[float, int] = {}
+        for row in rows:
+            if isinstance(row, dict) and row.get("role") == "assistant" and not row.get("tool_calls"):
+                timestamp = row.get("timestamp")
+                if isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool):
+                    timestamp_counts[timestamp] = timestamp_counts.get(timestamp, 0) + 1
         messages_by_row: dict[int, dict[str, Any]] = {}
         for index, row in enumerate(rows):
             if not isinstance(row, dict):
@@ -1553,6 +1568,11 @@ class HermesWorkspaceBackend:
                     # A malformed optional rich field must not hide the
                     # otherwise renderable user/assistant/tool record.
                     continue
+            timestamp = row.get("timestamp")
+            if (role == "assistant" and not row.get("tool_calls")
+                    and isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool)
+                    and timestamp_counts.get(timestamp) == 1 and timestamp in durations):
+                message["turn_duration_ms"] = durations[timestamp]
             messages_by_row[index] = message
 
         selected: list[dict[str, Any]] = []

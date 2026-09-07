@@ -68,6 +68,23 @@ class WikiIntegrationTests(unittest.TestCase):
                          data=base64.b64encode(content[offset:offset + 65536]).decode('ascii'))
         return operation_id, begin
 
+    def test_create_from_scratchpad_through_transport(self):
+        (self.root / 'drafts').mkdir()
+        root = self.execute('wiki.roots')['roots'][0]
+        content = b'# Scratchpad\nRemote draft\n'
+        operation = 'scratchpad-create'
+        self.execute('wiki.save.begin', wikiId='notes', path='drafts/new.md',
+            baseRevision='wiki-new-v1:' + root['generation'], operationId=operation,
+            totalBytes=len(content), sha256=hashlib.sha256(content).hexdigest())
+        self.execute('wiki.save.chunk', operationId=operation, offset=0,
+            data=base64.b64encode(content).decode('ascii'))
+        result = self.execute('wiki.save.commit', operationId=operation)
+        self.assertEqual(result['status'], 'committed')
+        read = self.execute('wiki.read', wikiId='notes', path='drafts/new.md', offset=0, limit=65536)
+        self.assertEqual(base64.b64decode(read['data']), content)
+        self.assertEqual(read['revision'], result['revision'])
+        self.assertEqual(self.execute('wiki.save.status', operationId=operation), result)
+
     def test_cold_host_connect_is_read_only_and_discovers_nested_markdown(self):
         home = self.base / "fresh-hermes"
         home.mkdir(mode=0o700)

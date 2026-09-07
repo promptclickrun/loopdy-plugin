@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from .wiki_contract import validate_payload, chunk_bytes
-from .wiki_service import WikiService, WikiServiceError, _Reader, _markdown, _raw_revision, _request_digest, _sha
+from .wiki_service import WikiService, WikiServiceError, _Reader, _markdown, _creation_revision, _request_digest, _sha
 
 MAX_UPLOADS = 128
 MAX_STAGED_BYTES = 32 * 1024 * 1024
@@ -90,7 +90,7 @@ class WikiUploads:
         with self.service._locked() as connection:
             self._schema(connection)
             grant = self.service._authorize(connection, p["wikiId"], profile, device_id, write=True)
-            _raw_revision(p["baseRevision"], grant["generation"])
+            creating = _creation_revision(p["baseRevision"], grant["generation"])
             if Path(p["path"]).suffix.casefold() not in {".md", ".markdown"}:
                 raise WikiServiceError("UNSUPPORTED_CONTENT", "Only Markdown files can be edited")
             binding = _request_digest((self.service._authority_id, profile, device_id, p["wikiId"],
@@ -109,7 +109,8 @@ class WikiUploads:
             reader = _Reader(self.service, connection, grant)
             root = reader._open_grant_root(reader._load_grant(p["wikiId"]))
             try:
-                observed, _ = self.service._snapshot(reader, root, p["path"])
+                observed, _ = (self.service._creation_snapshot(reader, root, p["path"]) if creating
+                               else self.service._snapshot(reader, root, p["path"]))
                 _markdown(observed)
             finally:
                 os.close(root)

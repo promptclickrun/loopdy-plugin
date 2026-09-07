@@ -92,7 +92,11 @@ def validate_payload(operation: str, value: Any) -> dict:
             exact_folder(value["folderPath"])
         for field in ("revision", "baseRevision"):
             if field in value and (value[field] is not None or field == "baseRevision"):
-                if not isinstance(value[field], str) or REVISION.fullmatch(value[field]) is None:
+                token = value[field]
+                creation = (operation == "wiki.save.begin" and field == "baseRevision"
+                            and isinstance(token, str)
+                            and re.fullmatch(r"wiki-new-v1:[0-9a-f]{32}", token) is not None)
+                if not creation and (not isinstance(token, str) or REVISION.fullmatch(token) is None):
                     raise _invalid()
         if "operationId" in value:
             if not isinstance(value["operationId"], str) or OPERATION_ID.fullmatch(value["operationId"]) is None:

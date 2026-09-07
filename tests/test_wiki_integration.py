@@ -21,6 +21,7 @@ import uuid
 from gateway.config import PlatformConfig
 from loopdy_plugin.adapter import LoopdyAdapter
 from loopdy_plugin.link_client import LoopdyLinkClient
+from loopdy_plugin.link_crypto import AccountCipher
 from loopdy_plugin.link_contracts import parse_workspace_request, workspace_result
 from loopdy_plugin.wiki_service import WikiServiceError
 from loopdy_plugin.wiki_contract import available_wiki_operations
@@ -133,6 +134,68 @@ class WikiIntegrationTests(unittest.TestCase):
                  baseRevision=read["revision"], operationId="hosted-read-only", totalBytes=0,
                  sha256=hashlib.sha256(b"").hexdigest())
         self.assertEqual(denied.exception.code, "READ_ONLY")
+
+    def test_account_grant_accepts_new_devices_after_reopen(self):
+        home = self.base / "account-host"
+        notes = home / "notes"
+        notes.mkdir(parents=True)
+        (notes / "index.md").write_text("# Account wiki\n")
+        transport = production_factory(host_home=home, config_getter=lambda: self.config)
+        service = transport.host_service()
+        granted = service.grant("account-wiki", root=notes, label="Account Wiki", profile_id="default",
+                                access_scope="account", writable=False)
+        before = service.list_grants()
+        self.assertEqual(before["grants"][0]["accessScope"], "account")
+        self.assertEqual(before["grants"][0]["deviceIds"], [])
+        for device in ("new-phone", "new-tablet"):
+            reopened = production_factory(host_home=home, config_getter=lambda: self.config)
+            context = replace(self.context, device_id=device)
+            def call(op, **fields):
+                return reopened.execute(op, {"agentId": "default", **fields}, context=context)
+            self.assertEqual(call("wiki.connect", folderPath=str(notes)), granted)
+            self.assertEqual(call("wiki.resolve", folderPath=str(notes)), granted)
+            self.assertEqual(call("wiki.roots"), {"roots": [granted]})
+            read = call("wiki.read", wikiId="account-wiki", path="index.md", offset=0, limit=65536)
+            self.assertEqual(read["text"], "# Account wiki\n")
+            self.assertEqual(len(call("wiki.list", wikiId="account-wiki", path="", offset=0,
+                                      limit=100, query="")["entries"]), 1)
+            self.assertEqual(len(call("wiki.search", wikiId="account-wiki", query="Account",
+                                      mode="content", offset=0, limit=100)["matches"]), 1)
+            with self.assertRaises(WikiServiceError) as denied:
+                call("wiki.save.begin", wikiId="account-wiki", path="index.md", baseRevision=read["revision"],
+                     operationId="account-read-only", totalBytes=0, sha256=hashlib.sha256(b"").hexdigest())
+            self.assertEqual(denied.exception.code, "READ_ONLY")
+            self.assertEqual(reopened.host_service().list_grants(), before)
+
+    def test_account_grant_rejects_foreign_account_profile_and_stale_context(self):
+        self.service.grant('notes', root=self.root, label='Notes', profile_id='default', access_scope='account')
+        before = self.service.list_grants()
+        for context in (None, replace(self.context, target_host_id='wrong-host'),
+                        replace(self.context, authority_id='foreign-account'), replace(self.context, sender_epoch=0)):
+            with self.subTest(context=context), self.assertRaises(WikiServiceError):
+                self.transport.execute('wiki.roots', {'agentId': 'default'}, context=context)
+        with self.assertRaises(WikiServiceError):
+            self.transport.execute('wiki.read', dict(agentId='another-profile', wikiId='notes',
+                path='index.md', offset=0, limit=64), context=self.context)
+        original_config = self.config
+        for changed in (replace(original_config, account_key=os.urandom(32)),
+                        replace(original_config, authorization_epoch=original_config.authorization_epoch + 1),
+                        replace(original_config, device_id='replacement-host')):
+            self.config = changed
+            current_context = replace(self.context, target_host_id=changed.device_id, authority_id=authority_id(changed))
+            self.assertEqual(self.transport.execute('wiki.roots', {'agentId': 'default'}, context=current_context), {'roots': []})
+            for operation, fields in (
+                ('wiki.connect', {'folderPath': str(self.root)}),
+                ('wiki.resolve', {'folderPath': str(self.root)}),
+                ('wiki.read', dict(wikiId='notes', path='index.md', offset=0, limit=64)),
+            ):
+                with self.subTest(operation=operation), self.assertRaises(WikiServiceError):
+                    self.transport.execute(operation, {'agentId': 'default', **fields}, context=current_context)
+        self.config = original_config
+        self.assertEqual(self.transport.host_service().list_grants(), before)
+        self.transport.host_service().revoke('notes')
+        with self.assertRaises(WikiServiceError):
+            self.execute('wiki.read', wikiId='notes', path='index.md', offset=0, limit=64)
 
     def test_credential_named_host_home_remains_ungrantable(self):
         user_home = self.base / "user-home"
@@ -304,21 +367,24 @@ class WikiIntegrationTests(unittest.TestCase):
         self.assertFalse((self.root / "loopdy").exists())
 
     def test_connect_contract_rejects_caller_authority_and_write_policy(self):
-        for fields in ({"deviceId": "another-device"}, {"writable": True}, {"authorityId": "other"}):
+        for fields in ({"deviceId": "another-device"}, {"writable": True}, {"authorityId": "other"},
+                       {"accessScope": "account"}, {"accountId": "caller-claimed-account"}):
             with self.assertRaises(ValueError):
                 parse_workspace_request(dict(version=1, type="workspace.request", requestId="wiki-connect-invalid-0001",
                     operation="wiki.connect", payload={"agentId": "default", "folderPath": str(self.root), **fields}, sentAt=1))
 
     def test_distinct_device_authorization_epochs_work_through_encrypted_adapter(self):
-        async def scenario(reuse_host_grant):
-            home = self.base / ("encrypted-host" if reuse_host_grant else "fresh-host")
+        async def scenario(reuse_host_grant, account_scope=False):
+            context = replace(self.context, device_id="new-account-phone") if account_scope else self.context
+            home = self.base / ("account-encrypted-host" if account_scope else "encrypted-host" if reuse_host_grant else "fresh-host")
             home.mkdir()
             transport = production_factory(host_home=home, config_getter=lambda: self.config)
             connected = (home if reuse_host_grant else self.base) / "encrypted-notes"
             connected.mkdir()
             if reuse_host_grant:
                 transport.host_service().grant("hosted-wiki", root=connected, label="Hosted Wiki",
-                    profile_id="default", device_ids=(self.context.device_id,), writable=False)
+                    profile_id="default", device_ids=() if account_scope else (self.context.device_id,),
+                    access_scope="account" if account_scope else "device", writable=False)
             client = LoopdyLinkClient(self.config, state=_State())
             sent = []
             class Socket:
@@ -338,10 +404,21 @@ class WikiIntegrationTests(unittest.TestCase):
             request = {'version': 1, 'type': 'workspace.request', 'requestId': 'wiki-encrypted-connect-0001',
                        'operation': 'wiki.connect', 'payload': {'agentId': 'default', 'folderPath': str(connected)}, 'sentAt': 1,
                        'targetHostId': self.config.device_id}
+            if account_scope:
+                before = transport.host_service().list_grants()
+                foreign_cipher = AccountCipher(os.urandom(32))
+                with self.assertRaisesRegex(ValueError, "ciphertext is invalid"):
+                    await client.handle_wire_message(json.dumps({
+                        'version': 1, 'type': 'frame', 'id': 'wiki-foreign-frame-0001',
+                        'senderDeviceId': context.device_id, 'senderEpoch': context.sender_epoch,
+                        'sequence': 1, 'ack': 0, 'ciphertext': foreign_cipher.seal(request),
+                    }), adapter.receive_link_payload)
+                self.assertEqual(sent, [])
+                self.assertEqual(transport.host_service().list_grants(), before)
             self.assertNotEqual(self.context.sender_epoch, self.config.authorization_epoch)
             await asyncio.wait_for(client.handle_wire_message(json.dumps({
                 'version': 1, 'type': 'frame', 'id': 'wiki-mobile-frame-0001',
-                'senderDeviceId': self.context.device_id, 'senderEpoch': self.context.sender_epoch,
+                'senderDeviceId': context.device_id, 'senderEpoch': context.sender_epoch,
                 'sequence': 1, 'ack': 0, 'ciphertext': client.cipher.seal(request),
             }), adapter.receive_link_payload), 5)
             results = [client.cipher.open(frame['ciphertext']) for frame in sent if frame['type'] == 'frame']
@@ -349,13 +426,13 @@ class WikiIntegrationTests(unittest.TestCase):
             self.assertEqual(results[0]['status'], 'completed', results[0])
             self.assertFalse(results[0]['payload']['writable'])
             resolved = transport.execute('wiki.resolve', {'agentId': 'default', 'folderPath': str(connected)},
-                                         context=self.context)
+                                         context=context)
             self.assertEqual(results[0]['payload'], resolved)
             self.assertNotIn('capabilities', results[0])
             self.assertEqual(results[0]["payload"]["folderPath"], str(connected))
-        for reuse_host_grant in (False, True):
-            with self.subTest(reuse_host_grant=reuse_host_grant):
-                asyncio.run(scenario(reuse_host_grant))
+        for reuse_host_grant, account_scope in ((False, False), (True, False), (True, True)):
+            with self.subTest(reuse_host_grant=reuse_host_grant, account_scope=account_scope):
+                asyncio.run(scenario(reuse_host_grant, account_scope))
 
     def test_exact_large_upload_replay_empty_save_and_serialization(self):
         content = b'\xef\xbb\xbf# Updated\r\n' + ('e\u0301 / \U0001f431\r\n' * 10000).encode('utf-8')

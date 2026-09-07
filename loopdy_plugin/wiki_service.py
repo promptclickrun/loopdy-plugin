@@ -457,6 +457,12 @@ class WikiService:
                     content BLOB NOT NULL, PRIMARY KEY(operation_id, kind)
                 );
             """)
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(wiki_grants)")}
+            if "access_scope" not in columns:
+                connection.execute(
+                    "ALTER TABLE wiki_grants ADD COLUMN access_scope TEXT NOT NULL "
+                    "DEFAULT 'device' CHECK(access_scope IN ('device','account'))"
+                )
             for table in ("wiki_operations", "wiki_events", "wiki_evidence"):
                 for action in ("UPDATE", "DELETE"):
                     connection.execute(
@@ -465,15 +471,17 @@ class WikiService:
                     )
 
     def grant(self, wiki_id: str, *, root: Path, label: str, profile_id: str,
-              device_ids: tuple[str, ...], writable: bool = False,
-              source_kind: str = "files") -> dict:
+              device_ids: tuple[str, ...] = (), writable: bool = False,
+              source_kind: str = "files", access_scope: str = "device") -> dict:
         """Host administration only. Changed policy always rotates generation."""
         with self._locked() as connection:
             wiki_id = _valid_workspace_id(wiki_id)
             label = _valid_label(label)
             profile_id = _opaque(profile_id, "profileId")
-            if not isinstance(device_ids, tuple) or not 1 <= len(device_ids) <= 128:
-                raise WikiServiceError("INVALID_REQUEST", "An explicit nonempty device tuple is required")
+            if (access_scope not in ("device", "account") or not isinstance(device_ids, tuple)
+                    or (access_scope == "device" and not 1 <= len(device_ids) <= 128)
+                    or (access_scope == "account" and device_ids)):
+                raise WikiServiceError("INVALID_REQUEST", "Choose explicit devices or the paired account")
             devices = tuple(_opaque(device, "deviceId") for device in device_ids)
             if len(set(devices)) != len(devices) or type(writable) is not bool:
                 raise WikiServiceError("INVALID_REQUEST", "Wiki grant policy is invalid")
@@ -492,9 +500,9 @@ class WikiService:
                 os.close(descriptor)
             existing = connection.execute("SELECT * FROM wiki_grants WHERE wiki_id=?", (wiki_id,)).fetchone()
             policy = (label, str(candidate), current.st_dev, current.st_ino, self._authority_id,
-                      profile_id, json.dumps(sorted(devices)), int(effective_writable), source_kind)
+                      profile_id, json.dumps(sorted(devices)), int(effective_writable), source_kind, access_scope)
             columns = ("label", "root", "root_dev", "root_ino", "authority_id", "profile_id",
-                       "device_ids", "writable", "source_kind")
+                       "device_ids", "writable", "source_kind", "access_scope")
             if existing is not None and tuple(existing[key] for key in columns) == policy:
                 return self._root_dto(existing)
             if existing is None and connection.execute("SELECT COUNT(*) FROM wiki_grants").fetchone()[0] >= _MAX_GRANTS:
@@ -502,8 +510,8 @@ class WikiService:
             with connection:
                 connection.execute(
                     "INSERT OR REPLACE INTO wiki_grants "
-                    "(wiki_id,label,root,root_dev,root_ino,authority_id,profile_id,device_ids,writable,source_kind,generation) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?)", (wiki_id, *policy, uuid.uuid4().hex),
+                    "(wiki_id,label,root,root_dev,root_ino,authority_id,profile_id,device_ids,writable,source_kind,access_scope,generation) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (wiki_id, *policy, uuid.uuid4().hex),
                 )
             row = connection.execute("SELECT * FROM wiki_grants WHERE wiki_id=?", (wiki_id,)).fetchone()
             self._revalidate(connection, row)
@@ -550,7 +558,7 @@ class WikiService:
                 if not _overlaps_root(candidate, lineage, registered, pinned):
                     continue
                 if (row["authority_id"] != self._authority_id or row["profile_id"] != profile_id
-                        or device_id not in json.loads(row["device_ids"])):
+                        or not self._allows_device(row, device_id)):
                     raise WikiServiceError("WIKI_NOT_ALLOWED", "This folder overlaps an existing host grant")
                 if candidate == registered or (current.st_dev, current.st_ino) == pinned:
                     exact.append(row)
@@ -596,6 +604,13 @@ class WikiService:
                 "sourceKind": row["source_kind"], "generation": row["generation"],
                 "folderPath": row["root"]}
 
+    @staticmethod
+    def _allows_device(row: sqlite3.Row, device_id: str) -> bool:
+        # Account scope removes only the extra Wiki device allowlist. Callers
+        # must still match the captured, account-key-bound pairing authority.
+        return (row["access_scope"] == "account"
+                or (row["access_scope"] == "device" and device_id in json.loads(row["device_ids"])))
+
     def _authorize(self, connection: sqlite3.Connection, wiki_id: str,
                    profile_id: str, device_id: str, *, write: bool = False) -> sqlite3.Row:
         _valid_workspace_id(wiki_id)
@@ -604,7 +619,7 @@ class WikiService:
         row = connection.execute("SELECT * FROM wiki_grants WHERE wiki_id=?", (wiki_id,)).fetchone()
         if (
             row is None or row["authority_id"] != self._authority_id
-            or row["profile_id"] != profile_id or device_id not in json.loads(row["device_ids"])
+            or row["profile_id"] != profile_id or not self._allows_device(row, device_id)
         ):
             raise WikiServiceError("WIKI_NOT_ALLOWED", "Wiki is not authorized for this owner and device")
         if write and (not row["writable"] or row["source_kind"] != "files" or not self._can_write):
@@ -647,7 +662,8 @@ class WikiService:
                 (self._authority_id,),
             ).fetchall()
             return {"grants": [dict(self._root_dto(row), profileId=row["profile_id"],
-                                    deviceIds=json.loads(row["device_ids"])) for row in rows]}
+                                    deviceIds=json.loads(row["device_ids"]),
+                                    accessScope=row["access_scope"]) for row in rows]}
 
     def resolve(self, folder_path: str, *, profile_id: str, device_id: str) -> dict:
         from .wiki_contract import exact_folder
@@ -659,7 +675,7 @@ class WikiService:
                 "SELECT * FROM wiki_grants WHERE authority_id=? AND profile_id=? AND root=? ORDER BY wiki_id",
                 (self._authority_id, profile_id, folder_path),
             ).fetchall()
-            visible = [row for row in rows if device_id in json.loads(row["device_ids"])]
+            visible = [row for row in rows if self._allows_device(row, device_id)]
             if not visible:
                 raise WikiServiceError("WIKI_NOT_ALLOWED", "This folder requires host approval")
             if len(visible) != 1:
@@ -709,7 +725,7 @@ class WikiService:
             ).fetchall()
             visible = []
             for row in rows:
-                if device_id not in json.loads(row["device_ids"]):
+                if not self._allows_device(row, device_id):
                     continue
                 try:
                     self._revalidate(connection, row)

@@ -7,8 +7,10 @@ import unittest
 import test_wiki_integration as fixtures
 from loopdy_plugin.wiki_transport import production_factory
 from loopdy_plugin.wiki_service import WikiServiceError
+from loopdy_plugin.wiki_contract import available_wiki_operations
 
 
+@unittest.skipUnless(available_wiki_operations(), "Requires secure descriptor-relative traversal")
 class AccountConnectTests(unittest.TestCase):
     setUp = fixtures.WikiIntegrationTests.setUp
 

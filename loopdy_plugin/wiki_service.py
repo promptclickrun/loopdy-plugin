@@ -1,4 +1,4 @@
-"""Owner-scoped Wiki files and explicit read-only connection; no runtime dependencies.
+"""Owner-scoped Wiki files and explicit account-authorized connection; no runtime dependencies.
 
 All cooperating processes must use the same private state directory. Saves use
 an advisory process lock, an append-only SQLite recovery journal, and a durable
@@ -467,6 +467,10 @@ class WikiService:
                     content BLOB NOT NULL, PRIMARY KEY(operation_id, kind)
                 );
             """)
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(wiki_grants)")}
+            if "access_scope" not in columns:
+                connection.execute("ALTER TABLE wiki_grants ADD COLUMN access_scope TEXT NOT NULL "
+                                   "DEFAULT 'device' CHECK(access_scope IN ('device','account'))")
             for table in ("wiki_operations", "wiki_events", "wiki_evidence"):
                 for action in ("UPDATE", "DELETE"):
                     connection.execute(
@@ -519,11 +523,13 @@ class WikiService:
             self._revalidate(connection, row)
             return self._root_dto(row)
 
-    def connect(self, folder_path: str, *, profile_id: str, device_id: str) -> dict:
-        """Explicit authenticated folder setup; never edits an existing grant.
+    def connect(self, folder_path: str, *, profile_id: str, device_id: str,
+                account_authorized: bool = False) -> dict:
+        """Explicit folder setup; account authority is supplied only by transport.
 
-        Transport supplies the verified device, selected profile, and captured
-        pairing authority. New registrations are read-only and device-specific.
+        Verified account selection creates/converts an exact grant to account
+        read/write. The default retains the legacy host-internal device policy.
+        Reads and resolve never call this mutation path.
         """
         from .wiki_contract import exact_folder
         folder_path = exact_folder(folder_path)
@@ -533,6 +539,7 @@ class WikiService:
             try:
                 candidate = _Reader(self, connection, None)._valid_grant_root(Path(folder_path))
                 lineage = _directory_lineage(candidate)
+                self._check_host_control_root(candidate, lineage)
                 home = Path.home().resolve()
                 if _lexically_contains(candidate, home) or lineage[-1] in _directory_lineage(home):
                     raise WikiServiceError("WIKI_NOT_ALLOWED", "Home directories cannot be connected")
@@ -560,18 +567,30 @@ class WikiService:
                 if not _overlaps_root(candidate, lineage, registered, pinned):
                     continue
                 if (row["authority_id"] != self._authority_id or row["profile_id"] != profile_id
-                        or device_id not in json.loads(row["device_ids"])):
+                        or (not account_authorized and not self._allows_device(row, device_id))):
                     raise WikiServiceError("WIKI_NOT_ALLOWED", "This folder overlaps an existing host grant")
-                if candidate == registered or (current.st_dev, current.st_ino) == pinned:
+                if candidate == registered and (current.st_dev, current.st_ino) == pinned:
                     exact.append(row)
+                elif account_authorized:
+                    raise WikiServiceError("WIKI_NOT_ALLOWED", "Choose the exact registered Wiki folder")
             if len(exact) > 1:
                 raise WikiServiceError("WIKI_AMBIGUOUS", "Choose a named Wiki from the authorized roots")
             if exact:
-                self._revalidate(connection, exact[0])
-                return self._root_dto(exact[0])
-            # Host-local approval may authorize a specific Wiki within Hermes
-            # home. Reuse that grant above; never create a new one there.
-            if protected:
+                row = exact[0]
+                self._revalidate(connection, row)
+                writable = int(row["source_kind"] == "files" and self._can_write)
+                if account_authorized and (row["access_scope"] != "account" or row["writable"] != writable):
+                    self.check_owner()
+                    with connection:
+                        connection.execute("UPDATE wiki_grants SET access_scope='account', device_ids='[]', "
+                                           "writable=?, generation=? WHERE wiki_id=?",
+                                           (writable, uuid.uuid4().hex, row["wiki_id"]))
+                        row = connection.execute("SELECT * FROM wiki_grants WHERE wiki_id=?", (row["wiki_id"],)).fetchone()
+                        self._revalidate(connection, row)
+                return self._root_dto(row)
+            # Only verified account selection may register ordinary data under
+            # the host home; control roots were unconditionally excluded above.
+            if protected and not account_authorized:
                 raise WikiServiceError("WIKI_NOT_ALLOWED", "This folder cannot be connected")
             if connection.execute("SELECT COUNT(*) FROM wiki_grants").fetchone()[0] >= _MAX_GRANTS:
                 raise WikiServiceError("QUOTA_EXCEEDED", "Wiki grant limit reached")
@@ -586,9 +605,30 @@ class WikiService:
                     (wiki_id, label, str(candidate), current.st_dev, current.st_ino, self._authority_id,
                      profile_id, json.dumps([device_id]), 0, "files", uuid.uuid4().hex),
                 )
+                if account_authorized:
+                    connection.execute("UPDATE wiki_grants SET access_scope='account', device_ids='[]', writable=? "
+                                       "WHERE wiki_id=?", (int(self._can_write), wiki_id))
                 row = connection.execute("SELECT * FROM wiki_grants WHERE wiki_id=?", (wiki_id,)).fetchone()
                 self._revalidate(connection, row)
             return self._root_dto(row)
+
+    def _check_host_control_root(self, candidate: Path, lineage: tuple[tuple[int, int], ...]) -> None:
+        # A custom Hermes home may also be the persistent user-data volume.
+        # Exempt ordinary data folders, never the home or its control subtrees.
+        controls = {'plugin-data', 'plugins', 'profiles', 'config', 'credentials',
+                    'sessions', 'logs', 'memories', 'skills', 'cache', 'cron',
+                    'hooks', 'auth', 'secrets', 'backups', 'hermes-agent',
+                    'desktop-plugins', 'tui-widgets', 'skins', 'pets'}
+        for home in self._protected_roots:
+            if _lexically_contains(candidate, home):
+                raise WikiServiceError('WIKI_NOT_ALLOWED', 'Host control folders cannot be connected')
+            if _lexically_contains(home, candidate):
+                first = unicodedata.normalize('NFC', candidate.parts[len(home.parts)]).casefold()
+                if first.startswith('.') or first in controls:
+                    raise WikiServiceError('WIKI_NOT_ALLOWED', 'Host control folders cannot be connected')
+            # Inode checks also cover case-insensitive aliases of known roots.
+            if any(_overlaps_root(candidate, lineage, home / name) for name in controls):
+                raise WikiServiceError('WIKI_NOT_ALLOWED', 'Host control folders cannot be connected')
 
     def revoke(self, wiki_id: str) -> dict:
         """Host administration only; recovery material is deliberately retained."""
@@ -606,6 +646,11 @@ class WikiService:
                 "sourceKind": row["source_kind"], "generation": row["generation"],
                 "folderPath": row["root"], "supportsCreation": self._can_write}
 
+    @staticmethod
+    def _allows_device(row: sqlite3.Row, device_id: str) -> bool:
+        return (row["access_scope"] == "account" or
+                (row["access_scope"] == "device" and device_id in json.loads(row["device_ids"])))
+
     def _authorize(self, connection: sqlite3.Connection, wiki_id: str,
                    profile_id: str, device_id: str, *, write: bool = False) -> sqlite3.Row:
         _valid_workspace_id(wiki_id)
@@ -614,7 +659,7 @@ class WikiService:
         row = connection.execute("SELECT * FROM wiki_grants WHERE wiki_id=?", (wiki_id,)).fetchone()
         if (
             row is None or row["authority_id"] != self._authority_id
-            or row["profile_id"] != profile_id or device_id not in json.loads(row["device_ids"])
+            or row["profile_id"] != profile_id or not self._allows_device(row, device_id)
         ):
             raise WikiServiceError("WIKI_NOT_ALLOWED", "Wiki is not authorized for this owner and device")
         if write and (not row["writable"] or row["source_kind"] != "files" or not self._can_write):
@@ -657,7 +702,8 @@ class WikiService:
                 (self._authority_id,),
             ).fetchall()
             return {"grants": [dict(self._root_dto(row), profileId=row["profile_id"],
-                                    deviceIds=json.loads(row["device_ids"])) for row in rows]}
+                                    deviceIds=json.loads(row["device_ids"]),
+                                    accessScope=row["access_scope"]) for row in rows]}
 
     def resolve(self, folder_path: str, *, profile_id: str, device_id: str) -> dict:
         from .wiki_contract import exact_folder
@@ -669,7 +715,7 @@ class WikiService:
                 "SELECT * FROM wiki_grants WHERE authority_id=? AND profile_id=? AND root=? ORDER BY wiki_id",
                 (self._authority_id, profile_id, folder_path),
             ).fetchall()
-            visible = [row for row in rows if device_id in json.loads(row["device_ids"])]
+            visible = [row for row in rows if self._allows_device(row, device_id)]
             if not visible:
                 raise WikiServiceError("WIKI_NOT_ALLOWED", "This folder requires host approval")
             if len(visible) != 1:
@@ -719,7 +765,7 @@ class WikiService:
             ).fetchall()
             visible = []
             for row in rows:
-                if device_id not in json.loads(row["device_ids"]):
+                if not self._allows_device(row, device_id):
                     continue
                 try:
                     self._revalidate(connection, row)

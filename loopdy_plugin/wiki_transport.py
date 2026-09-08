@@ -113,7 +113,9 @@ class WikiTransport:
         if operation == "wiki.roots":
             result = service.roots(**identity)
         elif operation == "wiki.connect":
-            result = service.connect(p["folderPath"], **identity)
+            # This capability comes from the checked encrypted Link context,
+            # never a payload flag or caller-supplied account identifier.
+            result = service.connect(p["folderPath"], **identity, account_authorized=True)
         elif operation == "wiki.resolve":
             result = service.resolve(p["folderPath"], **identity)
         elif operation == "wiki.list":

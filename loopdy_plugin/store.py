@@ -48,6 +48,26 @@ class LoopdyStore:
         self._initialized = False
         self._ensure_schema()
 
+    def record_turn_duration(
+        self, session_id: str, turn_id: str, final_timestamp: float, duration_ms: int
+    ) -> None:
+        """Immutable completion keyed by the host turn, not message text or arrival time."""
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO turn_durations "
+                "(session_id, turn_id, final_timestamp, duration_ms) VALUES (?, ?, ?, ?)",
+                (session_id, turn_id, final_timestamp, duration_ms),
+            )
+
+    def turn_durations(self, session_id: str) -> dict[float, int]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT final_timestamp, MIN(duration_ms) AS duration_ms "
+                "FROM turn_durations WHERE session_id = ? GROUP BY final_timestamp "
+                "HAVING COUNT(*) = 1", (session_id,),
+            ).fetchall()
+        return {row["final_timestamp"]: row["duration_ms"] for row in rows}
+
     def upsert_device(
         self,
         *,
@@ -3341,6 +3361,13 @@ class LoopdyStore:
             with self._connect(initialize=False) as connection:
                 connection.executescript(
                     """
+                    CREATE TABLE IF NOT EXISTS turn_durations (
+                        session_id TEXT NOT NULL,
+                        turn_id TEXT NOT NULL,
+                        final_timestamp REAL NOT NULL,
+                        duration_ms INTEGER NOT NULL CHECK(duration_ms >= 0),
+                        PRIMARY KEY (session_id, turn_id)
+                    );
                     CREATE TABLE IF NOT EXISTS metadata (
                         key TEXT PRIMARY KEY,
                         value TEXT NOT NULL

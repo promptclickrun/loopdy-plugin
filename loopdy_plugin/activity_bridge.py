@@ -7,6 +7,7 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import re
 import shlex
 import sqlite3
@@ -58,6 +59,9 @@ class LinkActivityBroker:
         self._drain_task: asyncio.Task[None] | None = None
         self._context_task: asyncio.Task[None] | None = None
         self._active: OrderedDict[tuple[str, str], str] = OrderedDict()
+        self._turn_started: dict[tuple[str, str], float] = {}
+        self._finished_turns: OrderedDict[tuple[str, str], None] = OrderedDict()
+        self._duration_store: Any = None
         self._bound_sessions: OrderedDict[str, str] = OrderedDict()
         self._api_usage: OrderedDict[tuple[str, str], dict[str, int]] = OrderedDict()
         self._api_usage_order: dict[tuple[str, str], dict[str, Any]] = {}
@@ -133,6 +137,47 @@ class LinkActivityBroker:
             active_task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    def attach_duration_store(self, store: Any) -> None:
+        self._duration_store = store
+
+    def start_turn_timing(self, session_id: str, turn_id: str) -> bool:
+        with self._lock:
+            key = (session_id, turn_id)
+            if key in self._finished_turns:
+                return False
+            self._turn_started.setdefault(key, time.monotonic())
+            while len(self._turn_started) > self.maximum_active_turns:
+                self._turn_started.pop(next(iter(self._turn_started)))
+            return True
+
+    def finish_turn_timing(self, session_id: str, turn_id: str, payload: dict[str, Any]) -> tuple[bool, int | None]:
+        with self._lock:
+            key = (session_id, turn_id)
+            if key in self._finished_turns:
+                return False, None
+            start = self._turn_started.pop(key, None)
+            self._finished_turns[key] = None
+            while len(self._finished_turns) > self.maximum_bound_sessions:
+                self._finished_turns.popitem(last=False)
+        elapsed = time.monotonic() - start if start is not None else None
+        duration = round(elapsed * 1000) if elapsed is not None and 0 <= elapsed <= 86_400 else None
+        # Hermes persists before post_llm_call and keeps the exact timestamp in
+        # conversation_history. Never match a completion by content or nearest time.
+        history = payload.get("conversation_history")
+        final = history[-1] if isinstance(history, list) and history else None
+        timestamp = final.get("timestamp") if isinstance(final, dict) else None
+        if (duration is not None and self._duration_store is not None
+                and isinstance(final, dict) and final.get("role") == "assistant"
+                and not final.get("tool_calls") and isinstance(timestamp, (int, float))
+                and not isinstance(timestamp, bool) and math.isfinite(timestamp) and timestamp > 0):
+            try:
+                recorder = getattr(self._duration_store, "record_turn_duration", None)
+                if callable(recorder):
+                    recorder(session_id, turn_id, timestamp, duration)
+            except (OSError, sqlite3.Error):
+                logger.warning("Could not persist completed turn duration")
+        return True, duration
 
     def activate(
         self,
@@ -896,6 +941,9 @@ def publish_hook_activity(
         link_session_id = child_route[1] if child_route else broker.bound_link_session(session_id)
         if not link_session_id:
             return
+        start_timing = getattr(broker, "start_turn_timing", None)
+        if callable(start_timing) and not start_timing(session_id, turn_id):
+            return
         broker.activate(session_id, turn_id, link_session_id=link_session_id)
         completion = _background_handoff_completion(payload.get("user_message"))
         resolver = getattr(broker, "take_handoff_process", None)
@@ -944,6 +992,15 @@ def publish_hook_activity(
             timestamp,
         )
         return
+
+    duration = None
+    if hook_name == "post_llm_call" and turn_id:
+        # Persistence is independent of the socket route: a turn can finish
+        # after detach has cleared the live routing tables.
+        finish_timing: Any = getattr(broker, "finish_turn_timing", None)
+        accepted, duration = finish_timing(session_id, turn_id, payload) if callable(finish_timing) else (True, None)
+        if not accepted:
+            return
 
     link_session_id = (
         broker.resolved_session_id(session_id, turn_id) if turn_id else None
@@ -1007,6 +1064,7 @@ def publish_hook_activity(
             "Response ready",
             None,
             timestamp,
+            duration_ms=duration,
         )
         broker.deactivate(session_id, turn_id)
         return
@@ -1169,6 +1227,11 @@ def finish_failed_turn_activity(
     turn_id = _turn_coordinate(payload.get("turn_id"))
     if not session_id or not turn_id:
         return
+    # Timing belongs to the turn, not the socket route cleared by detach().
+    finish_timing: Any = getattr(broker, "finish_turn_timing", None)
+    accepted, duration = finish_timing(session_id, turn_id, payload) if callable(finish_timing) else (True, None)
+    if not accepted:
+        return
     link_session_id = broker.resolved_session_id(session_id, turn_id)
     if not link_session_id:
         return
@@ -1185,6 +1248,7 @@ def finish_failed_turn_activity(
         "Response stopped" if failed else "Response ready",
         None,
         int(occurred_at if occurred_at is not None else time.time()),
+        duration_ms=duration,
     )
     broker.deactivate(session_id, turn_id)
 

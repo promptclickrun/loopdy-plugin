@@ -513,6 +513,24 @@ Supported event types are:
 - `job.failed`
 - `channel.message`
 
+## Optional completed-turn timing
+
+A completed reasoning activity may include the existing optional `durationMs` field with the whole host turn's measured elapsed time. The plugin measures with a monotonic clock from the first accepted turn-start hook to completion. Duplicate terminal hooks do not extend the duration. Unknown or out-of-range measurements are omitted; a missing start is not reconstructed from later wall-clock time.
+
+The plugin retains completed measurements in its private state database and joins them to history only by an exact, unique canonical final-assistant timestamp for the same session. Eligible `sessions.history` messages may include optional `turn_duration_ms`, an integer from 0 through 86,400,000. Ambiguous joins, missing timing and storage-read failures omit this presentation field without hiding the transcript. No message-content matching or approximate timestamp join is permitted.
+
+Native history decoding accepts finite numeric timestamps, including fractional seconds, and tolerates absent or malformed duration fields. Completed-turn presentation prefers recorded duration, then matching live completion timing. Legacy fallback uses actual human/final-message timestamps only, never synthetic row IDs or the current rendering clock. Timing metadata must survive local persistence and transcript reconciliation; it does not change canonical message identities or copied content.
+
+## Optional Wiki file creation
+
+Roots may advertise `supportsCreation: true` alongside the existing optional root metadata. Clients require this explicit flag on the current authorized root before creating a file; an omitted or false flag means upgrade/unsupported, not permission to attempt an older host operation. `writable` and the connection's read-only preference remain independent gates.
+
+Creation uses the existing bounded `wiki.save.begin` / chunk / commit / status transaction with `baseRevision: "wiki-new-v1:<32 lowercase hex grant generation>"`. This token is an absent-file precondition, not a content revision. It is accepted only as the base revision of a create request; successful content revisions keep the existing `wiki-v1:<generation>:<sha256>` format. Normal existing-file edits retain their original revision checks.
+
+Only a new `.md` or `.markdown` file beneath an existing authorized folder may be created. The host rechecks authority, grant generation, path ancestry and staged bytes, then atomically links the staged file into an absent destination without replacing any existing file, directory or symlink. No parent directories are implicitly created. Existing destinations are rejected or reported as conflicts, never overwritten or replaced by a local-export fallback.
+
+The same immutable operation identity and private durable journal cover upload retries, lost acknowledgements and restart recovery. Indeterminate operations are reconciled by status, not silently resubmitted as new creates. Native Scratchpad acknowledges a remote save only after exact verified readback and then adopts the saved revision for later edits.
+
 ## Optional Wiki folder registration
 
 `wiki.connect` extends the finite negotiated Wiki operation set and requires both advertised operation support and `wiki.v1`. Hosts without secure descriptor-relative traversal omit the feature and every Wiki operation. Its exact payload is the selected `agentId` and canonical absolute `folderPath`; caller device, authority, grant ID, and write-policy fields are rejected. The trusted workspace boundary supplies verified device/pairing ownership. It registers a safe existing directory read-only, or returns the unchanged exact authorized registration. Existing host-approved Wiki subfolders inside a custom, non-credential-named Hermes home (for example `/opt/data`) can be reused; new registrations there remain forbidden. The standard `~/.hermes` tree and other credential/control-named paths remain ungrantable and cannot use this exception. This exception does not relax other filesystem exclusions, and the existing grant's ownership, pinned directory identity, generation and access policy remain authoritative. Canonical folder paths must not end in a slash and are never silently normalized. Ambiguous or unauthorized overlapping registrations fail closed. It does not alias or change `wiki.resolve`, which remains lookup-only. New clients must not fall back to another registration mechanism when this operation is absent.

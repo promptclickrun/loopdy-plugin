@@ -105,6 +105,9 @@ def register(
 ) -> None:
     active_service = service or get_service()
     broker = activity_broker or LinkActivityBroker()
+    attach_duration_store = getattr(broker, "attach_duration_store", None)
+    if callable(attach_duration_store):
+        attach_duration_store(getattr(active_service, "store", None))
     profile = str(getattr(ctx, "profile_name", "default") or "default")
     identity_state = getattr(ctx, "state", None)
     update_manager = production_manager(profile)

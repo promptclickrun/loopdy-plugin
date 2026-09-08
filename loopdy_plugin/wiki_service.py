@@ -85,6 +85,16 @@ def _revision(generation: str, content: bytes) -> str:
     return f"wiki-v1:{generation}:{_sha(content)}"
 
 
+def _creation_revision(value: str, generation: str) -> bool:
+    """An explicit absent-file precondition, bound to the current grant epoch."""
+    if isinstance(value, str) and value.startswith("wiki-new-v1:"):
+        if value != f"wiki-new-v1:{generation}":
+            raise WikiServiceError("REVISION_STALE", "Wiki creation grant changed")
+        return True
+    _raw_revision(value, generation)
+    return False
+
+
 def _raw_revision(value: Any, generation: str) -> str | None:
     if value is None:
         return None
@@ -594,7 +604,7 @@ class WikiService:
         return {"wikiId": row["wiki_id"], "name": row["label"],
                 "writable": bool(row["writable"] and self._can_write),
                 "sourceKind": row["source_kind"], "generation": row["generation"],
-                "folderPath": row["root"]}
+                "folderPath": row["root"], "supportsCreation": self._can_write}
 
     def _authorize(self, connection: sqlite3.Connection, wiki_id: str,
                    profile_id: str, device_id: str, *, write: bool = False) -> sqlite3.Row:
@@ -801,6 +811,18 @@ class WikiService:
             if parent >= 0:
                 os.close(parent)
 
+    def _creation_snapshot(self, reader: _Reader, root: int, path: str):
+        # Only the final component may be absent. Missing/unsafe parents fail.
+        parent, name = reader._open_parent_from_root(root, path)
+        try:
+            try:
+                os.stat(name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                return b"", None
+        finally:
+            os.close(parent)
+        return self._snapshot(reader, root, path)
+
     @staticmethod
     def _event(connection: sqlite3.Connection, operation_id: str, status: str,
                revision: str | None = None, error_code: str | None = None) -> dict:
@@ -897,7 +919,7 @@ class WikiService:
         _markdown(content)
         if base_revision is None:
             raise WikiServiceError("REVISION_REQUIRED", "A base revision is required")
-        _raw_revision(base_revision, row["generation"])
+        creating = _creation_revision(base_revision, row["generation"])
         digest = _request_digest((self._authority_id, profile_id, device_id, wiki_id,
                                   row["generation"], path, base_revision, _sha(content)))
         operation = self._operation(connection, operation_id, profile_id, device_id)
@@ -908,7 +930,8 @@ class WikiService:
         reader = _Reader(self, connection, row)
         root = reader._open_grant_root(reader._load_grant(wiki_id))
         try:
-            observed, before = self._snapshot(reader, root, path)
+            observed, before = (self._creation_snapshot(reader, root, path) if creating
+                                else self._snapshot(reader, root, path))
             _markdown(observed)
             current_revision = _revision(row["generation"], observed)
             base = observed if current_revision == base_revision else None
@@ -944,14 +967,14 @@ class WikiService:
                     "INSERT INTO wiki_events(operation_id,status,revision,created_at) VALUES(?,?,?,?)",
                     (operation_id, "prepared", current_revision, time.time_ns()),
                 )
-            if current_revision != base_revision:
+            if (creating and before is not None) or (not creating and current_revision != base_revision):
                 return self._event(connection, operation_id, "conflict", current_revision, "REVISION_STALE")
             return self._replace(connection, row, reader, root, path, content, observed, before, operation_id, temp_name)
         finally:
             os.close(root)
 
     def _replace(self, connection: sqlite3.Connection, grant: sqlite3.Row, reader: _Reader,
-                 root: int, path: str, content: bytes, observed: bytes, before: os.stat_result,
+                 root: int, path: str, content: bytes, observed: bytes, before: os.stat_result | None,
                  operation_id: str, temp_name: str) -> dict:
         parent = temporary = -1
         temp_identity = None
@@ -971,18 +994,22 @@ class WikiService:
                 if written <= 0:
                     raise OSError("Short Wiki staging write")
                 remaining = remaining[written:]
-            os.fchown(temporary, -1, before.st_gid)
-            os.fchmod(temporary, stat.S_IMODE(before.st_mode))
+            if before is not None:
+                os.fchown(temporary, -1, before.st_gid)
+                os.fchmod(temporary, stat.S_IMODE(before.st_mode))
             _require_plain_metadata(temporary)
             os.fsync(temporary)
             os.fsync(parent)
             self._event(connection, operation_id, "committing")
             committing = True
             # Final full-byte/stat/path/owner check, AFTER staging and its journal.
-            late, late_stat = self._snapshot(reader, root, path)
+            late, late_stat = (self._creation_snapshot(reader, root, path) if before is None
+                               else self._snapshot(reader, root, path))
             with connection:
                 connection.execute("INSERT INTO wiki_evidence VALUES(?,?,?)", (operation_id, "late", late))
-            if late != observed or not _same_stat(before, late_stat):
+            changed = (late_stat is not None if before is None
+                       else late_stat is None or not _same_stat(before, late_stat))
+            if late != observed or changed:
                 return self._event(connection, operation_id, "conflict", _revision(grant["generation"], late), "REVISION_STALE")
             self._revalidate(connection, grant)
             check, _ = reader._open_parent_from_root(root, path)
@@ -997,7 +1024,16 @@ class WikiService:
                 raise WikiServiceError("REVISION_STALE", "Wiki staging identity changed")
             # There is deliberately no claim of CAS here: direct external writers
             # can change/remove the destination or move an ancestor after checks.
-            os.replace(temp_name, name, src_dir_fd=parent, dst_dir_fd=parent)
+            if before is None:
+                # link is atomic create-if-absent; never overwrite a racing file,
+                # directory or symlink. Drop the staging link before readback.
+                try:
+                    os.link(temp_name, name, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
+                except FileExistsError:
+                    return self._event(connection, operation_id, "conflict", error_code="REVISION_STALE")
+                os.unlink(temp_name, dir_fd=parent)
+            else:
+                os.replace(temp_name, name, src_dir_fd=parent, dst_dir_fd=parent)
             os.fsync(parent)
             actual, after = self._snapshot(reader, root, path)
             with connection:

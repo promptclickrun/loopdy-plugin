@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import sqlite3
 import time
 import zipfile
 from collections import OrderedDict
@@ -1505,6 +1506,16 @@ class HermesWorkspaceBackend:
         if offset == 0 and raw.get("session_id", stored_id) == stored_id:
             runtime = await self._session_runtime(stored_id, agent_id)
         runtime_fields = {"runtime": runtime} if runtime else {}
+        duration_reader = getattr(getattr(self.service, "store", None), "turn_durations", None)
+        try:
+            durations = duration_reader(stored_id) if callable(duration_reader) else {}
+        except (OSError, sqlite3.Error):
+            durations = {}
+        if not isinstance(durations, dict) or raw.get("session_id", stored_id) != stored_id:
+            durations = {}
+        # Page-local uniqueness cannot distinguish another completion on a
+        # different page. If the canonical read is unavailable, leave timing unknown.
+        unique_timestamps = await self._session_unique_final_timestamps(stored_id, agent_id) if durations else set()
         messages_by_row: dict[int, dict[str, Any]] = {}
         for index, row in enumerate(rows):
             if not isinstance(row, dict):
@@ -1553,6 +1564,11 @@ class HermesWorkspaceBackend:
                     # A malformed optional rich field must not hide the
                     # otherwise renderable user/assistant/tool record.
                     continue
+            timestamp = row.get("timestamp")
+            if (role == "assistant" and not row.get("tool_calls")
+                    and isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool)
+                    and timestamp in unique_timestamps and timestamp in durations):
+                message["turn_duration_ms"] = durations[timestamp]
             messages_by_row[index] = message
 
         selected: list[dict[str, Any]] = []
@@ -2720,6 +2736,38 @@ class HermesWorkspaceBackend:
             exclude_sources="cron",
             full=False,
         )
+
+    async def _session_unique_final_timestamps(self, stored_id: str, agent_id: str) -> set[float]:
+        def read() -> set[float]:
+            from hermes_cli.web_routers.sessions import _open_session_db_for_profile
+
+            db = _open_session_db_for_profile(agent_id, read_only=True)
+            try:
+                # Read the exact stored session, not a resumed successor. Include
+                # inactive rows conservatively: a timestamp reused after rewind or
+                # copied by compaction cannot identify a physical completion.
+                counts: dict[float, int] = {}
+                offset = 0
+                while True:
+                    rows = db.get_messages(stored_id, include_inactive=True, limit=500, offset=offset)
+                    for row in rows:
+                        if row.get("role") == "assistant" and not row.get("tool_calls"):
+                            timestamp = row.get("timestamp")
+                            if isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool):
+                                counts[timestamp] = counts.get(timestamp, 0) + 1
+                    if len(rows) < 500:
+                        break
+                    offset += len(rows)
+                return {timestamp for timestamp, count in counts.items() if count == 1}
+            finally:
+                db.close()
+
+        try:
+            return await asyncio.to_thread(read)
+        except Exception:
+            # Optional metadata must not hide history on older Hermes versions
+            # without this read API, or when the canonical store cannot be read.
+            return set()
 
     async def _session_messages(
         self,

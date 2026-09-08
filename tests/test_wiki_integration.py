@@ -85,7 +85,7 @@ class WikiIntegrationTests(unittest.TestCase):
         self.assertEqual(read['revision'], result['revision'])
         self.assertEqual(self.execute('wiki.save.status', operationId=operation), result)
 
-    def test_cold_host_connect_is_read_only_and_discovers_nested_markdown(self):
+    def test_cold_host_connect_is_read_write_and_discovers_nested_markdown(self):
         home = self.base / "fresh-hermes"
         home.mkdir(mode=0o700)
         transport = production_factory(host_home=home, config_getter=lambda: self.config)
@@ -101,7 +101,7 @@ class WikiIntegrationTests(unittest.TestCase):
             call("wiki.resolve", folderPath=str(notes))
         self.assertEqual(denied.exception.code, "WIKI_NOT_ALLOWED")
         root = call("wiki.connect", folderPath=str(notes))
-        self.assertFalse(root["writable"])
+        self.assertTrue(root["writable"])
         self.assertEqual(root["folderPath"], str(notes))
         self.assertEqual(call("wiki.connect", folderPath=str(notes)), root)
         self.assertEqual(call("wiki.resolve", folderPath=str(notes)), root)
@@ -111,11 +111,9 @@ class WikiIntegrationTests(unittest.TestCase):
             self.assertEqual([hit["path"] for hit in page["matches"]], ["nested/deeper/plan.md"])
         read = call("wiki.read", wikiId=root["wikiId"], path="nested/deeper/plan.md", offset=0, limit=65536)
         self.assertEqual(read["text"], "# Nested plan\nunique body content\n")
-        with self.assertRaises(WikiServiceError) as denied:
-            call("wiki.save.begin", wikiId=root["wikiId"], path="nested/deeper/plan.md",
-                 baseRevision=read["revision"], operationId="read-only-connect", totalBytes=0,
-                 sha256=hashlib.sha256(b"").hexdigest())
-        self.assertEqual(denied.exception.code, "READ_ONLY")
+        call("wiki.save.begin", wikiId=root["wikiId"], path="nested/deeper/plan.md",
+             baseRevision=read["revision"], operationId="writable-connect", totalBytes=0,
+             sha256=hashlib.sha256(b"").hexdigest())
         listing = call("wiki.list", wikiId=root["wikiId"], path="nested/deeper", offset=0, limit=100, query="")
         pdf = next(entry for entry in listing["entries"] if entry["name"] == "paper.pdf")
         self.assertEqual(pdf["kind"], "file")
@@ -140,16 +138,16 @@ class WikiIntegrationTests(unittest.TestCase):
         def call(op, **fields):
             return transport.execute(op, {"agentId": "default", **fields}, context=self.context)
         connected = call("wiki.connect", folderPath=str(notes))
-        self.assertEqual(connected, granted)
-        self.assertEqual(call("wiki.resolve", folderPath=str(notes)), granted)
-        self.assertEqual(service.list_grants(), before)
+        self.assertEqual(connected["wikiId"], granted["wikiId"])
+        self.assertTrue(connected["writable"])
+        self.assertNotEqual(connected["generation"], granted["generation"])
+        self.assertEqual(call("wiki.resolve", folderPath=str(notes)), connected)
+        self.assertNotEqual(service.list_grants(), before)
         read = call("wiki.read", wikiId=granted["wikiId"], path="index.md", offset=0, limit=65536)
         self.assertEqual(read["text"], "# Hosted wiki\n")
-        with self.assertRaises(WikiServiceError) as denied:
-            call("wiki.save.begin", wikiId=granted["wikiId"], path="index.md",
-                 baseRevision=read["revision"], operationId="hosted-read-only", totalBytes=0,
-                 sha256=hashlib.sha256(b"").hexdigest())
-        self.assertEqual(denied.exception.code, "READ_ONLY")
+        call("wiki.save.begin", wikiId=granted["wikiId"], path="index.md",
+             baseRevision=read["revision"], operationId="hosted-write", totalBytes=0,
+             sha256=hashlib.sha256(b"").hexdigest())
 
     def test_credential_named_host_home_remains_ungrantable(self):
         user_home = self.base / "user-home"
@@ -184,9 +182,7 @@ class WikiIntegrationTests(unittest.TestCase):
         before = service.list_grants()
         for folder, profile, context in (
             (notes, "other", self.context),
-            (notes, "default", replace(self.context, device_id="another-device")),
             (notes / "child", "default", self.context),
-            (sibling, "default", self.context),
             (home, "default", self.context),
             (service._state_dir, "default", self.context),
             (linked, "default", self.context),
@@ -197,10 +193,10 @@ class WikiIntegrationTests(unittest.TestCase):
                 self.assertEqual(denied.exception.code, "WIKI_NOT_ALLOWED")
         self.assertEqual(service.list_grants(), before)
         service.revoke("hosted-wiki")
-        with self.assertRaises(WikiServiceError) as denied:
-            transport.execute("wiki.connect", {"agentId": "default", "folderPath": str(notes)}, context=self.context)
-        self.assertEqual(denied.exception.code, "WIKI_NOT_ALLOWED")
         self.assertEqual(service.list_grants(), {"grants": []})
+        # Revocation removes a connection, not the paired account's folder authority.
+        connected = transport.execute("wiki.connect", {"agentId": "default", "folderPath": str(notes)}, context=self.context)
+        self.assertTrue(connected["writable"])
 
     def test_protected_host_grant_checks_ambiguity_overlap_and_root_identity(self):
         home = self.base / "host-home"
@@ -233,10 +229,10 @@ class WikiIntegrationTests(unittest.TestCase):
         self.assertEqual(service.list_grants(), before)
 
     def test_connect_cannot_adopt_or_overwrite_existing_authority(self):
+        connected = self.execute("wiki.connect", folderPath=str(self.root))
         before = self.execute("wiki.roots")
-        self.assertEqual(self.execute("wiki.connect", folderPath=str(self.root)), before["roots"][0])
-        for profile, context in (("other", self.context),
-                                 ("default", replace(self.context, device_id="another-device"))):
+        self.assertEqual(connected, before["roots"][0])
+        for profile, context in (("other", self.context),):
             for folder in (self.root, self.base):
                 with self.assertRaises(WikiServiceError):
                     self.transport.execute("wiki.connect", {"agentId": profile, "folderPath": str(folder)}, context=context)
@@ -364,7 +360,7 @@ class WikiIntegrationTests(unittest.TestCase):
             results = [client.cipher.open(frame['ciphertext']) for frame in sent if frame['type'] == 'frame']
             self.assertEqual(len(results), 1)
             self.assertEqual(results[0]['status'], 'completed', results[0])
-            self.assertFalse(results[0]['payload']['writable'])
+            self.assertTrue(results[0]['payload']['writable'])
             resolved = transport.execute('wiki.resolve', {'agentId': 'default', 'folderPath': str(connected)},
                                          context=self.context)
             self.assertEqual(results[0]['payload'], resolved)

@@ -255,6 +255,10 @@ class _Reader(WorkspaceFilesService):
 
     _open_absolute_directory = staticmethod(_absolute_directory)
 
+    def _include_directory_entry(self, path: str) -> bool:
+        # WikiNavigation rejects hidden components and colons in every returned path.
+        return ":" not in path and not any(part.startswith(".") for part in path.split("/"))
+
     def __init__(self, service: WikiService, connection: sqlite3.Connection, row: sqlite3.Row | None):
         self.service = service
         self.connection = connection

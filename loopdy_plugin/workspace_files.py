@@ -223,6 +223,10 @@ class WorkspaceFilesService:
             ]
         }
 
+    def _include_directory_entry(self, path: str) -> bool:
+        """Allow subclasses to narrow listings before revision and pagination."""
+        return True
+
     def list_directory(
         self,
         workspace_id: str,
@@ -262,7 +266,7 @@ class WorkspaceFilesService:
                     if not _safe_name(name):
                         continue
                     relative = f"{path}/{name}" if path else name
-                    if _protected_path(relative):
+                    if _protected_path(relative) or not self._include_directory_entry(relative):
                         continue
                     try:
                         entry_stat = item.stat(follow_symlinks=False)

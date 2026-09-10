@@ -1,0 +1,550 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+
+class DeviceToolContractTests(unittest.TestCase):
+    def test_device_tool_request_and_result_are_strict_and_correlated(self):
+        from loopdy_plugin.link_contracts import (
+            device_tool_request,
+            device_tool_result,
+            parse_device_tool_request,
+            parse_device_tool_result,
+        )
+
+        request = device_tool_request(
+            request_id="request-device-tool-0001",
+            device_id="phone-1",
+            host_id="host-1",
+            authorization_epoch=3,
+            session_id="session-1",
+            agent_id="default",
+            turn_id="turn-1",
+            operation="calendar.create",
+            arguments={
+                "title": "Dentist",
+                "start": "2026-09-11T15:00:00Z",
+                "end": "2026-09-11T16:00:00Z",
+                "timeZone": "America/Chicago",
+                "span": "thisEvent",
+            },
+            sent_at=100,
+            expires_at=130,
+        )
+        parsed = parse_device_tool_request(request)
+        self.assertEqual(parsed["requestId"], "request-device-tool-0001")
+        self.assertEqual(parsed["operation"], "calendar.create")
+        self.assertEqual(parsed["expiresAt"], 130)
+
+        result = device_tool_result(
+            request=parsed,
+            status="completed",
+            payload={"id": "event-1", "revision": "rev-1"},
+            sent_at=101,
+        )
+        parsed_result = parse_device_tool_result(result, sender_device_id="phone-1")
+        self.assertEqual(parsed_result["hostId"], "host-1")
+        self.assertEqual(parsed_result["payload"]["id"], "event-1")
+
+        with self.assertRaises(ValueError):
+            parse_device_tool_request({**request, "unexpected": True})
+
+        recurring = device_tool_request(
+            request_id="request-device-tool-0002",
+            device_id="phone-1",
+            host_id="host-1",
+            authorization_epoch=3,
+            session_id="session-1",
+            agent_id="default",
+            turn_id="turn-1",
+            operation="calendar.update",
+            arguments={
+                "id": "event-1",
+                "expectedRevision": "rev-1",
+                "occurrenceStart": "2026-09-11T15:00:00Z",
+                "span": "thisEvent",
+            },
+            sent_at=100,
+            expires_at=130,
+        )
+        self.assertEqual(recurring["arguments"]["occurrenceStart"], "2026-09-11T15:00:00Z")
+        reminders = device_tool_request(
+            request_id="request-device-tool-0003",
+            device_id="phone-1",
+            host_id="host-1",
+            authorization_epoch=3,
+            session_id="session-1",
+            agent_id="default",
+            turn_id="turn-1",
+            operation="reminders.list",
+            arguments={"completed": False, "includeUndated": True},
+            sent_at=100,
+            expires_at=130,
+        )
+        self.assertTrue(reminders["arguments"]["includeUndated"])
+
+    def test_device_tool_status_is_strict_and_bounded(self):
+        from loopdy_plugin.link_contracts import device_tool_status, parse_device_tool_status
+
+        status = device_tool_status(
+            device_id="phone-1",
+            host_id="host-1",
+            authorization_epoch=3,
+            enabled=["health", "calendar"],
+            available=True,
+            sent_at=100,
+        )
+        parsed = parse_device_tool_status(status, sender_device_id="phone-1")
+        self.assertEqual(parsed["enabled"], ["health", "calendar"])
+        with self.assertRaises(ValueError):
+            parse_device_tool_status(
+                {**status, "enabled": ["health"] * 33}, sender_device_id="phone-1"
+            )
+
+
+class DeviceToolHandlerTests(unittest.TestCase):
+    @staticmethod
+    def _execution_context(*, source="loopdy_link", owner_id="phone-1", scope_id="finance", epoch=7, attributes=None):
+        from tool_execution_context import ToolExecutionContext
+
+        return ToolExecutionContext(
+            source=source,
+            owner_id=owner_id,
+            scope_id=scope_id,
+            authorization_epoch=epoch,
+            attributes={"host_id": "host-1"} if attributes is None else attributes,
+        )
+
+    def test_bridge_is_default_off_until_matching_phone_status(self):
+        from loopdy_plugin.device_tools import DeviceToolBridge
+
+        bridge = DeviceToolBridge()
+        execution = self._execution_context()
+        result = asyncio.run(bridge.execute(
+            context=execution,
+            device_id="phone-1", host_id="host-1", authorization_epoch=7,
+            session_id="session-1", agent_id="finance", turn_id="turn-1",
+            tool_call_id="call-1", operation="calendar.list", arguments={
+                "start": "2026-09-10T00:00:00Z", "end": "2026-09-11T00:00:00Z", "timeZone": "UTC",
+            },
+        ))
+        self.assertEqual(result["code"], "unavailable")
+
+    def test_handlers_fail_closed_without_verified_context(self):
+        from loopdy_plugin.device_tools import register
+
+        context = SimpleNamespace(tools={}, schemas={})
+        context.register_tool = lambda *, name, handler, schema, **kwargs: context.tools.update({name: handler}) or context.schemas.update({name: schema})
+        register(context, bridge=None)
+        with self.assertRaises(ValueError):
+            asyncio.run(context.tools["iphone_health"]({
+                    "start": "2026-09-10T00:00:00Z",
+                    "end": "2026-09-11T00:00:00Z",
+                    "timeZone": "UTC",
+                }))
+
+    def test_handler_uses_context_owner_and_official_coordinates(self):
+        from loopdy_plugin.device_tools import DeviceToolBridge, register
+
+        bridge = DeviceToolBridge()
+        bridge.execute = AsyncMock(return_value={"status": "completed", "payload": {"items": []}})
+        context = SimpleNamespace(tools={}, schemas={})
+        context.register_tool = lambda *, name, handler, schema, **kwargs: context.tools.update({name: handler}) or context.schemas.update({name: schema})
+        register(context, bridge=bridge)
+        execution = self._execution_context()
+        result = asyncio.run(
+            context.tools["iphone_calendar"](
+                {
+                    "operation": "list",
+                    "start": "2026-09-10T00:00:00Z",
+                    "end": "2026-09-11T00:00:00Z",
+                    "timeZone": "UTC",
+                    "limit": 20,
+                },
+                tool_execution_context=execution,
+                session_id="session-1",
+                turn_id="turn-1",
+                tool_call_id="call-1",
+            )
+        )
+        self.assertEqual(json.loads(result)["status"], "completed")
+        bridge.execute.assert_awaited_once()
+        request = bridge.execute.await_args.kwargs
+        self.assertEqual(request["device_id"], "phone-1")
+        self.assertEqual(request["host_id"], "host-1")
+        self.assertEqual(request["authorization_epoch"], 7)
+        self.assertEqual(request["session_id"], "session-1")
+        self.assertEqual(request["turn_id"], "turn-1")
+        self.assertEqual(request["tool_call_id"], "call-1")
+        self.assertEqual(request["operation"], "calendar.list")
+
+    def test_context_attributes_are_exactly_authenticated_host_coordinate(self):
+        from loopdy_plugin.device_tools import DeviceToolBridge, DeviceToolError
+
+        context = self._execution_context(attributes={"host_id": "host-1", "untrusted": "value"})
+        with self.assertRaises(DeviceToolError):
+            DeviceToolBridge._assert_context(
+                context,
+                device_id="phone-1",
+                host_id="host-1",
+                authorization_epoch=7,
+                session_id="session-1",
+                agent_id="finance",
+                turn_id="turn-1",
+            )
+
+    def test_handler_requires_ordinary_session_turn_and_tool_call_coordinates(self):
+        from loopdy_plugin.device_tools import DeviceToolBridge, register
+
+        bridge = DeviceToolBridge()
+        bridge.execute = AsyncMock(return_value={"status": "completed", "payload": {}})
+        context = SimpleNamespace(tools={}, schemas={})
+        context.register_tool = lambda *, name, handler, schema, **kwargs: context.tools.update({name: handler}) or context.schemas.update({name: schema})
+        register(context, bridge=bridge)
+        execution = self._execution_context()
+        payload = {
+            "operation": "list",
+            "start": "2026-09-10T00:00:00Z",
+            "end": "2026-09-11T00:00:00Z",
+            "timeZone": "UTC",
+        }
+        with self.assertRaises(ValueError):
+            asyncio.run(context.tools["iphone_calendar"](
+                payload,
+                tool_execution_context=execution,
+                task_id="must-not-be-used-as-turn-id",
+                tool_call_id="call-1",
+            ))
+        with self.assertRaises(ValueError):
+            asyncio.run(context.tools["iphone_calendar"](
+                payload,
+                tool_execution_context=execution,
+                session_id="session-1",
+                turn_id="turn-1",
+            ))
+
+    def test_context_requires_canonical_source_nonempty_ids_and_positive_integer_epoch(self):
+        from loopdy_plugin.device_tools import DeviceToolBridge, DeviceToolError
+
+        coordinates = dict(
+            device_id="phone-1",
+            host_id="host-1",
+            authorization_epoch=7,
+            session_id="session-1",
+            agent_id="finance",
+            turn_id="turn-1",
+        )
+        for kwargs in (
+            {"source": "proxy"},
+            {"owner_id": ""},
+            {"scope_id": ""},
+            {"epoch": 0},
+            {"epoch": "7"},
+        ):
+            context = SimpleNamespace(
+                source=kwargs.get("source", "loopdy_link"),
+                owner_id=kwargs.get("owner_id", "phone-1"),
+                scope_id=kwargs.get("scope_id", "finance"),
+                authorization_epoch=kwargs.get("epoch", 7),
+                attributes={"host_id": "host-1"},
+            )
+            with self.subTest(kwargs=kwargs), self.assertRaises(DeviceToolError):
+                DeviceToolBridge._assert_context(context, **coordinates)
+
+    def test_status_epoch_must_match_the_verified_sender_frame_epoch(self):
+        from loopdy_plugin.device_tools import DeviceToolBridge
+        from loopdy_plugin.link_contracts import device_tool_status
+
+        bridge = DeviceToolBridge(
+            link_client=SimpleNamespace(
+                config=SimpleNamespace(device_id="host-1", authorization_epoch=8),
+            ),
+            clock=lambda: 100,
+        )
+        stale = device_tool_status(
+            device_id="phone-1",
+            host_id="host-1",
+            authorization_epoch=7,
+            enabled=["calendar"],
+            available=True,
+            sent_at=100,
+        )
+        self.assertTrue(
+            bridge.accept_status(
+                stale,
+                sender_device_id="phone-1",
+                sender_epoch=7,
+                target_device_id="host-1",
+            )
+        )
+        self.assertFalse(
+            bridge.accept_status(
+                stale,
+                sender_device_id="phone-1",
+                sender_epoch=8,
+                target_device_id="host-1",
+            )
+        )
+
+    def test_same_second_status_transition_is_not_dropped(self):
+        from loopdy_plugin.device_tools import DeviceToolBridge
+        from loopdy_plugin.link_contracts import device_tool_status
+
+        bridge = DeviceToolBridge(
+            link_client=SimpleNamespace(config=SimpleNamespace(device_id="host-1")),
+            clock=lambda: 100,
+        )
+        disabled = device_tool_status(
+            device_id="phone-1", host_id="host-1", authorization_epoch=7,
+            enabled=[], available=False, sent_at=100,
+        )
+        enabled = device_tool_status(
+            device_id="phone-1", host_id="host-1", authorization_epoch=7,
+            enabled=["calendar"], available=True, sent_at=100,
+        )
+        self.assertTrue(bridge.accept_status(
+            disabled, sender_device_id="phone-1", sender_epoch=7, target_device_id="host-1",
+        ))
+        self.assertTrue(bridge.accept_status(
+            enabled, sender_device_id="phone-1", sender_epoch=7, target_device_id="host-1",
+        ))
+        self.assertFalse(bridge.accept_status(
+            enabled, sender_device_id="phone-1", sender_epoch=7, target_device_id="host-1",
+        ))
+
+    def test_same_second_disable_cancels_pending_request(self):
+        from loopdy_plugin.device_tools import DeviceToolBridge
+        from loopdy_plugin.link_contracts import device_tool_status
+
+        class Client:
+            connected = True
+            peer_capabilities = {"directed-frames-v1"}
+            config = SimpleNamespace(device_id="host-1")
+
+            async def send_payload(self, _request, **_kwargs):
+                await asyncio.sleep(0)
+
+        bridge = DeviceToolBridge(Client(), clock=lambda: 100)
+        enabled = device_tool_status(
+            device_id="phone-1", host_id="host-1", authorization_epoch=7,
+            enabled=["calendar"], available=True, sent_at=100,
+        )
+        disabled = device_tool_status(
+            device_id="phone-1", host_id="host-1", authorization_epoch=7,
+            enabled=[], available=False, sent_at=100,
+        )
+        self.assertTrue(bridge.accept_status(
+            enabled, sender_device_id="phone-1", sender_epoch=7, target_device_id="host-1",
+        ))
+        context = SimpleNamespace(
+            source="loopdy_link", owner_id="phone-1", scope_id="default",
+            authorization_epoch=7, attributes={"host_id": "host-1"},
+        )
+
+        async def run():
+            task = asyncio.create_task(bridge.execute(
+                context=context, device_id="phone-1", host_id="host-1", authorization_epoch=7,
+                session_id="session-1", agent_id="default", turn_id="turn-1", tool_call_id="call-disable",
+                operation="calendar.create", arguments={
+                    "title": "Dentist", "start": "2026-09-11T15:00:00Z",
+                    "end": "2026-09-11T16:00:00Z", "timeZone": "UTC",
+                },
+            ))
+            while not bridge._pending:
+                await asyncio.sleep(0)
+            self.assertTrue(bridge.accept_status(
+                disabled, sender_device_id="phone-1", sender_epoch=7, target_device_id="host-1",
+            ))
+            return await task
+
+        result = asyncio.run(run())
+        self.assertEqual(result["code"], "authorization_required")
+
+
+class DirectedLinkTests(unittest.TestCase):
+    def test_encrypted_frame_preserves_optional_directed_target(self):
+        from loopdy_plugin.link_contracts import EncryptedFrame, parse_encrypted_frame
+
+        frame = EncryptedFrame(
+            frame_id="frame-directed-0001",
+            sender_device_id="host-1",
+            sender_epoch=3,
+            sequence=1,
+            ack=0,
+            ciphertext="ciphertext-000000",
+            target_device_id="phone-1",
+        )
+        parsed = parse_encrypted_frame(json.dumps(frame.wire_value()))
+        self.assertEqual(parsed.target_device_id, "phone-1")
+
+    def test_targeted_payload_requires_negotiated_directed_frames(self):
+        from loopdy_plugin.link_client import LoopdyLinkClient
+
+        client = object.__new__(LoopdyLinkClient)
+        client._connected = asyncio.Event()
+        client._connected.set()
+        client._authentication_failed = False
+        client._send_lock = asyncio.Lock()
+        client._transport_lock = AsyncMock()
+        client._transport_lock.__aenter__ = AsyncMock(return_value=client._transport_lock)
+        client._transport_lock.__aexit__ = AsyncMock(return_value=None)
+        client._transport_get = lambda name, default=None: default
+        client._transport_set = lambda name, value: None
+        client._wait_for_prior_pending = AsyncMock()
+        client._send_wire = AsyncMock()
+        client._delivery_timeout = 1
+        client.config = SimpleNamespace(device_id="host-1", authorization_epoch=3)
+        client.cipher = SimpleNamespace(seal=lambda payload: "ciphertext-000000")
+        client._accepted = {}
+        client._backpressured_frame_id = None
+        client._mark_failed_outbound_and_reconnect = AsyncMock()
+        client.peer_capabilities = frozenset()
+        with self.assertRaises(ConnectionError):
+            asyncio.run(client.send_payload({"type": "device.tool.request"}, target_device_id="phone-1"))
+
+    def test_status_uses_frame_coordinates_and_replacement_invalidates_cache(self):
+        from loopdy_plugin.device_tools import DeviceToolBridge
+        from loopdy_plugin.link_contracts import device_tool_status
+
+        client = SimpleNamespace(
+            config=SimpleNamespace(device_id="host-1"),
+            connected=True,
+            peer_capabilities={"directed-frames-v1"},
+        )
+        bridge = DeviceToolBridge(client, clock=lambda: 100)
+        status = device_tool_status(
+            device_id="phone-1", host_id="host-1", authorization_epoch=7,
+            enabled=["calendar"], available=True, sent_at=100,
+        )
+        self.assertTrue(bridge.accept_status(
+            status, sender_device_id="phone-1", sender_epoch=7, target_device_id="host-1",
+        ))
+        self.assertFalse(bridge.accept_status(
+            status, sender_device_id="phone-1", sender_epoch=8, target_device_id="host-1",
+        ))
+        self.assertFalse(bridge.accept_status(
+            status, sender_device_id="phone-1", sender_epoch=7, target_device_id="other-host",
+        ))
+        bridge.bind_link_client(SimpleNamespace(config=SimpleNamespace(device_id="host-2")))
+        self.assertFalse(bridge._status)
+
+    def test_call_identity_deduplicates_and_changed_arguments_conflict(self):
+        from loopdy_plugin.device_tools import DeviceToolBridge
+        from loopdy_plugin.link_contracts import device_tool_result, device_tool_status
+
+        sent = []
+        bridge = None
+
+        class Client:
+            connected = True
+            peer_capabilities = {"directed-frames-v1"}
+            config = SimpleNamespace(device_id="host-1")
+
+            async def send_payload(self, request, **_kwargs):
+                sent.append(request)
+                result = device_tool_result(
+                    request=request, status="completed", payload={"id": "event-1"}, sent_at=101,
+                )
+                bridge.accept_result(
+                    result,
+                    sender_device_id="phone-1",
+                    sender_epoch=7,
+                    target_device_id="host-1",
+                )
+
+        bridge = DeviceToolBridge(Client(), clock=lambda: 100)
+        status = device_tool_status(
+            device_id="phone-1", host_id="host-1", authorization_epoch=7,
+            enabled=["calendar"], available=True, sent_at=100,
+        )
+        self.assertTrue(bridge.accept_status(
+            status, sender_device_id="phone-1", sender_epoch=7, target_device_id="host-1",
+        ))
+        context = SimpleNamespace(
+            source="loopdy_link", owner_id="phone-1", scope_id="default",
+            authorization_epoch=7, attributes={"host_id": "host-1"},
+        )
+
+        async def run():
+            first = await bridge.execute(
+                context=context, device_id="phone-1", host_id="host-1", authorization_epoch=7,
+                session_id="session-1", agent_id="default", turn_id="turn-1", tool_call_id="call-1",
+                operation="calendar.create", arguments={
+                    "title": "Dentist", "start": "2026-09-11T15:00:00Z",
+                    "end": "2026-09-11T16:00:00Z", "timeZone": "UTC",
+                },
+            )
+            replay = await bridge.execute(
+                context=context, device_id="phone-1", host_id="host-1", authorization_epoch=7,
+                session_id="session-1", agent_id="default", turn_id="turn-1", tool_call_id="call-1",
+                operation="calendar.create", arguments={
+                    "title": "Dentist", "start": "2026-09-11T15:00:00Z",
+                    "end": "2026-09-11T16:00:00Z", "timeZone": "UTC",
+                },
+            )
+            conflict = await bridge.execute(
+                context=context, device_id="phone-1", host_id="host-1", authorization_epoch=7,
+                session_id="session-1", agent_id="default", turn_id="turn-1", tool_call_id="call-1",
+                operation="calendar.create", arguments={
+                    "title": "Different", "start": "2026-09-11T15:00:00Z",
+                    "end": "2026-09-11T16:00:00Z", "timeZone": "UTC",
+                },
+            )
+            return first, replay, conflict
+
+        first, replay, conflict = asyncio.run(run())
+        self.assertEqual(first["status"], "completed")
+        self.assertEqual(replay, first)
+        self.assertEqual(conflict["code"], "request_conflict")
+        self.assertEqual(len(sent), 1)
+
+    def test_completed_read_payload_is_not_retained(self):
+        from loopdy_plugin.device_tools import DeviceToolBridge
+        from loopdy_plugin.link_contracts import device_tool_result, device_tool_status
+
+        bridge = None
+
+        class Client:
+            connected = True
+            peer_capabilities = {"directed-frames-v1"}
+            config = SimpleNamespace(device_id="host-1")
+
+            async def send_payload(self, request, **_kwargs):
+                bridge.accept_result(
+                    device_tool_result(
+                        request=request,
+                        status="completed",
+                        payload={"sensitive": "private-health-value"},
+                        sent_at=101,
+                    ),
+                    sender_device_id="phone-1",
+                    sender_epoch=7,
+                    target_device_id="host-1",
+                )
+
+        bridge = DeviceToolBridge(Client(), clock=lambda: 100)
+        status = device_tool_status(
+            device_id="phone-1", host_id="host-1", authorization_epoch=7,
+            enabled=["health"], available=True, sent_at=100,
+        )
+        self.assertTrue(bridge.accept_status(
+            status, sender_device_id="phone-1", sender_epoch=7, target_device_id="host-1",
+        ))
+        context = SimpleNamespace(
+            source="loopdy_link", owner_id="phone-1", scope_id="default",
+            authorization_epoch=7, attributes={"host_id": "host-1"},
+        )
+        result = asyncio.run(bridge.execute(
+            context=context, device_id="phone-1", host_id="host-1", authorization_epoch=7,
+            session_id="session-1", agent_id="default", turn_id="turn-1", tool_call_id="call-read",
+            operation="health.read", arguments={
+                "start": "2026-09-10T00:00:00Z", "end": "2026-09-11T00:00:00Z", "timeZone": "UTC",
+            },
+        ))
+        self.assertEqual(result["payload"]["sensitive"], "private-health-value")
+        self.assertFalse(bridge._outcomes)

@@ -91,6 +91,21 @@ class ToolRegistrationTests(unittest.TestCase):
         self.assertNotIn("valid_until", weather_provenance["required"])
         for tool_name, renderer_schema in context.schemas.items():
             description = renderer_schema["description"]
+            if tool_name.startswith("iphone_"):
+                self.assertEqual(renderer_schema["parameters"]["additionalProperties"], False)
+                self.assertIn("authenticated iPhone", description)
+                self.assertTrue(
+                    {"deviceId", "hostId", "authorizationEpoch", "targetDeviceId"}.isdisjoint(
+                        renderer_schema["parameters"]["properties"]
+                    )
+                )
+                if tool_name == "iphone_calendar":
+                    self.assertNotIn("listID", renderer_schema["parameters"]["properties"])
+                    self.assertNotIn("includeUndated", renderer_schema["parameters"]["properties"])
+                if tool_name == "iphone_reminders":
+                    self.assertNotIn("calendarID", renderer_schema["parameters"]["properties"])
+                    self.assertNotIn("occurrenceStart", renderer_schema["parameters"]["properties"])
+                continue
             if tool_name == "loopdy_await_form_response":
                 self.assertNotIn("renderer", description)
                 self.assertIn("exact-session", description)

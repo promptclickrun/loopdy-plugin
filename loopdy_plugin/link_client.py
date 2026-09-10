@@ -37,6 +37,7 @@ from .link_contracts import (
     VoiceSpeakRequest,
     WorkspaceRequest,
     AVAILABLE_WIKI_OPERATIONS,
+    DIRECTED_FRAMES_CAPABILITY,
     parse_attachment_chunk,
     parse_backpressure,
     parse_encrypted_frame,
@@ -50,6 +51,8 @@ from .link_contracts import (
     parse_user_message,
     parse_voice_speak_request,
     parse_workspace_request,
+    parse_device_tool_result,
+    parse_device_tool_status,
     workspace_rejection,
 )
 from .link_attachments import LinkAttachmentInbox
@@ -280,6 +283,9 @@ class InboundLinkTurn:
     sender_device_id: str
     attachment_paths: tuple[str, ...] = ()
     attachment_types: tuple[str, ...] = ()
+    sender_epoch: int | None = None
+    target_host_id: str | None = None
+    authority_origin: str | None = None
 
 
 @dataclass(frozen=True)
@@ -351,6 +357,22 @@ class InboundLinkWorkspaceRequest:
     target_host_id: str | None = None
     authority_id: str | None = None
     sender_epoch: int | None = None
+
+
+@dataclass(frozen=True)
+class InboundLinkDeviceToolResult:
+    result: dict[str, Any]
+    sender_device_id: str
+    sender_epoch: int
+    target_device_id: str | None
+
+
+@dataclass(frozen=True)
+class InboundLinkDeviceToolStatus:
+    status: dict[str, Any]
+    sender_device_id: str
+    sender_epoch: int
+    target_device_id: str | None
 
 
 def canonical_device_request(
@@ -439,6 +461,7 @@ class LoopdyLinkClient:
         if len(negotiated) > 16:
             raise ValueError("Loopdy Link capability catalog is too large")
         self.capabilities = tuple(negotiated)
+        self.peer_capabilities: frozenset[str] = frozenset()
         self._accepted: dict[str, asyncio.Future[None]] = {}
         self._live_activity_accepted: dict[str, asyncio.Future[None]] = {}
         self._inbound_callback_queue: asyncio.Queue[
@@ -494,6 +517,8 @@ class LoopdyLinkClient:
                 | InboundLinkPersonalityRequest
                 | InboundLinkGenerativeUIFormSubmission
                 | InboundLinkWorkspaceRequest
+                | InboundLinkDeviceToolResult
+                | InboundLinkDeviceToolStatus
             ],
             Any,
         ],
@@ -562,9 +587,16 @@ class LoopdyLinkClient:
     async def send_payload(
         self, payload: dict[str, Any], *, preserve_pending_on_failure: bool = False,
         owner_check: Callable[[], None] | None = None,
+        target_device_id: str | None = None,
     ) -> str:
         if self._authentication_failed:
             raise ConnectionError("Loopdy Link authorization requires re-pairing")
+        if payload.get("type") == "device.tool.request" and target_device_id is None:
+            raise ValueError("Loopdy Link device tool requests require a directed target")
+        if target_device_id is not None:
+            if DIRECTED_FRAMES_CAPABILITY not in self.peer_capabilities:
+                raise ConnectionError("Loopdy Link directed frames were not negotiated")
+            target_device_id = _opaque(target_device_id, 1, 96)
         async with self._send_lock:
             await asyncio.wait_for(self._connected.wait(), timeout=20.0)
             async with self._transport_lock:
@@ -579,6 +611,7 @@ class LoopdyLinkClient:
                     sequence=sequence,
                     ack=int(self._transport_get("last_received_sequence", 0) or 0),
                     ciphertext=self.cipher.seal(payload),
+                    target_device_id=target_device_id,
                 )
                 wire = frame.wire_value()
                 self._transport_set("pending_frame", wire)
@@ -660,6 +693,8 @@ class LoopdyLinkClient:
                 | InboundLinkPersonalityRequest
                 | InboundLinkGenerativeUIFormSubmission
                 | InboundLinkWorkspaceRequest
+                | InboundLinkDeviceToolResult
+                | InboundLinkDeviceToolStatus
             ],
             Any,
         ],
@@ -729,6 +764,12 @@ class LoopdyLinkClient:
                 else:
                     await self._accept_inbound_frame(frame)
                 return False
+        if frame.target_device_id is not None and frame.target_device_id != self.config.device_id:
+            if defer_callbacks:
+                self._enqueue_inbound_callback(callback, frame, None)
+            else:
+                await self._accept_inbound_frame(frame)
+            return False
         inbound: (
             InboundLinkTurn
             | _InboundLinkTurnFailure
@@ -742,6 +783,8 @@ class LoopdyLinkClient:
             | InboundLinkPersonalityRequest
             | InboundLinkGenerativeUIFormSubmission
             | InboundLinkWorkspaceRequest
+            | InboundLinkDeviceToolResult
+            | InboundLinkDeviceToolStatus
             | None
         )
         if payload.get("type") == "attachment.chunk":
@@ -820,6 +863,9 @@ class LoopdyLinkClient:
                 sender_device_id=frame.sender_device_id,
                 attachment_paths=attachment_paths,
                 attachment_types=attachment_types,
+                sender_epoch=frame.sender_epoch,
+                target_host_id=target_host_id or self.config.device_id,
+                authority_origin=_link_authority_origin(self.config),
             )
         elif payload.get("type") == "relay.ready":
             registration = parse_relay_ready(payload)
@@ -901,6 +947,32 @@ class LoopdyLinkClient:
                     if request.operation in AVAILABLE_WIKI_OPERATIONS else None
                 ),
                 sender_epoch=frame.sender_epoch,
+            )
+        elif payload.get("type") == "device.tool.result":
+            if frame.target_device_id != self.config.device_id:
+                raise ValueError("Loopdy Link device tool result target is invalid")
+            inbound = InboundLinkDeviceToolResult(
+                result=parse_device_tool_result(
+                    payload,
+                    sender_device_id=frame.sender_device_id,
+                    sender_epoch=frame.sender_epoch,
+                ),
+                sender_device_id=frame.sender_device_id,
+                sender_epoch=frame.sender_epoch,
+                target_device_id=frame.target_device_id,
+            )
+        elif payload.get("type") == "device.tools.status":
+            if frame.target_device_id != self.config.device_id:
+                raise ValueError("Loopdy Link device tool status target is invalid")
+            inbound = InboundLinkDeviceToolStatus(
+                status=parse_device_tool_status(
+                    payload,
+                    sender_device_id=frame.sender_device_id,
+                    sender_epoch=frame.sender_epoch,
+                ),
+                sender_device_id=frame.sender_device_id,
+                sender_epoch=frame.sender_epoch,
+                target_device_id=frame.target_device_id,
             )
         else:
             # Authenticated unfamiliar application payloads (including newer
@@ -1567,6 +1639,9 @@ class LoopdyLinkClient:
                 )
             ):
                 raise ValueError("Loopdy Link socket capabilities are invalid")
+            self.peer_capabilities = frozenset(value["capabilities"])
+        else:
+            self.peer_capabilities = frozenset()
         if value.get("deviceId") != self.config.device_id:
             raise ValueError("Loopdy Link socket readiness device is invalid")
         if value.get("authorizationEpoch") != self.config.authorization_epoch:
@@ -1646,6 +1721,7 @@ class LoopdyLinkClient:
             sequence=server_sequence + 1,
             ack=max(pending.ack, server_ack),
             ciphertext=self.cipher.seal(self.cipher.open(pending.ciphertext)),
+            target_device_id=pending.target_device_id,
         )
         if self._backpressured_frame_id == pending.frame_id:
             self._backpressured_frame_id = rebased.frame_id
@@ -1792,6 +1868,15 @@ def _opaque(value: str, minimum: int, maximum: int) -> str:
     return value
 
 
+def _link_authority_origin(config: Any) -> str:
+    try:
+        from .wiki_transport import authority_id
+
+        return authority_id(config)
+    except Exception:
+        return str(getattr(config, "device_id", ""))
+
+
 def _validated_live_activity_update(payload: dict[str, Any]) -> dict[str, Any]:
     expected = {
         "version",
@@ -1867,6 +1952,8 @@ def _bounded_live_integer(value: Any, minimum: int, maximum: int) -> bool:
 __all__ = [
     "InboundLinkCommandCatalog",
     "InboundLinkGenerativeUIFormSubmission",
+    "InboundLinkDeviceToolResult",
+    "InboundLinkDeviceToolStatus",
     "InboundLinkWorkspaceRequest",
     "InboundLinkPersonalityRequest",
     "InboundLinkRelayReady",

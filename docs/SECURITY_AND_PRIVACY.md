@@ -4,6 +4,25 @@ This document describes the technical behavior of the current implementation.
 It is not legal advice and does not replace a jurisdiction-specific privacy
 policy, App Store disclosure review, or independent security audit.
 
+
+## Optional iPhone tools
+
+The next release candidate adds independent, default-off Health, Calendar and
+Reminders controls in Permissions. Health data is read only for the user's health
+and fitness questions. Calendar and Reminders permit direct reads and changes
+after explicit enablement and iOS authorization. Grants belong to the phone, its
+authorization epoch and the selected host. Turning a grant off blocks new and
+in-flight access; it does not revoke the underlying iOS permission.
+
+Requested results travel through encrypted directed Link frames to the selected
+Hermes host and may be sent to its AI provider and retained in normal tool/chat
+history. The native mutation journal and plugin retry cache retain only bounded
+identity and reconciliation metadata, never private read payloads. Health data
+is not used for advertising or analytics. Availability is foreground-only.
+Account erasure removes saved grants and the local mutation journal. See the
+[iPhone device-tools contract](IPHONE_DEVICE_TOOLS.md) for exact boundaries,
+Health empty-result semantics and the physical-device acceptance requirements.
+
 ## 1. Security goals
 
 Loopdy aims to:

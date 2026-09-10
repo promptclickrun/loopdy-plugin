@@ -1020,6 +1020,49 @@ class AdapterTests(unittest.TestCase):
             self.assertTrue(event.metadata["loopdy_link_verified"])
         self.assertNotIn("mobile-private-coordinate", repr(event.metadata))
 
+    def test_verified_link_turn_carries_runtime_only_tool_execution_context(self) -> None:
+        from tool_execution_context import ToolExecutionContext
+        from loopdy_plugin.link_client import InboundLinkTurn
+        from loopdy_plugin.link_contracts import UserMessage
+
+        link = _LinkClient()
+        link.config = SimpleNamespace(device_id="hermes-host-private-coordinate")
+        adapter = LoopdyAdapter(
+            PlatformConfig(enabled=True), service=_Service(), link_client=link
+        )
+        adapter.handle_message = AsyncMock()
+        turn = InboundLinkTurn(
+            message=UserMessage(
+                message_id="message-tool-context-0001",
+                session_id="session-tool-context-0001",
+                agent_id="finance",
+                actor_id="actor-coordinate-1",
+                actor_name="Alex",
+                device_name="Kitchen iPad",
+                text="What is on my calendar?",
+                attachments=(),
+                sent_at=1788000000,
+            ),
+            sender_id="link_verified_sender_coordinate",
+            sender_device_id="mobile-private-coordinate",
+            sender_epoch=7,
+        )
+
+        asyncio.run(adapter.receive_link_turn(turn))
+
+        event = adapter.handle_message.await_args.args[0]
+        execution = event.tool_execution_context
+        self.assertIsInstance(execution, ToolExecutionContext)
+        self.assertEqual(execution.source, "loopdy_link")
+        self.assertEqual(execution.owner_id, "mobile-private-coordinate")
+        self.assertEqual(execution.scope_id, "finance")
+        self.assertEqual(execution.authorization_epoch, 7)
+        self.assertEqual(
+            dict(execution.attributes),
+            {"host_id": "hermes-host-private-coordinate"},
+        )
+        self.assertNotIn("mobile-private-coordinate", repr(event))
+
     def test_verified_link_media_is_released_only_after_hermes_processing_completes(self) -> None:
         from loopdy_plugin.link_client import InboundLinkTurn
         from loopdy_plugin.link_contracts import UserMessage

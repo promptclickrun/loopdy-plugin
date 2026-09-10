@@ -27,6 +27,7 @@ from .adapter import (
     standalone_send,
     validate_config,
 )
+from .device_tools import DeviceToolBridge, register as register_device_tools
 from .approval import LoopdyApprovalTransport
 from .activity_bridge import (
     LinkActivityBroker,
@@ -74,6 +75,15 @@ HOOKS = (
 logger = logging.getLogger("hermes.plugins.loopdy")
 
 
+def _device_tools_supported() -> bool:
+    """Advertise phone tools only when Hermes carries verified tool context."""
+    try:
+        from tool_execution_context import ToolExecutionContext
+    except (ImportError, AttributeError):
+        return False
+    return callable(getattr(ToolExecutionContext, "__init__", None))
+
+
 def register_marketplace_publish_skill(ctx: Any) -> None:
     """Register Loopdy's read-only publishing guidance with Hermes."""
 
@@ -111,6 +121,7 @@ def register(
     profile = str(getattr(ctx, "profile_name", "default") or "default")
     identity_state = getattr(ctx, "state", None)
     update_manager = production_manager(profile)
+    device_tool_bridge = DeviceToolBridge()
 
     selected_attachment_store = attachment_store or AttachmentStore(
         get_hermes_home()
@@ -142,6 +153,8 @@ def register(
             gateway_client=selected_gateway_client,
         ),
     )
+    if _device_tools_supported():
+        register_device_tools(ctx, bridge=device_tool_bridge)
     register_marketplace_publish_skill(ctx)
 
     ctx.register_platform(
@@ -153,6 +166,7 @@ def register(
             link_state=identity_state,
             activity_broker=broker,
             plugin_update_manager=update_manager,
+            device_tool_bridge=device_tool_bridge,
         ),
         check_fn=check_requirements,
         validate_config=validate_config,

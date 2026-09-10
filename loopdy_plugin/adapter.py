@@ -30,6 +30,8 @@ from hermes_constants import get_hermes_home
 from .events import EVENT_TYPES, LoopdyEvent, build_event
 from .link_client import (
     InboundLinkCommandCatalog,
+    InboundLinkDeviceToolResult,
+    InboundLinkDeviceToolStatus,
     InboundLinkGenerativeUIFormSubmission,
     InboundLinkPersonalityRequest,
     InboundLinkPickerOpen,
@@ -65,7 +67,10 @@ from .link_contracts import (
     voice_speak_error,
     workspace_capabilities,
     workspace_result,
+    DEVICE_TOOL_CAPABILITY,
+    DIRECTED_FRAMES_CAPABILITY,
 )
+from .device_tools import DeviceToolBridge
 from .generative_ui import (
     GenerativeUIError,
     parse_v2_json,
@@ -136,6 +141,29 @@ class _ActivePicker:
 
 class VoiceSynthesisError(RuntimeError):
     pass
+
+
+def _verified_tool_execution_context(link_client: Any, turn: InboundLinkTurn) -> Any:
+    """Map only verified Link frame coordinates into Hermes' generic context."""
+    if turn.sender_epoch is None:
+        return None
+    try:
+        from tool_execution_context import ToolExecutionContext
+    except ImportError:
+        return None
+    config = getattr(link_client, "config", None)
+    host_id = turn.target_host_id or getattr(config, "device_id", "")
+    if not host_id or host_id != getattr(config, "device_id", host_id):
+        return None
+    return ToolExecutionContext(
+        source="loopdy_link",
+        owner_id=turn.sender_device_id,
+        scope_id=turn.message.agent_id,
+        authorization_epoch=turn.sender_epoch,
+        attributes={
+            "host_id": host_id,
+        },
+    )
 
 
 def synthesize_voice_audio(request: VoiceSpeakRequest) -> SynthesizedVoiceAudio:
@@ -305,6 +333,7 @@ class LoopdyAdapter(BasePlatformAdapter):
         personality_manager: PersonalityCatalogManager | Any | None = None,
         workspace_controller: Any | None = None,
         plugin_update_manager: PluginUpdateManager | None = None,
+        device_tool_bridge: DeviceToolBridge | None = None,
         wiki_transport: Any | None = None,
         voice_synthesizer: Callable[[VoiceSpeakRequest], SynthesizedVoiceAudio] = synthesize_voice_audio,
     ):
@@ -321,6 +350,7 @@ class LoopdyAdapter(BasePlatformAdapter):
             host_home=get_hermes_home(), config_getter=self._wiki_current_config,
         )
         self.activity_broker = activity_broker
+        self.device_tool_bridge = device_tool_bridge or DeviceToolBridge()
         self.personality_manager = personality_manager or PersonalityCatalogManager(
             config_path=get_hermes_home() / "config.yaml"
         )
@@ -375,7 +405,11 @@ class LoopdyAdapter(BasePlatformAdapter):
                     build_marketplace_gateway_client,
                 )
 
-                capabilities = [CARD_TEMPLATE_CAPABILITY]
+                capabilities = [
+                    CARD_TEMPLATE_CAPABILITY,
+                    DEVICE_TOOL_CAPABILITY,
+                    DIRECTED_FRAMES_CAPABILITY,
+                ]
                 try:
                     marketplace_client = build_marketplace_gateway_client(runtime_config)
                 except Exception as exc:
@@ -393,7 +427,9 @@ class LoopdyAdapter(BasePlatformAdapter):
                     ),
                     capabilities=capabilities,
                 )
+                self.device_tool_bridge.bind_link_client(self.link_client)
         elif getattr(self.link_client, "config", None) is not None:
+            self.device_tool_bridge.bind_link_client(self.link_client)
             from .marketplace import build_marketplace_gateway_client
 
             try:
@@ -1587,6 +1623,7 @@ class LoopdyAdapter(BasePlatformAdapter):
                     else {}
                 ),
             },
+            tool_execution_context=_verified_tool_execution_context(self.link_client, turn),
         )
         await self._materialize_pending_link_session_workspace(
             turn.message.agent_id,
@@ -2028,6 +2065,8 @@ class LoopdyAdapter(BasePlatformAdapter):
             | InboundLinkPersonalityRequest
             | InboundLinkGenerativeUIFormSubmission
             | InboundLinkWorkspaceRequest
+            | InboundLinkDeviceToolResult
+            | InboundLinkDeviceToolStatus
         ),
     ) -> None:
         if isinstance(payload, InboundLinkWorkspaceRequest):
@@ -2125,6 +2164,26 @@ class LoopdyAdapter(BasePlatformAdapter):
                     except Exception:
                         # Optional update bookkeeping cannot break workspace delivery.
                         pass
+            return
+        if isinstance(payload, InboundLinkDeviceToolStatus):
+            bridge = self.device_tool_bridge
+            if bridge is not None:
+                bridge.accept_status(
+                    payload.status,
+                    sender_device_id=payload.sender_device_id,
+                    sender_epoch=payload.sender_epoch,
+                    target_device_id=payload.target_device_id,
+                )
+            return
+        if isinstance(payload, InboundLinkDeviceToolResult):
+            bridge = self.device_tool_bridge
+            if bridge is not None:
+                bridge.accept_result(
+                    payload.result,
+                    sender_device_id=payload.sender_device_id,
+                    sender_epoch=payload.sender_epoch,
+                    target_device_id=payload.target_device_id,
+                )
             return
         if isinstance(payload, InboundLinkGenerativeUIFormSubmission):
             response = await asyncio.to_thread(

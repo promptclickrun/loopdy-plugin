@@ -20,6 +20,25 @@ compatibility, but the app does not offer it for new selection.
 
 All modes support proactive messages even when no chat session is active.
 
+## Release 2.11.0 authenticated iPhone tools
+
+Adds `iphone_health`, `iphone_calendar`, and `iphone_reminders` through the
+existing end-to-end encrypted Loopdy Link connection. Each capability is off by
+default and must be enabled independently in Loopdy on the originating iPhone.
+Health is read-only; Calendar and Reminders support bounded list, create, update,
+and delete operations. The phone must be foregrounded, unlocked, connected, and
+selected for the authenticated Hermes host.
+
+Requests are directed to one verified phone and bind its authorization epoch,
+selected host, agent, session, turn, and tool call. The transport has no broadcast
+fallback. Updates and deletes require an exact item plus its expected revision;
+mutation identities and bounded outcomes are journaled to prevent blind duplicate
+writes, while Health, Calendar, and Reminder read contents are not retained in the
+plugin. This release requires the matching Hermes `ToolExecutionContext` runtime
+support and a Loopdy build advertising `directed-frames-v1`. See
+[iPhone device tools](docs/IPHONE_DEVICE_TOOLS.md) for the full security and privacy
+architecture.
+
 ## Release 2.10.0 voice settings and Project availability
 
 Adds agent-scoped `voice_settings.get` and `voice_settings.set` over the existing

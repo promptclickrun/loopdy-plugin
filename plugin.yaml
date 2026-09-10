@@ -2,7 +2,7 @@ manifest_version: 1
 name: loopdy
 label: Loopdy
 kind: platform
-version: "2.10.0"
+version: "2.11.0"
 license: Apache-2.0
 description: >
   Native Hermes platform for encrypted Loopdy Link chat and workspace controls,
@@ -39,6 +39,9 @@ provides_hooks:
   - kanban_task_completed
   - kanban_task_blocked
 provides_tools:
+  - iphone_health
+  - iphone_calendar
+  - iphone_reminders
   - loopdy_render_summary
   - loopdy_render_metrics
   - loopdy_render_list

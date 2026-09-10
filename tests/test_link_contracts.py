@@ -662,6 +662,35 @@ class LinkContractTests(unittest.TestCase):
         for operation in GROUPS_OPERATIONS:
             self.assertEqual(parse_workspace_request(wire(operation)).operation, operation)
 
+    def test_voice_settings_operations_are_allowlisted_and_advertise_the_feature(self) -> None:
+        from loopdy_plugin.link_contracts import (
+            WORKSPACE_OPERATIONS,
+            parse_workspace_request,
+            workspace_capabilities,
+        )
+
+        self.assertTrue({"voice_settings.get", "voice_settings.set"}.issubset(WORKSPACE_OPERATIONS))
+        self.assertIn("voice-settings-v1", workspace_capabilities()["features"])
+        for operation, payload in (
+            ("voice_settings.get", {"agentId": "default"}),
+            ("voice_settings.set", {
+                "agentId": "default",
+                "expectedRevision": "a" * 64,
+                "providerId": "openai",
+                "voiceId": "alloy",
+                "confirmed": True,
+            }),
+        ):
+            request = parse_workspace_request({
+                "version": 1,
+                "type": "workspace.request",
+                "requestId": f"voice-settings-{operation.replace('.', '-')}",
+                "operation": operation,
+                "payload": payload,
+                "sentAt": 1_788_000_300,
+            })
+            self.assertEqual(request.operation, operation)
+
     def test_project_git_requests_accept_only_fixed_operation_payloads(self) -> None:
         from loopdy_plugin.link_contracts import parse_workspace_request
 

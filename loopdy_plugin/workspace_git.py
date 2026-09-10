@@ -983,6 +983,19 @@ def _run_git_bounded(
     return bytes(stdout), False
 
 
+def _git_reports_non_repository(output: bytes) -> bool:
+    lines = output.decode("utf-8", "replace").lower().splitlines()
+    return any(
+        line.startswith(prefix)
+        for line in lines
+        for prefix in (
+            "fatal: not a git repository",
+            "fatal: --local can only be used inside a git repository",
+            "fatal: this operation must be run in a work tree",
+        )
+    )
+
+
 def _safe_git_config(root: Path, timeout: float) -> tuple[str, ...]:
     """Neutralize every configured external filter/text converter by its discovered driver name."""
     probe = subprocess.run(
@@ -1005,6 +1018,10 @@ def _safe_git_config(root: Path, timeout: float) -> tuple[str, ...]:
         timeout=timeout,
     )
     if probe.returncode not in {0, 1}:
+        if _git_reports_non_repository(probe.stderr):
+            raise WorkspaceGitError(
+                "PROJECT_NOT_REPOSITORY", "Workspace is not a Git repository"
+            )
         raise WorkspaceGitError("GIT_UNAVAILABLE", "Git configuration could not be safety-checked")
     filters: set[str] = set()
     diffs: set[str] = set()

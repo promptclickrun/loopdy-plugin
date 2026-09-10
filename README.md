@@ -20,6 +20,26 @@ compatibility, but the app does not offer it for new selection.
 
 All modes support proactive messages even when no chat session is active.
 
+## Release 2.10.0 voice settings and Project availability
+
+Adds agent-scoped `voice_settings.get` and `voice_settings.set` over the existing
+encrypted workspace transport, advertised by `voice-settings-v1`. Loopdy iOS
+2.0.1 (11) uses these for OpenAI and ElevenLabs provider, Voice ID, and API key
+settings. Hermes remains the synthesizer and owns provider selection, profile
+configuration and credential persistence. No new HTTP service or direct iOS
+provider integration is introduced.
+
+Reads expose the current provider and key-presence flags, never key material.
+Writes require the loaded revision and explicit confirmation; an omitted/blank
+key preserves the saved credential. Profile ownership, concurrent changes, readback
+and no-op behavior are validated before reporting success. The next synthesis uses
+saved settings without a restart. Installing this plugin version still requires
+the normal gateway activation step.
+
+Project Git returns `project_not_repository` only for a confirmed non-repository
+folder. The app presents N/A without Retry. `git_unavailable`, unsafe configuration,
+timeouts and actual repository failures retain their distinct errors.
+
 ## Release 2.9.1 compatibility
 
 Repairs Scheduled Tasks after Hermes moved its cron workers into

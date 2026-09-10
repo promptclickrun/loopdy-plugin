@@ -1352,9 +1352,9 @@ class HermesWorkspaceBackendTests(unittest.TestCase):
                     )
                 )
 
-        self.assertEqual(raised.exception.code, "git_unavailable")
+        self.assertEqual(raised.exception.code, "project_not_repository")
         self.assertEqual(
-            str(raised.exception), "Git is unavailable for this Project."
+            str(raised.exception), "This Project is not a Git repository."
         )
 
     def test_registered_hermes_project_defaults_to_read_only_git_status(self) -> None:

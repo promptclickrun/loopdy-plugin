@@ -184,6 +184,7 @@ class HermesWorkspaceBackend:
         ] = OrderedDict()
         self._skill_update_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._capability_update_lock = asyncio.Lock()
+        self._voice_settings_update_locks: dict[str, asyncio.Lock] = {}
         self._agent_catalog_compatibility = "unknown"
         self._installed_hermes_version = InstalledHermesVersion()
 
@@ -493,6 +494,21 @@ class HermesWorkspaceBackend:
         }
         await self._save_profile_config(agent_id, config)
         return {"agentId": agent_id, "defaults": defaults}
+
+    async def voice_settings_get(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from .voice_settings import get_voice_settings
+
+        return await get_voice_settings(self, payload)
+
+    async def voice_settings_set(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from .voice_settings import set_voice_settings
+
+        return await set_voice_settings(self, payload)
+
+    async def _voice_settings_key_status(self, agent_id: str) -> dict[str, Any]:
+        from .voice_settings import profile_key_status
+
+        return await profile_key_status(agent_id)
 
     async def skills_tools_list(self, payload: dict[str, Any]) -> dict[str, Any]:
         agent_id = _agent_payload_id(payload)
@@ -3238,6 +3254,7 @@ def _project_git_control_error(error: WorkspaceGitError) -> WorkspaceControlErro
         "UNSUPPORTED_PATH_ENCODING": ("diff_unavailable", "failed", "This Project path cannot be displayed."),
         "WORKSPACE_NOT_ALLOWED": ("project_unavailable", "failed", "Project Git is unavailable for this Project."),
         "OPERATION_NOT_ALLOWED": ("operation_disabled", "failed", "This Git operation is disabled by the host."),
+        "PROJECT_NOT_REPOSITORY": ("project_not_repository", "failed", "This Project is not a Git repository."),
         "GIT_UNAVAILABLE": ("git_unavailable", "failed", "Git is unavailable for this Project."),
         "GIT_TIMEOUT": ("git_timeout", "failed", "Git did not finish in time. Retry after refreshing."),
         "REMOTE_UNAVAILABLE": ("remote_unavailable", "failed", "The configured Git remote is unavailable."),
@@ -4231,6 +4248,8 @@ class WorkspaceController:
         "scheduled_tasks.run": "scheduled_tasks_run",
         "agent_defaults.get": "agent_defaults_get",
         "agent_defaults.set": "agent_defaults_set",
+        "voice_settings.get": "voice_settings_get",
+        "voice_settings.set": "voice_settings_set",
         "skills_tools.list": "skills_tools_list",
         "skills_tools.get": "skills_tools_get",
         "skills_tools.create": "skills_tools_create",

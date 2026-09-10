@@ -30,6 +30,74 @@ def git(root: Path, *args: str) -> str:
 
 
 class WorkspaceGitTests(unittest.TestCase):
+    def test_non_repository_root_has_a_dedicated_typed_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(WorkspaceGitError, "PROJECT_NOT_REPOSITORY"):
+                WorkspaceGitService(
+                    [{
+                        "workspace_id": "fixture",
+                        "label": "Fixture",
+                        "root": directory,
+                        "visibility": "private",
+                        "operations": ["status"],
+                        "remotes": [],
+                        "branches": [],
+                        "mutations_enabled": False,
+                    }],
+                    state_path=Path(directory) / "workspace-git.sqlite3",
+                )
+
+    def test_genuine_git_unavailable_failure_keeps_its_retryable_classification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(
+                workspace_git,
+                "_safe_git_config",
+                side_effect=WorkspaceGitError(
+                    "GIT_UNAVAILABLE", "Git configuration could not be safety-checked"
+                ),
+            ):
+                with self.assertRaisesRegex(WorkspaceGitError, "GIT_UNAVAILABLE"):
+                    WorkspaceGitService(
+                        [{
+                            "workspace_id": "fixture",
+                            "label": "Fixture",
+                            "root": directory,
+                            "visibility": "private",
+                            "operations": ["status"],
+                            "remotes": [],
+                            "branches": [],
+                            "mutations_enabled": False,
+                    }],
+                    state_path=Path(directory) / "workspace-git.sqlite3",
+                )
+
+    def test_corrupt_git_config_keeps_genuine_git_unavailable_classification(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="not a git repository ") as directory:
+            root = Path(directory) / "repo"
+            root.mkdir()
+            git(root, "init")
+            corrupt_config = Path(directory) / "corrupt-config"
+            corrupt_config.write_text(
+                "[core]\ninvalid config line\n", encoding="utf-8"
+            )
+            (root / ".git" / "config").write_text(
+                f"[include]\npath = {corrupt_config}\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(WorkspaceGitError, "GIT_UNAVAILABLE"):
+                WorkspaceGitService(
+                    [{
+                        "workspace_id": "fixture",
+                        "label": "Fixture",
+                        "root": str(root),
+                        "visibility": "private",
+                        "operations": ["status"],
+                        "remotes": [],
+                        "branches": [],
+                        "mutations_enabled": False,
+                    }],
+                    state_path=root / "workspace-git.sqlite3",
+                )
+
     def test_text_preview_crosses_real_backend_with_canonical_field(self) -> None:
         import asyncio
         from loopdy_plugin.workspace_control import HermesWorkspaceBackend

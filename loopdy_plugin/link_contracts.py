@@ -37,7 +37,7 @@ MAX_AGENT_ATTACHMENT_CHUNKS = (
 ) // MAX_ATTACHMENT_CHUNK_BYTES
 MAX_AVATAR_WORKSPACE_PLAINTEXT_BYTES = 2_800_000
 MAX_ENCRYPTED_FRAME_CHARACTERS = 4_000_000
-PLUGIN_VERSION = "2.9.1"
+PLUGIN_VERSION = "2.10.0"
 AVAILABLE_WIKI_OPERATIONS = available_wiki_operations()
 GROUPS_OPERATIONS = frozenset(
     {
@@ -90,6 +90,8 @@ WORKSPACE_OPERATIONS = frozenset(
         "scheduled_tasks.run",
         "agent_defaults.get",
         "agent_defaults.set",
+        "voice_settings.get",
+        "voice_settings.set",
         "skills_tools.list",
         "skills_tools.get",
         "skills_tools.create",
@@ -1607,7 +1609,7 @@ def workspace_capabilities() -> dict[str, Any]:
     wiki_operations = available_wiki_operations()
     features = [
         "workspace-rejected-v1", "backpressure-v1", "plugin-update-v1",
-        "host-runtime-diagnostics-v1",
+        "host-runtime-diagnostics-v1", "voice-settings-v1",
     ]
     if wiki_operations:
         features.append("wiki.v1")

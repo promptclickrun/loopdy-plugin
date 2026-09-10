@@ -331,6 +331,9 @@ class LoopdyAdapter(BasePlatformAdapter):
                 session_workspace_setter=self._set_link_session_workspace,
                 session_workspace_getter=self._get_link_session_workspace,
                 session_active_getter=self._is_link_session_active,
+                session_subagents_getter=(
+                    getattr(self.activity_broker, "subagent_snapshot", None)
+                ),
                 session_goal_getter=self.goal_snapshot_for_session,
                 session_runtime_getter=self.runtime_snapshot_for_session,
                 connection_id_getter=self._link_workspace_connection_id,

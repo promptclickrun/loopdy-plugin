@@ -77,9 +77,13 @@ class LinkActivityBroker:
         self._goal_snapshots: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._goal_published_at: dict[str, float] = {}
         self._todo_signatures: OrderedDict[str, str] = OrderedDict()
+        # Execution ownership survives socket detach, but never process exit.
+        # Durable historical starts are not evidence of still-running children.
         self._subagent_rosters: OrderedDict[
-            str, OrderedDict[str, dict[str, Any]]
+            tuple[str, str], OrderedDict[str, dict[str, Any]]
         ] = OrderedDict()
+        self._subagent_parent_turns: dict[tuple[str, str, str], str] = {}
+        self._subagent_observed_at = 0
         self._subagent_signatures: OrderedDict[str, str] = OrderedDict()
         self._live_state: dict[str, dict[str, Any]] = {}
 
@@ -130,7 +134,6 @@ class LinkActivityBroker:
             self._todo_signatures.clear()
             self._goal_snapshots.clear()
             self._goal_published_at.clear()
-            self._subagent_rosters.clear()
             self._subagent_signatures.clear()
         tasks = tuple(item for item in (task, context_task) if item is not None)
         for active_task in tasks:
@@ -613,30 +616,73 @@ class LinkActivityBroker:
                     self._todo_signatures.popitem(last=False)
             return delivered
 
+    def subagent_snapshot(
+        self, profile: str, stored_id: str, visible_id: str
+    ) -> dict[str, Any]:
+        """Current process-owned roster, including an authoritative empty result.
+
+        updatedAt is an ordering timestamp in milliseconds; startedAt remains
+        Unix seconds. No runtime fields or historical starts infer execution.
+        """
+        with self._status_lock:
+            if self.bound_link_session(stored_id):
+                for child_id in self._subagent_rosters.get((profile, stored_id), {}):
+                    turn = self._subagent_parent_turns.get((profile, stored_id, child_id))
+                    if turn:
+                        self.register_child_route(child_id, child_id, turn)
+            return self._subagent_snapshot_locked(profile, stored_id, visible_id)
+
+    def _subagent_snapshot_locked(
+        self, profile: str, stored_id: str, visible_id: str
+    ) -> dict[str, Any]:
+        self._subagent_observed_at = max(
+            int(time.time() * 1000), self._subagent_observed_at + 1
+        )
+        return session_subagents(
+            session_id=visible_id,
+            subagents=list(self._subagent_rosters.get((profile, stored_id), {}).values()),
+            updated_at=self._subagent_observed_at,
+        )
+
+    def subagent_origin(self, profile: str, child: str) -> tuple[str, str] | None:
+        with self._status_lock:
+            matches = [(parent, turn) for (owner_profile, parent, child_id), turn
+                       in self._subagent_parent_turns.items()
+                       if owner_profile == profile and child_id == child]
+            return matches[0] if len(matches) == 1 else None
+
     def publish_subagent_lifecycle(
         self,
         hook_name: str,
-        link_session_id: str,
+        link_session_id: str | None,
         snapshot: dict[str, Any],
         *,
         occurred_at: int,
+        profile: str = "default",
     ) -> bool:
-        """Reduce official child hooks into a bounded active-roster snapshot."""
+        """Reduce official child hooks independently of parent turn/transport."""
 
         child_session_id = _coordinate(snapshot.get("child_session_id"), 180)
-        if not child_session_id or hook_name not in {"subagent_start", "subagent_stop"}:
+        parent_session_id = _coordinate(snapshot.get("parent_session_id"), 128)
+        if not parent_session_id or not child_session_id or hook_name not in {"subagent_start", "subagent_stop"}:
             return False
+        owner = (profile, parent_session_id)
+        child_owner = (*owner, child_session_id)
         with self._status_lock:
-            parent_turn = _turn_coordinate(snapshot.get("parent_turn_id"))
+            parent_turn = self._subagent_parent_turns.get(child_owner) or _turn_coordinate(snapshot.get("parent_turn_id"))
+            if hook_name == "subagent_start" and parent_turn:
+                self._subagent_parent_turns[child_owner] = parent_turn
             parent_route = self.bound_link_session(
                 str(snapshot.get("parent_session_id") or "")
             )
             if hook_name == "subagent_start" and parent_route and parent_turn:
                 self.register_child_route(child_session_id, child_session_id, parent_turn)
+            if hook_name == "subagent_stop" and owner not in self._subagent_rosters:
+                return False
             roster = self._subagent_rosters.setdefault(
-                link_session_id, OrderedDict()
+                owner, OrderedDict()
             )
-            self._subagent_rosters.move_to_end(link_session_id)
+            self._subagent_rosters.move_to_end(owner)
             if hook_name == "subagent_start":
                 subagent_id = (
                     _coordinate(snapshot.get("child_subagent_id"), 180)
@@ -663,20 +709,23 @@ class LinkActivityBroker:
                 roster[child_session_id] = item
                 roster.move_to_end(child_session_id)
                 while len(roster) > 256:
-                    roster.popitem(last=False)
+                    expired_child, _ = roster.popitem(last=False)
+                    self._subagent_parent_turns.pop((*owner, expired_child), None)
             elif roster.pop(child_session_id, None) is None:
                 return False
             if hook_name == "subagent_stop":
                 self.remove_child_route(child_session_id)
+                self._subagent_parent_turns.pop(child_owner, None)
             while len(self._subagent_rosters) > self.maximum_bound_sessions:
-                expired_session, _ = self._subagent_rosters.popitem(last=False)
-                self._subagent_signatures.pop(expired_session, None)
+                expired_owner, expired_roster = self._subagent_rosters.popitem(last=False)
+                for expired_child in expired_roster:
+                    self._subagent_parent_turns.pop((*expired_owner, expired_child), None)
+            if not link_session_id:
+                return False
             try:
-                payload = session_subagents(
-                    session_id=link_session_id,
-                    subagents=list(roster.values()),
-                    updated_at=occurred_at,
-                )
+                # Live rosters carry the immutable parent ID, never a chat alias
+                # that a reset can reassign while these children still exist.
+                payload = self._subagent_snapshot_locked(profile, parent_session_id, parent_session_id)
                 signature = json.dumps(
                     payload["subagents"],
                     ensure_ascii=False,
@@ -692,6 +741,8 @@ class LinkActivityBroker:
             if delivered:
                 self._subagent_signatures[link_session_id] = signature
                 self._subagent_signatures.move_to_end(link_session_id)
+                while len(self._subagent_signatures) > self.maximum_bound_sessions:
+                    self._subagent_signatures.popitem(last=False)
             if parent_turn:
                 lifecycle = "running" if hook_name == "subagent_start" else _subagent_lifecycle(
                     snapshot.get("child_status")
@@ -929,6 +980,15 @@ def publish_hook_activity(
         turn_id = _turn_coordinate(payload.get("parent_turn_id"))
     if not session_id:
         return
+    if hook_name in {"subagent_start", "subagent_stop"}:
+        profile = _safe_text(payload.get("profile_name"), 80) or profile
+        origin_reader = getattr(broker, "subagent_origin", None)
+        if callable(origin_reader):
+            origin = origin_reader(profile, str(payload.get("child_session_id") or ""))
+            if isinstance(origin, tuple) and len(origin) == 2:
+                session_id = _coordinate(origin[0], 128) or session_id
+                turn_id = _turn_coordinate(origin[1]) or turn_id
+                payload = {**payload, "parent_session_id": session_id, "parent_turn_id": turn_id}
 
     if hook_name == "pre_llm_call":
         if not turn_id:
@@ -1031,7 +1091,7 @@ def publish_hook_activity(
             if snapshot is not None and callable(publisher):
                 publisher(bound_session_id, snapshot, occurred_at=timestamp)
 
-    if hook_name in {"subagent_start", "subagent_stop"} and bound_session_id:
+    if hook_name in {"subagent_start", "subagent_stop"}:
         publisher = getattr(broker, "publish_subagent_lifecycle", None)
         if callable(publisher):
             publisher(
@@ -1039,6 +1099,7 @@ def publish_hook_activity(
                 bound_session_id,
                 payload,
                 occurred_at=timestamp,
+                profile=profile,
             )
 
     if not link_session_id or not turn_id:

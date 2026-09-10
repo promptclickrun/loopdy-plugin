@@ -224,6 +224,7 @@ def register(
                 hook_name,
                 service=active_service,
                 profile=profile,
+                profile_getter=lambda: ctx.profile_name,
                 activity_broker=broker,
             ),
         )
@@ -391,8 +392,12 @@ def _deliver_hook(
     service: Any,
     profile: str,
     activity_broker: LinkActivityBroker | Any,
+    profile_getter: Any | None = None,
     **payload: Any,
 ) -> None:
+    if hook_name in {"subagent_start", "subagent_stop"} and callable(profile_getter):
+        # PluginContext resolves the current profile scope, not load-time defaults.
+        profile = str(profile_getter() or profile)
     if hook_name == "on_session_end":
         service.store.dismiss_attention_for_session(
             str(payload.get("session_id") or payload.get("task_id") or "")

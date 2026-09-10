@@ -142,6 +142,7 @@ class HermesWorkspaceBackend:
         session_workspace_setter: Any | None = None,
         session_workspace_getter: Any | None = None,
         session_active_getter: Any | None = None,
+        session_subagents_getter: Any | None = None,
         session_goal_getter: Any | None = None,
         session_runtime_getter: Any | None = None,
         connection_id_getter: Any | None = None,
@@ -157,6 +158,7 @@ class HermesWorkspaceBackend:
         self.session_workspace_setter = session_workspace_setter
         self.session_workspace_getter = session_workspace_getter
         self.session_active_getter = session_active_getter
+        self.session_subagents_getter = session_subagents_getter
         self.session_goal_getter = session_goal_getter
         self.session_runtime_getter = session_runtime_getter
         self.connection_id_getter = connection_id_getter
@@ -1326,8 +1328,16 @@ class HermesWorkspaceBackend:
                 goal = self.session_goal_getter(profile, preferred_visible_id, stored_id)
                 if inspect.isawaitable(goal):
                     goal = await goal
+            # Keep direct model generation distinct from delegated execution.
+            # This read follows the authenticated, profile-scoped catalog row,
+            # and never substitutes its potentially reused chat alias as owner.
+            subagents = (
+                self.session_subagents_getter(profile, stored_id, visible_id)
+                if callable(self.session_subagents_getter) else None
+            )
             sessions.append(
                 {
+                    **({"subagents": subagents} if subagents is not None else {}),
                     **({"goal": goal} if goal is not None else {}),
                     "storedId": stored_id,
                     "profile": profile,
@@ -1505,7 +1515,9 @@ class HermesWorkspaceBackend:
         runtime = None
         if offset == 0 and raw.get("session_id", stored_id) == stored_id:
             runtime = await self._session_runtime(stored_id, agent_id)
-        runtime_fields = {"runtime": runtime} if runtime else {}
+        runtime_fields: dict[str, Any] = {"runtime": runtime} if runtime else {}
+        if offset == 0 and raw.get("session_id", stored_id) == stored_id and callable(self.session_subagents_getter):
+            runtime_fields["subagents"] = self.session_subagents_getter(agent_id, stored_id, stored_id)
         duration_reader = getattr(getattr(self.service, "store", None), "turn_durations", None)
         try:
             durations = duration_reader(stored_id) if callable(duration_reader) else {}

@@ -1,8 +1,11 @@
 # iPhone tools for Hermes
 
-Status: implemented release candidate for Loopdy 2.0.1 (12) and plugin 2.11.0.
-Build 11 does not contain this feature. Deployment and physical-device acceptance
-must be recorded separately from source and simulator results.
+Status: released to internal TestFlight in Loopdy 2.0.1 (13), with plugin 2.11.0.
+Apple processing and membership in all four internal groups were verified on
+September 10, 2026 for build 504a2307-1bbb-4443-bd40-ee24b05bf660. Build 11 does
+not contain this feature; upload 12 failed processing. Physical-device
+Health/EventKit acceptance remains pending and is separate from source and
+simulator results.
 
 ## User contract
 
@@ -134,6 +137,14 @@ Permission, stale-owner, expired, unsupported, busy, stale-revision, unavailable
 persistence and uncertain outcomes remain distinct. Error strings must be bounded
 and sanitized. No operation should make the chat composer unusable or block the
 socket receive loop while an Apple permission prompt/query is pending.
+
+## Release metadata
+
+Keep both HealthKit usage-description keys in the app Info.plist because the
+shared authorization API is linked even for reads. The update description must
+truthfully state that Loopdy does not change Health data. Both authorization
+calls pass an empty toShare set; health.write is not an allowed operation.
+Do not mistake an Info.plist description for permission to add Health writes.
 
 ## Regression and acceptance requirements
 

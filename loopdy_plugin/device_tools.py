@@ -74,6 +74,11 @@ class DeviceToolBridge:
     def bind_link_client(self, link_client: Any | None) -> None:
         if link_client is not self.link_client:
             self._status.clear()
+            # A mutation outcome is only a safe replay for the authenticated
+            # Link owner that produced it.  Never let a newly bound client
+            # observe a prior client's cached result, even when the request
+            # coordinates happen to be otherwise identical.
+            self._outcomes.clear()
             for pending in self._pending.values():
                 if not pending.future.done():
                     pending.future.set_exception(DeviceToolError("owner_changed"))
@@ -176,6 +181,11 @@ class DeviceToolBridge:
         pending = self._pending.get(parsed["requestId"])
         if pending is None or not _same_coordinates(pending.request, parsed):
             return False
+        # A response cannot predate the request that originated it.  The
+        # builder enforces this for locally-created results; repeat the check
+        # here because inbound phone results are untrusted wire data.
+        if parsed["sentAt"] < pending.request["sentAt"]:
+            return False
         if not pending.future.done():
             pending.future.set_result(parsed)
         return True
@@ -224,7 +234,7 @@ class DeviceToolBridge:
             if DIRECTED_FRAMES_CAPABILITY not in set(getattr(client, "peer_capabilities", ())):
                 raise DeviceToolError("directed_frames_unavailable")
             request_id = _stable_request_id(
-                device_id, authorization_epoch, session_id, agent_id, turn_id, tool_call_id,
+                device_id, host_id, authorization_epoch, session_id, agent_id, turn_id, tool_call_id,
             )
             fingerprint = _request_fingerprint(operation, arguments)
             existing = self._pending.get(request_id)

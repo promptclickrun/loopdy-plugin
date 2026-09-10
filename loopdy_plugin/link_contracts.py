@@ -43,6 +43,9 @@ MAX_ENCRYPTED_FRAME_CHARACTERS = 4_000_000
 # a payload accepted here cannot be rejected after it reaches the phone.
 MAX_DEVICE_TOOL_PAYLOAD_BYTES = 20 * 1024
 MAX_DEVICE_TOOL_ARGUMENT_BYTES = 16 * 1024
+MAX_DEVICE_TOOL_DATE_RANGE_SECONDS = 31 * 24 * 60 * 60
+MAX_DEVICE_TOOL_LIST_LIMIT = 200
+MAX_DEVICE_TOOL_ID_COUNT = 50
 DEVICE_TOOL_CAPABILITY = "device-tools-v1"
 DIRECTED_FRAMES_CAPABILITY = "directed-frames-v1"
 DEVICE_TOOL_OPERATIONS = frozenset(
@@ -558,6 +561,10 @@ def device_tool_result(
     *, request: dict[str, Any], status: str, payload: dict[str, Any], sent_at: int,
     code: str | None = None,
 ) -> dict[str, Any]:
+    request = parse_device_tool_request(request)
+    result_sent_at = _positive(sent_at, "sentAt")
+    if result_sent_at < request["sentAt"]:
+        raise ValueError("Loopdy Link device tool result timestamp is invalid")
     result = {
         "version": 1,
         "type": "device.tool.result",
@@ -571,7 +578,7 @@ def device_tool_result(
         "operation": request["operation"],
         "status": status,
         "payload": payload,
-        "sentAt": sent_at,
+        "sentAt": result_sent_at,
     }
     if code is not None:
         result["code"] = code
@@ -2379,10 +2386,59 @@ def _device_tool_date(value: Any, field: str, *, required: bool = False) -> str 
     if raw is None:
         return None
     try:
-        datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Loopdy Link device tool {field} is invalid") from exc
     return raw
+
+
+def _device_tool_range(
+    value: dict[str, Any], *, required: bool
+) -> None:
+    has_start = "start" in value
+    has_end = "end" in value
+    has_time_zone = "timeZone" in value
+    if required or has_start or has_end or has_time_zone:
+        start = _device_tool_date(value.get("start"), "start", required=True)
+        end = _device_tool_date(value.get("end"), "end", required=True)
+        _device_tool_string(value.get("timeZone"), "timeZone", required=True, maximum=128)
+        start_date = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        end_date = datetime.fromisoformat(end.replace("Z", "+00:00"))
+        elapsed = (end_date - start_date).total_seconds()
+        if elapsed <= 0 or elapsed > MAX_DEVICE_TOOL_DATE_RANGE_SECONDS:
+            raise ValueError("Loopdy Link device tool date range is invalid")
+
+
+def _device_tool_ordered_dates(
+    value: dict[str, Any], start_field: str, end_field: str
+) -> None:
+    start = _device_tool_date(value.get(start_field), start_field, required=True)
+    end = _device_tool_date(value.get(end_field), end_field, required=True)
+    start_date = datetime.fromisoformat(start.replace("Z", "+00:00"))
+    end_date = datetime.fromisoformat(end.replace("Z", "+00:00"))
+    if end_date <= start_date:
+        raise ValueError("Loopdy Link device tool date range is invalid")
+
+
+def _device_tool_limit(value: Any) -> None:
+    if value is not None and (
+        type(value) is not int or not 1 <= value <= MAX_DEVICE_TOOL_LIST_LIMIT
+    ):
+        raise ValueError("Loopdy Link device tool limit is invalid")
+
+
+def _device_tool_id_list(value: dict[str, Any], field: str) -> None:
+    if field not in value:
+        return
+    ids = value[field]
+    if (
+        not isinstance(ids, list)
+        or not 1 <= len(ids) <= MAX_DEVICE_TOOL_ID_COUNT
+        or any(not isinstance(item, str) or not item or len(item) > 512 for item in ids)
+    ):
+        raise ValueError(f"Loopdy Link device tool {field} is invalid")
 
 
 def _device_tool_arguments(operation: str, value: Any) -> dict[str, Any]:
@@ -2412,26 +2468,22 @@ def _device_tool_arguments(operation: str, value: Any) -> dict[str, Any]:
         raise ValueError("Loopdy Link device tool arguments contain an unknown key")
     result = dict(value)
     if operation in {"health.read", "calendar.list"}:
-        _device_tool_date(result.get("start"), "start", required=True)
-        _device_tool_date(result.get("end"), "end", required=True)
-        _device_tool_string(result.get("timeZone"), "timeZone", required=True, maximum=128)
+        _device_tool_range(result, required=True)
+        _device_tool_limit(result.get("limit"))
+    if operation == "health.read" and "types" in result:
+        types = result["types"]
+        if (
+            not isinstance(types, list)
+            or not 1 <= len(types) <= len(HEALTH_TYPES)
+            or any(item not in HEALTH_TYPES for item in types)
+        ):
+            raise ValueError("Loopdy Link device tool types are invalid")
+    if operation == "calendar.list":
+        _device_tool_id_list(result, "calendarIDs")
     elif operation == "reminders.list":
-        has_range = any(field in result for field in ("start", "end", "timeZone"))
-        if has_range:
-            _device_tool_date(result.get("start"), "start", required=True)
-            _device_tool_date(result.get("end"), "end", required=True)
-            _device_tool_string(result.get("timeZone"), "timeZone", required=True, maximum=128)
-        if result.get("limit") is not None and (type(result["limit"]) is not int or not 1 <= result["limit"] <= 200):
-            raise ValueError("Loopdy Link device tool limit is invalid")
-        for field in ("calendarIDs", "listIDs"):
-            if field in result:
-                ids = result[field]
-                if not isinstance(ids, list) or not 1 <= len(ids) <= 50 or any(not isinstance(item, str) or not item or len(item) > 512 for item in ids):
-                    raise ValueError(f"Loopdy Link device tool {field} is invalid")
-        if "types" in result:
-            types = result["types"]
-            if not isinstance(types, list) or not 1 <= len(types) <= len(HEALTH_TYPES) or any(item not in HEALTH_TYPES for item in types):
-                raise ValueError("Loopdy Link device tool types are invalid")
+        _device_tool_range(result, required=False)
+        _device_tool_limit(result.get("limit"))
+        _device_tool_id_list(result, "listIDs")
         if "completed" in result and type(result["completed"]) is not bool:
             raise ValueError("Loopdy Link device tool completed is invalid")
         if "includeUndated" in result and type(result["includeUndated"]) is not bool:
@@ -2440,8 +2492,7 @@ def _device_tool_arguments(operation: str, value: Any) -> dict[str, Any]:
         _device_tool_string(result.get("title"), "title", required=True)
     if operation.startswith("calendar.") and operation != "calendar.list":
         if operation == "calendar.create":
-            _device_tool_date(result.get("start"), "start", required=True)
-            _device_tool_date(result.get("end"), "end", required=True)
+            _device_tool_ordered_dates(result, "start", "end")
             _device_tool_string(result.get("timeZone"), "timeZone", required=True, maximum=128)
         if operation in {"calendar.update", "calendar.delete"}:
             _device_tool_string(result.get("id"), "id", required=True, maximum=512)

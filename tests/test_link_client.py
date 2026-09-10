@@ -755,6 +755,79 @@ class LinkClientTests(unittest.TestCase):
             original["sequence"],
         )
 
+    def test_legacy_socket_ready_retires_persisted_directed_tool_without_replay(self) -> None:
+        from loopdy_plugin.link_client import LoopdyLinkClient
+        from loopdy_plugin.link_contracts import EncryptedFrame
+
+        _, config = self._configuration()
+        state = _State()
+        client = LoopdyLinkClient(config, state=state)
+        pending = EncryptedFrame(
+            frame_id="frame-directed-tool-legacy-0001",
+            sender_device_id=config.device_id,
+            sender_epoch=config.authorization_epoch,
+            sequence=1,
+            ack=0,
+            ciphertext=client.cipher.seal(
+                {
+                    "version": 1,
+                    "type": "device.tool.request",
+                    "requestId": "request-directed-tool-legacy-0001",
+                }
+            ),
+            target_device_id="phone-device-1",
+        ).wire_value()
+        state.set("link.transport.host-device-fixture.pending_frame", pending)
+
+        class LegacyConnection:
+            def __init__(self) -> None:
+                self.sent: list[dict] = []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                client._stopping.set()
+                return False
+
+            async def recv(self):
+                return json.dumps(
+                    {
+                        "version": 1,
+                        "type": "socket.ready",
+                        "deviceId": config.device_id,
+                        "authorizationEpoch": config.authorization_epoch,
+                        "lastInboundSequence": 0,
+                        "lastInboundFrameId": None,
+                        "lastAcknowledgedSequence": 0,
+                    }
+                )
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+            async def send(self, value):
+                self.sent.append(json.loads(value))
+
+        connection = LegacyConnection()
+
+        def connect(*_args, **_kwargs):
+            return connection
+
+        async def scenario() -> None:
+            with patch("websockets.asyncio.client.connect", new=connect):
+                await client._run(lambda _payload: None)
+
+        asyncio.run(scenario())
+
+        self.assertEqual(connection.sent, [])
+        self.assertIsNone(
+            state.get("link.transport.host-device-fixture.pending_frame")
+        )
+
     def test_two_clients_for_one_host_serialize_their_durable_outbound_sequence(self) -> None:
         from loopdy_plugin.link_client import LoopdyLinkClient
 

@@ -1707,6 +1707,25 @@ class LoopdyLinkClient:
             if future is not None and not future.done():
                 future.set_exception(TimeoutError("Loopdy Link delivery failed"))
             return
+        if (
+            pending.target_device_id is not None
+            and DIRECTED_FRAMES_CAPABILITY not in self.peer_capabilities
+        ):
+            # A legacy relay cannot preserve the recipient boundary for this
+            # frame. Retire it after readiness reconciliation instead of
+            # replaying it as a broadcast on the replacement socket.
+            self._backpressured_frame_id = None
+            self._transport_set("outbound_sequence", max(outbound, server_sequence))
+            self._transport_set("last_received_sequence", max(received, server_ack))
+            self._transport_set("pending_frame", None)
+            future = self._accepted.pop(pending.frame_id, None)
+            if future is not None and not future.done():
+                future.set_exception(
+                    ConnectionError(
+                        "Loopdy Link directed delivery was retired because the relay lacks directed frames"
+                    )
+                )
+            return
         self._transport_set("outbound_sequence", max(outbound, server_sequence))
         self._transport_set("last_received_sequence", max(received, server_ack))
         if pending.sequence == server_sequence + 1:

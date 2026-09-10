@@ -2881,7 +2881,7 @@ class HermesWorkspaceBackend:
         return await delete_session_endpoint(session_id, profile=agent_id)
 
     async def _cron_list(self, agent_id: str | None) -> list[dict[str, Any]]:
-        from hermes_cli.web_server import _list_cron_jobs_sync
+        from hermes_cli.web_routers.cron import _list_cron_jobs_sync
 
         return await asyncio.to_thread(_list_cron_jobs_sync, agent_id or "all")
 
@@ -2894,7 +2894,7 @@ class HermesWorkspaceBackend:
         self, agent_id: str, values: dict[str, Any]
     ) -> dict[str, Any]:
         from hermes_cli.web_models import CronJobCreate
-        from hermes_cli.web_server import _create_cron_job_sync
+        from hermes_cli.web_server_cron import _create_cron_job_sync
 
         return await asyncio.to_thread(
             _create_cron_job_sync,
@@ -2906,7 +2906,7 @@ class HermesWorkspaceBackend:
         self, task_id: str, agent_id: str, updates: dict[str, Any]
     ) -> dict[str, Any]:
         from hermes_cli.web_models import CronJobUpdate
-        from hermes_cli.web_server import _update_cron_job_sync
+        from hermes_cli.web_routers.cron import _update_cron_job_sync
 
         return await asyncio.to_thread(
             _update_cron_job_sync,
@@ -2916,22 +2916,22 @@ class HermesWorkspaceBackend:
         )
 
     async def _cron_pause(self, task_id: str, agent_id: str) -> dict[str, Any]:
-        from hermes_cli.web_server import _pause_cron_job_sync
+        from hermes_cli.web_routers.cron import _pause_cron_job_sync
 
         return await asyncio.to_thread(_pause_cron_job_sync, task_id, agent_id)
 
     async def _cron_resume(self, task_id: str, agent_id: str) -> dict[str, Any]:
-        from hermes_cli.web_server import _resume_cron_job_sync
+        from hermes_cli.web_routers.cron import _resume_cron_job_sync
 
         return await asyncio.to_thread(_resume_cron_job_sync, task_id, agent_id)
 
     async def _cron_run(self, task_id: str, agent_id: str) -> dict[str, Any]:
-        from hermes_cli.web_server import _trigger_cron_job_sync
+        from hermes_cli.web_routers.cron import _trigger_cron_job_sync
 
         return await asyncio.to_thread(_trigger_cron_job_sync, task_id, agent_id)
 
     async def _cron_delete(self, task_id: str, agent_id: str) -> None:
-        from hermes_cli.web_server import _delete_cron_job_sync
+        from hermes_cli.web_routers.cron import _delete_cron_job_sync
 
         await asyncio.to_thread(_delete_cron_job_sync, task_id, agent_id)
 

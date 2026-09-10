@@ -20,6 +20,17 @@ compatibility, but the app does not offer it for new selection.
 
 All modes support proactive messages even when no chat session is active.
 
+## Release 2.9.1 compatibility
+
+Repairs Scheduled Tasks after Hermes moved its cron workers into
+`hermes_cli.web_routers.cron` and `hermes_cli.web_server_cron`. List, create,
+edit, pause, resume, run and delete keep using Hermes' own workers. The compatibility
+regression imports the installed Hermes modules and exercises every bridge so a
+successful app build cannot hide a broken host import.
+
+The plugin must be installed and activated on the selected Hermes host; an iOS
+update alone does not repair the scheduler bridge.
+
 ## Release 2.9.0 compatibility
 
 Adds the official Hermes hosted-room `groups.*` operations to authenticated

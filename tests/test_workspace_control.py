@@ -45,6 +45,63 @@ class _Backend:
 
 
 class WorkspaceControllerTests(unittest.TestCase):
+    def test_scheduled_cron_bridge_uses_installed_hermes_worker_modules(self) -> None:
+        from hermes_cli import web_server_cron
+        from hermes_cli.web_routers import cron as cron_routes
+
+        backend = HermesWorkspaceBackend(service=SimpleNamespace())
+        listed = [{"id": "cron-job-0001"}]
+        created = {"id": "cron-job-0001", "name": "Morning weather"}
+        updated = {"id": "cron-job-0001", "name": "Updated weather"}
+
+        with (
+            patch.object(cron_routes, "_list_cron_jobs_sync", return_value=listed) as list_worker,
+            patch.object(web_server_cron, "_create_cron_job_sync", return_value=created) as create_worker,
+            patch.object(cron_routes, "_update_cron_job_sync", return_value=updated) as update_worker,
+            patch.object(cron_routes, "_pause_cron_job_sync", return_value={"paused": True}) as pause_worker,
+            patch.object(cron_routes, "_resume_cron_job_sync", return_value={"paused": False}) as resume_worker,
+            patch.object(cron_routes, "_trigger_cron_job_sync", return_value={"ran": True}) as run_worker,
+            patch.object(cron_routes, "_delete_cron_job_sync", return_value={"ok": True}) as delete_worker,
+        ):
+            self.assertEqual(asyncio.run(backend._cron_list("default")), listed)
+            self.assertEqual(
+                asyncio.run(backend._cron_create("default", {
+                    "name": "Morning weather",
+                    "prompt": "Summarize the weather.",
+                    "schedule": "0 8 * * * America/Chicago",
+                })),
+                created,
+            )
+            self.assertEqual(
+                asyncio.run(backend._cron_update(
+                    "cron-job-0001", "default", {"name": "Updated weather"}
+                )),
+                updated,
+            )
+            self.assertEqual(
+                asyncio.run(backend._cron_pause("cron-job-0001", "default")),
+                {"paused": True},
+            )
+            self.assertEqual(
+                asyncio.run(backend._cron_resume("cron-job-0001", "default")),
+                {"paused": False},
+            )
+            self.assertEqual(
+                asyncio.run(backend._cron_run("cron-job-0001", "default")),
+                {"ran": True},
+            )
+            asyncio.run(backend._cron_delete("cron-job-0001", "default"))
+
+        list_worker.assert_called_once_with("default")
+        self.assertEqual(create_worker.call_args.args[1], "default")
+        self.assertEqual(update_worker.call_args.args, (
+            "cron-job-0001", unittest.mock.ANY, "default"
+        ))
+        pause_worker.assert_called_once_with("cron-job-0001", "default")
+        resume_worker.assert_called_once_with("cron-job-0001", "default")
+        run_worker.assert_called_once_with("cron-job-0001", "default")
+        delete_worker.assert_called_once_with("cron-job-0001", "default")
+
     def test_session_project_identity_rejects_unbounded_folder_catalogs(self) -> None:
         catalog = {
             "projects": [{

@@ -20,6 +20,18 @@ compatibility, but the app does not offer it for new selection.
 
 All modes support proactive messages even when no chat session is active.
 
+## Release 2.11.1 iPhone Health argument validation
+
+Fixes `invalid_arguments` before a valid iPhone Health request reaches the phone.
+Hermes supplies composite `session:task:nonce` turn IDs; the plugin now preserves
+those IDs in requests and replies instead of rejecting their colons. The same
+correction applies to Calendar and Reminders. IDs remain bounded to 512 bytes,
+and authenticated ownership and exact reply correlation remain required.
+
+Update the host plugin to activate this fix. No new iOS build or permission reset
+is required. Regression tests cover the registered tools through the real bridge,
+the observed Health query formats, mismatched replies, and identifier bounds.
+
 ## Release 2.11.0 authenticated iPhone tools
 
 Adds `iphone_health`, `iphone_calendar`, and `iphone_reminders` through the

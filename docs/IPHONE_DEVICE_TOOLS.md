@@ -7,6 +7,10 @@ not contain this feature; upload 12 failed processing. Physical-device
 Health/EventKit acceptance remains pending and is separate from source and
 simulator results.
 
+Plugin 2.11.1 fixes pre-send `invalid_arguments` for valid Health queries by
+accepting Hermes' canonical composite turn IDs. Update the host plugin; build 13
+already accepts these IDs and does not require new permissions or an app update.
+
 ## User contract
 
 Permissions contains independent Apple Health, Calendar and Reminders controls.
@@ -43,7 +47,7 @@ Native harness is not required and is not treated as operational.
 | Component | Responsibility |
 | --- | --- |
 | Hermes `ToolExecutionContext` extension | Carries immutable authenticated ingress ownership to official plugin handlers and hooks, with official session/turn/tool-call IDs. |
-| Loopdy plugin 2.11.0 | Registers `iphone_health`, `iphone_calendar`, `iphone_reminders`; targets the verified originating phone and correlates results. |
+| Loopdy plugin 2.11.1 | Registers `iphone_health`, `iphone_calendar`, `iphone_reminders`; targets the verified originating phone and correlates results using canonical Hermes turn IDs. |
 | Link relay with `directed-frames-v1` | Negotiates exact-recipient delivery and queues only for that active paired device. Legacy sockets never receive a broadcast fallback. |
 | iOS `DeviceToolPermissions` | Persists opt-in grants and fences asynchronous work by scope/revision. |
 | iOS `DeviceToolCoordinator` | Validates envelopes, deadlines, ownership and grants; bounds concurrency and journals mutation outcomes. |
@@ -81,6 +85,14 @@ different arguments produces a conflict. The native request limit is 20 KB;
 the plugin additionally limits arguments to 16 KB. Native results are bounded
 to 128 KB. Host timeout is normally 30 seconds (bounded to 20–60 seconds);
 the native envelope permits no more than 120 seconds.
+
+Hermes turn coordinates are runtime identities such as `session:task:nonce`,
+not the relay's base64url-style device IDs. Preserve them verbatim in both request
+and result validation, including colon separators and the native 512-byte bound.
+Do not hash, strip separators, or regenerate turn IDs to pass validation. Keep
+the existing strict validators for device, host, session and request identities.
+Test the registered handler through the real bridge with composite turn IDs;
+tests using only a synthetic `turn-1` miss this integration boundary.
 
 Status is advisory. Every operation still checks the live native grant,
 foreground/protected-data state, selected host, account and expiry. Results

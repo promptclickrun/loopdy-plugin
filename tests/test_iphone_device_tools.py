@@ -9,6 +9,54 @@ from unittest.mock import AsyncMock
 
 
 class DeviceToolContractTests(unittest.TestCase):
+    def test_device_tool_round_trip_preserves_composite_hermes_turn_ids(self):
+        from loopdy_plugin.link_contracts import device_tool_request, device_tool_result
+
+        for turn_id in (
+            "session-1:session:loopdy_link:phone-1:9e4a120b",
+            "session-1:" + "t" * 493 + ":12345678",  # Native 512-byte boundary.
+        ):
+            with self.subTest(turn_id=turn_id):
+                request = device_tool_request(
+                    request_id="request-device-tool-turn", device_id="phone-1",
+                    host_id="host-1", authorization_epoch=7, session_id="session-1",
+                    agent_id="default", turn_id=turn_id, operation="health.read",
+                    arguments={
+                        "start": "2026-09-09T17:39:16.650462-05:00",
+                        "end": "2026-09-10T17:39:16.650462-05:00",
+                        "timeZone": "America/Chicago", "limit": 20,
+                        "types": ["step_count", "heart_rate", "sleep_analysis"],
+                    }, sent_at=100, expires_at=130,
+                )
+                response = device_tool_result(
+                    request=request, status="completed", payload={"items": []}, sent_at=101,
+                )
+                self.assertEqual(request["turnId"], turn_id)
+                self.assertEqual(response["turnId"], turn_id)
+
+    def test_device_tool_turn_ids_remain_bounded_and_reject_invalid_coordinates(self):
+        from loopdy_plugin.link_contracts import (
+            device_tool_request, device_tool_result, parse_device_tool_request,
+            parse_device_tool_result,
+        )
+
+        request = device_tool_request(
+            request_id="request-device-tool-turn", device_id="phone-1",
+            host_id="host-1", authorization_epoch=7, session_id="session-1",
+            agent_id="default", turn_id="turn-1", operation="reminders.list",
+            arguments={}, sent_at=100, expires_at=130,
+        )
+        response = device_tool_result(
+            request=request, status="completed", payload={"items": []}, sent_at=101,
+        )
+        for turn_id in (None, True, 123, "", "t" * 513, "turn\n1", "turn\x001",
+                        "turn\x7f1", "turn 1", "turn/1", "turn\u202e1"):
+            with self.subTest(turn_id=turn_id):
+                with self.assertRaises(ValueError):
+                    parse_device_tool_request({**request, "turnId": turn_id})
+                with self.assertRaises(ValueError):
+                    parse_device_tool_result({**response, "turnId": turn_id})
+
     def test_device_tool_request_and_result_are_strict_and_correlated(self):
         from loopdy_plugin.link_contracts import (
             device_tool_request,
@@ -238,6 +286,66 @@ class DeviceToolContractTests(unittest.TestCase):
 
 
 class DeviceToolHandlerTests(unittest.TestCase):
+    def test_registered_phone_tools_complete_with_canonical_hermes_turn_coordinates(self):
+        from loopdy_plugin.device_tools import DeviceToolBridge, register
+        from loopdy_plugin.link_contracts import device_tool_result, device_tool_status
+
+        turn_id = "session-1:session:loopdy_link:phone-1:9e4a120b"
+        queries = (
+            ("iphone_health", "health.read", {
+                "start": "2026-09-10T00:00:00-05:00",
+                "end": "2026-09-10T17:39:16-05:00",
+                "timeZone": "America/Chicago", "limit": 10, "types": ["step_count"],
+            }),
+            ("iphone_calendar", "calendar.list", {
+                "operation": "list", "start": "2026-09-10T00:00:00-05:00",
+                "end": "2026-09-10T17:39:16-05:00", "timeZone": "America/Chicago",
+            }),
+            ("iphone_reminders", "reminders.list", {"operation": "list"}),
+        )
+        for name, operation, arguments in queries:
+            with self.subTest(tool=name):
+                sent = []
+                accepted = []
+                bridge = None
+
+                class Client:
+                    connected = True
+                    peer_capabilities = {"directed-frames-v1"}
+                    config = SimpleNamespace(device_id="host-1")
+
+                    async def send_payload(self, request, **kwargs):
+                        sent.append((request, kwargs))
+                        result = device_tool_result(
+                            request=request, status="completed", payload={"items": []}, sent_at=101,
+                        )
+                        for candidate in ({**result, "turnId": turn_id + "-other"}, result):
+                            accepted.append(bridge.accept_result(
+                                candidate, sender_device_id="phone-1", sender_epoch=7,
+                                target_device_id="host-1",
+                            ))
+
+                bridge = DeviceToolBridge(Client(), clock=lambda: 100)
+                bridge.accept_status(device_tool_status(
+                    device_id="phone-1", host_id="host-1", authorization_epoch=7,
+                    enabled=["health", "calendar", "reminders"], available=True, sent_at=100,
+                ), sender_device_id="phone-1", sender_epoch=7, target_device_id="host-1")
+                registry = SimpleNamespace(tools={})
+                registry.register_tool = lambda *, name, handler, **kwargs: registry.tools.update({name: handler})
+                register(registry, bridge=bridge)
+                result = json.loads(asyncio.run(registry.tools[name](
+                    arguments, tool_execution_context=self._execution_context(),
+                    session_id="session-1", turn_id=turn_id, tool_call_id="call-1",
+                )))
+                self.assertEqual(result["status"], "completed", result)
+                self.assertEqual(result["payload"], {"items": []})
+                self.assertEqual(result["turnId"], turn_id)
+                self.assertEqual(accepted, [False, True])
+                self.assertEqual(len(sent), 1)
+                self.assertEqual(sent[0][0]["turnId"], turn_id)
+                self.assertEqual(sent[0][0]["operation"], operation)
+                self.assertEqual(sent[0][1]["target_device_id"], "phone-1")
+
     @staticmethod
     def _execution_context(*, source="loopdy_link", owner_id="phone-1", scope_id="finance", epoch=7, attributes=None):
         from tool_execution_context import ToolExecutionContext

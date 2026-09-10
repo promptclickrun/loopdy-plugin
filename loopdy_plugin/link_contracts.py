@@ -527,7 +527,7 @@ def parse_device_tool_request(value: Any) -> dict[str, Any]:
     epoch = _positive(value.get("authorizationEpoch"), "authorizationEpoch")
     session_id = _session_coordinate(value.get("sessionId"))
     agent_id = _opaque(value.get("agentId"), "agentId", 1, 96)
-    turn_id = _opaque(value.get("turnId"), "turnId", 1, 128)
+    turn_id = _device_tool_turn_id(value.get("turnId"))
     operation = value.get("operation")
     if not isinstance(operation, str) or operation not in DEVICE_TOOL_OPERATIONS:
         raise ValueError("Loopdy Link device tool operation is invalid")
@@ -620,7 +620,7 @@ def parse_device_tool_result(
         authorizationEpoch=_positive(value.get("authorizationEpoch"), "authorizationEpoch"),
         sessionId=_session_coordinate(value.get("sessionId")),
         agentId=_opaque(value.get("agentId"), "agentId", 1, 96),
-        turnId=_opaque(value.get("turnId"), "turnId", 1, 128),
+        turnId=_device_tool_turn_id(value.get("turnId")),
         operation=_device_tool_operation(value.get("operation")),
         payload=payload,
         sentAt=_positive(value.get("sentAt"), "sentAt"),
@@ -2342,6 +2342,18 @@ def _avatar_payload(value: Any) -> dict[str, Any]:
     if len(blob) != byte_count:
         raise ValueError("Loopdy Link workspace payload is invalid")
     return avatar
+
+
+def _device_tool_turn_id(value: Any) -> str:
+    # Hermes uses session:task:nonce turn coordinates. Preserve the official
+    # identity on both sides of the phone round trip; do not hash or strip it.
+    # ASCII keeps the bound equal to iOS DeviceToolCoordinator's 512-byte limit.
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"[A-Za-z0-9_:-]{1,512}", value) is None
+    ):
+        raise ValueError("Loopdy Link device tool turnId is invalid")
+    return value
 
 
 def _device_tool_operation(value: Any) -> str:

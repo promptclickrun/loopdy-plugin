@@ -8,6 +8,27 @@ from types import SimpleNamespace
 
 
 class ActivityBridgeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_detached_children_keep_parent_owned_roster_until_last_stop(self):
+        from loopdy_plugin.activity_bridge import LinkActivityBroker
+        broker = LinkActivityBroker()
+        for child in ('child-a', 'child-b'):
+            broker.publish_subagent_lifecycle('subagent_start', None,
+                {'parent_session_id': 'parent', 'parent_turn_id': 'turn-a',
+                 'child_session_id': child, 'child_goal': 'Work', 'child_role': 'worker'},
+                occurred_at=1, profile='default')
+        first = broker.subagent_snapshot('default', 'parent', 'visible')
+        self.assertEqual(len(first['subagents']), 2)
+        self.assertEqual(broker.subagent_snapshot('other', 'parent', 'visible')['subagents'], [])
+        for remaining, child in ((1, 'child-a'), (0, 'child-b')):
+            broker.publish_subagent_lifecycle('subagent_stop', None,
+                {'parent_session_id': 'parent', 'parent_turn_id': 'turn-b',
+                 'child_session_id': child, 'child_status': 'failed'},
+                occurred_at=2, profile='default')
+            current = broker.subagent_snapshot('default', 'parent', 'visible')
+            self.assertEqual(len(current['subagents']), remaining)
+            self.assertGreater(current['updatedAt'], first['updatedAt'])
+
+
     async def test_goal_observations_preserve_tombstones_and_unavailable_is_not_absence(self):
         from loopdy_plugin.activity_bridge import LinkActivityBroker
         broker = LinkActivityBroker()

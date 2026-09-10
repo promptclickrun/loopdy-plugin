@@ -33,6 +33,7 @@ from .link_contracts import (
     MAX_ATTACHMENT_CHUNK_BYTES,
     PLUGIN_VERSION,
     AVAILABLE_WIKI_OPERATIONS,
+    GROUPS_OPERATIONS,
     WORKSPACE_OPERATIONS,
     WorkspaceRequest,
     _workspace_json,
@@ -2452,6 +2453,69 @@ class HermesWorkspaceBackend:
 
         return await asyncio.to_thread(dispatch)
 
+    async def _groups_request(self, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Forward Hermes' native hosted-room RPC without reimplementing it."""
+        return await self._hermes_request(
+            operation,
+            payload,
+            unavailable_message="Hermes native Bot Mode is unavailable on this gateway",
+            request_id=f"loopdy-{operation}",
+        )
+
+    async def groups_capabilities(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._groups_request("groups.capabilities", payload)
+
+    async def groups_list(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._groups_request("groups.list", payload)
+
+    async def groups_create(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._groups_request("groups.create", payload)
+
+    async def groups_state(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._groups_request("groups.state", payload)
+
+    async def groups_send(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._groups_request("groups.send", payload)
+
+    async def groups_rename(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._groups_request("groups.rename", payload)
+
+    async def groups_log(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._groups_request("groups.log", payload)
+
+    async def groups_disband(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._groups_request("groups.disband", payload)
+
+    async def groups_replicate(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._groups_request("groups.replicate", payload)
+
+    async def groups_replica_state(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._groups_request("groups.replica_state", payload)
+
+    async def groups_promote(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._groups_request("groups.promote", payload)
+
+    async def groups_demote(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._groups_request("groups.demote", payload)
+
+    async def groups_stop(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._groups_request("groups.stop", payload)
+
+    async def groups_retry(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._groups_request("groups.retry", payload)
+
+    async def groups_approve(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._groups_request("groups.approve", payload)
+
+    async def groups_peer_invite(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._groups_request("groups.peer.invite", payload)
+
+    async def groups_peer_revoke(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._groups_request("groups.peer.revoke", payload)
+
+    async def groups_peer_register(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._groups_request("groups.peer.register", payload)
+
     async def _profile_config(self, agent_id: str) -> dict[str, Any]:
         try:
             result = await self._hermes_request(
@@ -4194,6 +4258,7 @@ class WorkspaceController:
         "approvals.load": "approvals_load",
         "approvals.respond": "approvals_respond",
         "clarifications.respond": "clarifications_respond",
+        **{operation: operation.replace(".", "_") for operation in GROUPS_OPERATIONS},
     }
 
     def __init__(self, *, backend: Any, wiki_transport: WikiTransport | None = None):

@@ -626,7 +626,7 @@ class LinkContractTests(unittest.TestCase):
             )
 
     def test_project_git_operations_are_explicitly_allowlisted(self) -> None:
-        from loopdy_plugin.link_contracts import WORKSPACE_OPERATIONS
+        from loopdy_plugin.link_contracts import GROUPS_OPERATIONS, WORKSPACE_OPERATIONS
 
         operations = (
             "projects.git.capabilities",
@@ -636,6 +636,31 @@ class LinkContractTests(unittest.TestCase):
             "projects.git.execute",
         )
         self.assertTrue(set(operations).issubset(WORKSPACE_OPERATIONS))
+
+    def test_native_groups_operations_are_allowlisted_and_advertised(self) -> None:
+        from loopdy_plugin.link_contracts import (
+            GROUPS_OPERATIONS,
+            WORKSPACE_OPERATIONS,
+            parse_workspace_request,
+            workspace_capabilities,
+        )
+
+        capabilities = workspace_capabilities()
+        self.assertEqual(set(GROUPS_OPERATIONS).intersection(capabilities["operations"]), set(GROUPS_OPERATIONS))
+        self.assertTrue(GROUPS_OPERATIONS.issubset(WORKSPACE_OPERATIONS))
+
+        def wire(operation: str) -> dict:
+            return {
+                "version": 1,
+                "type": "workspace.request",
+                "requestId": "groups_request_coordinate_0001",
+                "operation": operation,
+                "payload": {"room_id": "room_coordinate_0001"},
+                "sentAt": 1_788_000_200,
+            }
+
+        for operation in GROUPS_OPERATIONS:
+            self.assertEqual(parse_workspace_request(wire(operation)).operation, operation)
 
     def test_project_git_requests_accept_only_fixed_operation_payloads(self) -> None:
         from loopdy_plugin.link_contracts import parse_workspace_request

@@ -20,6 +20,18 @@ compatibility, but the app does not offer it for new selection.
 
 All modes support proactive messages even when no chat session is active.
 
+## Release 2.9.0 compatibility
+
+Adds the official Hermes hosted-room `groups.*` operations to authenticated
+Loopdy Link workspace control for Loopdy iOS 2.0.1 (9). Hermes owns room execution,
+typed history, task retry and stop. Clients must negotiate protocol 2 and a
+running driver before enabling Bot Mode. This does not implement or replace the
+separate Loopdy Native harness under development.
+
+Publish and activate the plugin separately from the iOS TestFlight build. Use
+`hermes loopdy update --restart` and verify the completed updater receipt plus
+live groups capabilities. Existing account, Wiki and activity fixes are retained.
+
 ## Release 2.8.0 compatibility
 
 This release aligns the host with Loopdy app 1.8.0: exact-call generated image

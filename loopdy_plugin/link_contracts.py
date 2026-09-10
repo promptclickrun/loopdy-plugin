@@ -37,11 +37,34 @@ MAX_AGENT_ATTACHMENT_CHUNKS = (
 ) // MAX_ATTACHMENT_CHUNK_BYTES
 MAX_AVATAR_WORKSPACE_PLAINTEXT_BYTES = 2_800_000
 MAX_ENCRYPTED_FRAME_CHARACTERS = 4_000_000
-PLUGIN_VERSION = "2.8.0"
+PLUGIN_VERSION = "2.9.0"
 AVAILABLE_WIKI_OPERATIONS = available_wiki_operations()
+GROUPS_OPERATIONS = frozenset(
+    {
+        "groups.capabilities",
+        "groups.list",
+        "groups.create",
+        "groups.state",
+        "groups.send",
+        "groups.rename",
+        "groups.log",
+        "groups.disband",
+        "groups.replicate",
+        "groups.replica_state",
+        "groups.promote",
+        "groups.demote",
+        "groups.stop",
+        "groups.retry",
+        "groups.approve",
+        "groups.peer.invite",
+        "groups.peer.revoke",
+        "groups.peer.register",
+    }
+)
 WORKSPACE_OPERATIONS = frozenset(
     {
         *AVAILABLE_WIKI_OPERATIONS,
+        *GROUPS_OPERATIONS,
         "agents.list",
         "host_runtime.status",
         "plugin_update.start",
@@ -2315,6 +2338,7 @@ __all__ = [
     "VoiceSpeakRequest",
     "WorkspaceRequest",
     "AVAILABLE_WIKI_OPERATIONS",
+    "GROUPS_OPERATIONS",
     "WORKSPACE_OPERATIONS",
     "activity_event",
     "assistant_message",

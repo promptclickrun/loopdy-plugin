@@ -211,6 +211,35 @@ class WorkspaceControllerTests(unittest.TestCase):
             self.assertEqual(result["handler"], expected_handler)
             self.assertEqual(backend.calls[-1], (expected_handler, {"sequence": index}))
 
+    def test_native_groups_methods_forward_exactly_to_hermes_json_rpc(self) -> None:
+        from loopdy_plugin.link_contracts import GROUPS_OPERATIONS
+
+        backend = HermesWorkspaceBackend(service=object())
+        calls: list[tuple[str, dict, str | None]] = []
+
+        async def request(
+            operation: str,
+            payload: dict,
+            *,
+            unavailable_message: str,
+            request_id: str | None = None,
+        ) -> dict:
+            calls.append((operation, payload, request_id))
+            return {"native": operation}
+
+        backend._hermes_request = request
+        for operation in sorted(GROUPS_OPERATIONS):
+            handler = getattr(backend, operation.replace(".", "_"))
+            payload = {"room_id": f"room-{operation.replace('.', '-')}-0001"}
+            self.assertEqual(asyncio.run(handler(payload)), {"native": operation})
+
+        self.assertEqual([call[0] for call in calls], sorted(GROUPS_OPERATIONS))
+        self.assertEqual([call[1] for call in calls], [
+            {"room_id": f"room-{operation.replace('.', '-')}-0001"}
+            for operation in sorted(GROUPS_OPERATIONS)
+        ])
+        self.assertTrue(all(call[2] == f"loopdy-{call[0]}" for call in calls))
+
     def test_agent_attachments_resolve_and_fetch_in_bounded_profile_scoped_chunks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -667,6 +667,7 @@ class LinkActivityBroker:
         if not parent_session_id or not child_session_id or hook_name not in {"subagent_start", "subagent_stop"}:
             return False
         owner = (profile, parent_session_id)
+        signature_key = f"{profile}\x1f{parent_session_id}"
         child_owner = (*owner, child_session_id)
         with self._status_lock:
             parent_turn = self._subagent_parent_turns.get(child_owner) or _turn_coordinate(snapshot.get("parent_turn_id"))
@@ -735,12 +736,12 @@ class LinkActivityBroker:
             except (TypeError, ValueError):
                 logger.warning("Hermes subagent roster was invalid")
                 return False
-            if self._subagent_signatures.get(link_session_id) == signature:
+            if self._subagent_signatures.get(signature_key) == signature:
                 return False
             delivered = self.publish(payload)
             if delivered:
-                self._subagent_signatures[link_session_id] = signature
-                self._subagent_signatures.move_to_end(link_session_id)
+                self._subagent_signatures[signature_key] = signature
+                self._subagent_signatures.move_to_end(signature_key)
                 while len(self._subagent_signatures) > self.maximum_bound_sessions:
                     self._subagent_signatures.popitem(last=False)
             if parent_turn:

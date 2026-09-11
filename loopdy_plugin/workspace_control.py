@@ -1482,8 +1482,11 @@ class HermesWorkspaceBackend:
         values = _object(payload, "workspace payload")
         if not {"storedId", "agentId"}.issubset(values) or set(values) - {"storedId", "agentId", "cursor"}:
             raise WorkspaceControlError("Session state payload is invalid", code="session_state_invalid")
-        stored_id = _coordinate(values["storedId"], 160)
-        agent_id = _agent_id(values["agentId"])
+        try:
+            stored_id = _coordinate(values["storedId"], 160)
+            agent_id = _agent_id(values["agentId"])
+        except WorkspaceControlError as exc:
+            raise WorkspaceControlError("Session state scope is invalid.", code="session_state_invalid") from exc
         cursor = values.get("cursor")
         reader = SessionStateReader()
         try:
@@ -1515,8 +1518,11 @@ class HermesWorkspaceBackend:
         values = _object(payload, "workspace payload")
         if not {"storedId", "agentId", "reference"}.issubset(values) or set(values) - {"storedId", "agentId", "reference", "offset"}:
             raise WorkspaceControlError("Session content payload is invalid", code="session_state_invalid")
-        stored_id = _coordinate(values["storedId"], 160)
-        agent_id = _agent_id(values["agentId"])
+        try:
+            stored_id = _coordinate(values["storedId"], 160)
+            agent_id = _agent_id(values["agentId"])
+        except WorkspaceControlError as exc:
+            raise WorkspaceControlError("Session content scope is invalid.", code="session_state_invalid") from exc
         try:
             return await SessionStateReader().content_profile(
                 agent_id=agent_id, stored_id=stored_id, reference=values["reference"], offset=values.get("offset", 0),

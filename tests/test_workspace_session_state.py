@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,9 +24,11 @@ class WorkspaceSessionStateTests(unittest.IsolatedAsyncioTestCase):
         self.backend._session_catalog = AsyncMock(return_value={"sessions": [{"id": "stored-one", "chat_id": "visible-one"}]})
         self.backend._session_messages = AsyncMock(side_effect=AssertionError("Legacy transcript read"))
         self.opener = patch("hermes_cli.web_routers.sessions._with_db", side_effect=self.open_db)
+        self.opener_threads = []
         self.opener.start()
 
     def open_db(self, profile, callback, *, read_only):
+        self.opener_threads.append(threading.get_ident())
         self.assertEqual(profile, "default")
         self.assertTrue(read_only)
         return callback(self.db)
@@ -50,6 +53,7 @@ class WorkspaceSessionStateTests(unittest.IsolatedAsyncioTestCase):
         self.backend._session_catalog.assert_not_called()
         self.assertIn("sessions.state", workspace_capabilities()["operations"])
         self.assertIn("sessions.content", workspace_capabilities()["operations"])
+        self.assertIn("session-state-v1", workspace_capabilities()["features"])
 
     async def test_initial_visible_alias_uses_only_the_exact_profile_catalog(self):
         page = await self.request("sessions.state", storedId="visible-one")
@@ -86,6 +90,8 @@ class WorkspaceSessionStateTests(unittest.IsolatedAsyncioTestCase):
                 break
             offset = part["nextOffset"]
         self.assertEqual(json.loads("".join(chunks))["content"], content)
+        self.assertTrue(self.opener_threads)
+        self.assertTrue(all(thread != threading.get_ident() for thread in self.opener_threads))
 
     async def test_no_unknown_fields_or_bool_offsets_are_accepted(self):
         for operation, fields in [("sessions.state", {"url": "https://example.com"}),
@@ -93,10 +99,17 @@ class WorkspaceSessionStateTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(operation=operation), self.assertRaises(WorkspaceControlError):
                 await self.request(operation, **fields)
 
+    async def test_top_level_scope_errors_have_the_state_error_code(self):
+        for operation in ("sessions.state", "sessions.content"):
+            for fields in ({"storedId": None}, {"agentId": 4}):
+                with self.subTest(operation=operation, fields=fields), self.assertRaises(WorkspaceControlError) as failure:
+                    options = {"reference": {}} if operation == "sessions.content" else {}
+                    await self.request(operation, **options, **fields)
+                self.assertEqual(failure.exception.code, "session_state_invalid")
+
     async def test_state_index_failure_is_explicit_and_never_loads_legacy_history(self):
         with patch.object(self.db, "_ensure_display_order", return_value=False):
             with self.assertRaises(WorkspaceControlError) as failure:
                 await self.request("sessions.state")
         self.assertEqual(failure.exception.code, "session_state_unavailable")
         self.backend._session_messages.assert_not_called()
-

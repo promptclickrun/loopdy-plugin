@@ -20,6 +20,16 @@ compatibility, but the app does not offer it for new selection.
 
 All modes support proactive messages even when no chat session is active.
 
+## Host context compatibility
+
+Ordinary Link chat does not require the optional Hermes `ToolExecutionContext`
+extension. The adapter adds the runtime-only context argument only when the host
+exports its context type and `MessageEvent` accepts that field. Hosts without
+both parts keep normal chat, attachment and busy-input routing; the iPhone tool
+registrations remain unavailable rather than falling back to unverified metadata.
+Do not patch Hermes core to enable those tools. Installation and gateway restart
+are separate steps when applying this compatibility fix.
+
 ## Release 2.11.2 iPhone tool delivery
 
 Fixes immediate `delivery_uncertain` failures after iPhone permissions and query

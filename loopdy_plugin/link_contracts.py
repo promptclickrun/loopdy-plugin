@@ -117,6 +117,8 @@ WORKSPACE_OPERATIONS = frozenset(
         "agents.avatar.set",
         "sessions.list",
         "sessions.history",
+        "sessions.state",
+        "sessions.content",
         "sessions.update",
         "sessions.delete",
         "attachments.resolve",
@@ -1880,7 +1882,7 @@ def workspace_capabilities() -> dict[str, Any]:
     wiki_operations = available_wiki_operations()
     features = [
         "workspace-rejected-v1", "backpressure-v1", "plugin-update-v1",
-        "host-runtime-diagnostics-v1", "voice-settings-v1",
+        "host-runtime-diagnostics-v1", "voice-settings-v1", "session-state-v1",
     ]
     if wiki_operations:
         features.append("wiki.v1")

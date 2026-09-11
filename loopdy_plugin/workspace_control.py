@@ -42,6 +42,8 @@ from .workspace_git import WorkspaceGitError, WorkspaceGitService
 from . import workspace_capabilities
 from .wiki_service import WikiServiceError
 from .wiki_transport import WikiRequestContext, WikiTransport
+from .session_state import (SessionStateReader, SessionStateNotFound,
+                            SessionStateResetRequired, SessionStateUnavailable)
 
 
 class WorkspaceControlError(RuntimeError):
@@ -1474,6 +1476,56 @@ class HermesWorkspaceBackend:
         except Exception:
             # Unavailable/legacy optional metadata must not strand history.
             return None
+
+    async def sessions_state(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Opt-in canonical pages; never fall back to a legacy full transcript."""
+        values = _object(payload, "workspace payload")
+        if not {"storedId", "agentId"}.issubset(values) or set(values) - {"storedId", "agentId", "cursor"}:
+            raise WorkspaceControlError("Session state payload is invalid", code="session_state_invalid")
+        stored_id = _coordinate(values["storedId"], 160)
+        agent_id = _agent_id(values["agentId"])
+        cursor = values.get("cursor")
+        reader = SessionStateReader()
+        try:
+            try:
+                result = await reader.read_profile(agent_id=agent_id, stored_id=stored_id, cursor=cursor)
+            except SessionStateNotFound:
+                if cursor is not None:
+                    raise
+                catalog = _object(await self._session_catalog(agent_id), "Hermes session catalog")
+                resolved = _stored_session_id_for_visible(catalog, stored_id)
+                if resolved is None or resolved == stored_id:
+                    raise
+                result = await reader.read_profile(agent_id=agent_id, stored_id=resolved)
+        except SessionStateResetRequired as exc:
+            raise WorkspaceControlError("Session changed. Reload its current state.",
+                                        code="session_state_reset", status="conflict") from exc
+        except SessionStateUnavailable as exc:
+            raise WorkspaceControlError("Hermes session state is not ready.", code="session_state_unavailable") from exc
+        except ValueError as exc:
+            raise WorkspaceControlError("Session state coordinate is invalid.", code="session_state_invalid") from exc
+        result["sessionId"] = stored_id
+        if cursor is None:
+            runtime = await self._session_runtime(result["storedId"], agent_id)
+            if runtime:
+                result["runtime"] = runtime
+        return result
+
+    async def sessions_content(self, payload: dict[str, Any]) -> dict[str, Any]:
+        values = _object(payload, "workspace payload")
+        if not {"storedId", "agentId", "reference"}.issubset(values) or set(values) - {"storedId", "agentId", "reference", "offset"}:
+            raise WorkspaceControlError("Session content payload is invalid", code="session_state_invalid")
+        stored_id = _coordinate(values["storedId"], 160)
+        agent_id = _agent_id(values["agentId"])
+        try:
+            return await SessionStateReader().content_profile(
+                agent_id=agent_id, stored_id=stored_id, reference=values["reference"], offset=values.get("offset", 0),
+            )
+        except SessionStateResetRequired as exc:
+            raise WorkspaceControlError("Session content changed. Reload its current state.",
+                                        code="session_state_reset", status="conflict") from exc
+        except ValueError as exc:
+            raise WorkspaceControlError("Session content coordinate is invalid.", code="session_state_invalid") from exc
 
     async def sessions_history(self, payload: dict[str, Any]) -> dict[str, Any]:
         values = _object(payload, "workspace payload")
@@ -4233,6 +4285,8 @@ class WorkspaceController:
         "agents.avatar.set": "agents_avatar_set",
         "sessions.list": "sessions_list",
         "sessions.history": "sessions_history",
+        "sessions.state": "sessions_state",
+        "sessions.content": "sessions_content",
         "sessions.update": "sessions_update",
         "sessions.delete": "sessions_delete",
         "attachments.resolve": "attachments_resolve",

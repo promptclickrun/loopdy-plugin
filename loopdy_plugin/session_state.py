@@ -21,6 +21,10 @@ class SessionStateUnavailable(ValueError):
     """The installed Hermes store cannot provide bounded display history."""
 
 
+class SessionStateNotFound(SessionStateResetRequired):
+    """The exact requested stored coordinate does not exist in this profile."""
+
+
 _RICH_FIELDS = (
     "tool_call_id", "tool_calls", "tool_name", "effect_disposition", "timestamp",
     "token_count", "finish_reason", "reasoning", "reasoning_content",
@@ -100,6 +104,17 @@ class SessionStateReader:
             read_only=True,
         )
 
+    async def content_profile(self, *, agent_id: str, stored_id: str,
+                              reference: dict[str, Any], offset: int = 0) -> dict[str, Any]:
+        from hermes_cli.web_routers.sessions import _with_db
+
+        return await asyncio.to_thread(
+            _with_db, agent_id,
+            lambda db: self.content(db, agent_id=agent_id, stored_id=stored_id,
+                                    reference=reference, offset=offset),
+            read_only=True,
+        )
+
     def _coordinate(self, value: Any, *, agent_id: str, stored_id: str, kind: str) -> dict[str, Any]:
         extra = {"offset"} if kind == "cursor" else {"rowId", "sha256"}
         if (not isinstance(value, dict) or set(value) != {"version", "agentId", "storedId", "revision", *extra}
@@ -148,7 +163,7 @@ class SessionStateReader:
         # Exact stored IDs only. The caller may use Hermes' official catalog to
         # resolve a visible chat alias before requesting this reader.
         if db.get_session(stored_id) is None:
-            raise SessionStateResetRequired("Session is no longer available")
+            raise SessionStateNotFound("Session is no longer available")
         ensure_index = getattr(db, "_ensure_display_order", None)
         for _ in range(3):
             resolved = db.resolve_resume_session_id(stored_id)

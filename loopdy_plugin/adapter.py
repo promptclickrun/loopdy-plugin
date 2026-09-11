@@ -1004,7 +1004,8 @@ class LoopdyAdapter(BasePlatformAdapter):
                     success=False,
                     error=f"Loopdy Link delivery failed ({type(exc).__name__})",
                 )
-        event = _channel_event(content, metadata=metadata)
+        target = str(chat_id or self.home_target or "all").strip()
+        event = _channel_event(content, metadata=metadata, target=target)
         # A validated card is atomic even when its JSON exceeds the text limit.
         if "generative_ui" not in event.detail and len(content) > 50_000:
             result = SendResult(success=True)
@@ -1016,7 +1017,6 @@ class LoopdyAdapter(BasePlatformAdapter):
                 if not result.success:
                     return result
             return result
-        target = str(chat_id or self.home_target or "all").strip()
         if self.link_client is not None and target in {"all", "home"}:
             return await self._deliver_link_notification(event, target=target)
         result = await asyncio.to_thread(self.service.deliver, event, target=target)
@@ -2753,7 +2753,9 @@ def _is_link_chat_id(value: str) -> bool:
     )
 
 
-def _channel_event(content: str, *, metadata: Optional[Dict[str, Any]]) -> Any:
+def _channel_event(
+    content: str, *, metadata: Optional[Dict[str, Any]], target: str = "all"
+) -> Any:
     values = metadata or {}
     requested_type = str(values.get("event_type") or "")
     job_id = _text(values.get("job_id"), 180)
@@ -2770,16 +2772,25 @@ def _channel_event(content: str, *, metadata: Optional[Dict[str, Any]]) -> Any:
         "message": message,
         **({"agent_name": agent_name} if agent_name else {}),
     }
+    correlation: tuple[str, ...] = ()
     card_content = _channel_card_content(content, job_id=job_id)
     if card_content is not None:
         try:
             card = validate_rendered_envelope(parse_v2_json(card_content))
             detail["message"] = _text(card.get("title"), 120) or "Agent update"
             detail["generative_ui"] = card
+            # Standalone cron fallback drops job metadata. Use the complete
+            # validated card instance, including creation time, so both paths
+            # retain one Inbox identity without hiding later identical updates.
+            correlation = (
+                "card-instance-v1", profile, target,
+                json.dumps(card, sort_keys=True, separators=(",", ":"), ensure_ascii=True),
+            )
         except (GenerativeUIError, TypeError, ValueError):
             pass
     return build_event(
         kind,
+        correlation=correlation,
         profile=profile,
         session_id=_text(values.get("session_id"), 180),
         job_id=job_id,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import ipaddress
 import json
@@ -18,12 +19,12 @@ import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from .direct_connection import DirectPeer
 
 
-_COMMAND_ID = re.compile(r"^[A-Za-z0-9_.-]{16,128}$")
+_COMMAND_ID = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 _DEVICE_ID = re.compile(r"^[A-Za-z0-9_-]{1,96}$")
 _FINGERPRINT = re.compile(r"^[A-Za-z0-9_-]{43}$")
 _MAX_BODY_BYTES = 512 * 1024
@@ -32,6 +33,7 @@ _REQUEST_PAST_SECONDS = 24 * 60 * 60
 _REQUEST_FUTURE_SECONDS = 60
 _RECORD_TTL_SECONDS = _REQUEST_PAST_SECONDS + _REQUEST_FUTURE_SECONDS
 _METADATA_OVERHEAD_BYTES = 256
+_SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 
 
 @dataclass(frozen=True)
@@ -133,9 +135,15 @@ def _validate_peer(peer: Any) -> DirectPeer:
         raise ValueError("direct peer principal is invalid")
     _canonical_origin(peer.account_origin, "account_origin")
     _canonical_origin(peer.direct_origin, "direct_origin")
-    if not isinstance(peer.host_device_id, str) or _DEVICE_ID.fullmatch(peer.host_device_id) is None:
+    if (
+        not isinstance(peer.host_device_id, str)
+        or _DEVICE_ID.fullmatch(peer.host_device_id) is None
+    ):
         raise ValueError("host_device_id is invalid")
-    if not isinstance(peer.peer_device_id, str) or _DEVICE_ID.fullmatch(peer.peer_device_id) is None:
+    if (
+        not isinstance(peer.peer_device_id, str)
+        or _DEVICE_ID.fullmatch(peer.peer_device_id) is None
+    ):
         raise ValueError("peer_device_id is invalid")
     if type(peer.host_epoch) is not int or peer.host_epoch <= 0:
         raise ValueError("host_epoch is invalid")
@@ -221,7 +229,7 @@ class DirectCommandJournal:
             raise ValueError("maximum_entries must be a positive integer")
         if type(maximum_bytes) is not int or maximum_bytes <= 0:
             raise ValueError("maximum_bytes must be a positive integer")
-        self.path = Path(path)
+        self.path = Path(os.path.abspath(os.fspath(path)))
         self.clock = clock
         self.maximum_entries = maximum_entries
         self.maximum_bytes = maximum_bytes
@@ -244,17 +252,10 @@ class DirectCommandJournal:
         principal = _validate_peer(peer)
         if not isinstance(command_id, str) or _COMMAND_ID.fullmatch(command_id) is None:
             raise ValueError("command_id is invalid")
-        now = self._now()
-        if type(issued_at) is not int:
-            raise ValueError("issued_at must be an integer Unix timestamp")
-        if issued_at > now + _REQUEST_FUTURE_SECONDS:
-            raise ValueError("issued_at is too far in the future")
-        if issued_at < now - _REQUEST_PAST_SECONDS:
-            raise ValueError("issued_at is expired")
         payload_json = _canonical_object(payload, "payload")
         digest = hashlib.sha256(payload_json).hexdigest()
         return await asyncio.to_thread(
-            self._admit_sync, principal, command_id, issued_at, digest, now
+            self._admit_sync, principal, command_id, issued_at, digest
         )
 
     async def complete(
@@ -270,20 +271,29 @@ class DirectCommandJournal:
             self._capabilities.clear()
 
     def _initialize(self) -> None:
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(self.path.parent, 0o700)
+        parent_descriptor = self._open_parent(create=True)
         try:
-            existing = os.lstat(self.path)
-        except FileNotFoundError:
-            descriptor = os.open(
-                self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
-            )
-            os.close(descriptor)
-        else:
-            if not stat.S_ISREG(existing.st_mode):
-                raise ValueError("direct command journal path must be a regular file")
-            os.chmod(self.path, 0o600)
-        connection = sqlite3.connect(self.path, timeout=5, isolation_level=None)
+            self._guard_sidecars_in_parent(parent_descriptor)
+            try:
+                database_descriptor = os.open(
+                    self.path.name,
+                    os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=parent_descriptor,
+                )
+            except FileExistsError:
+                database_descriptor = self._open_database_file(parent_descriptor)
+            try:
+                database_stat = os.fstat(database_descriptor)
+                if not stat.S_ISREG(database_stat.st_mode):
+                    raise ValueError("direct command journal path must be a regular file")
+                os.fchmod(database_descriptor, 0o600)
+                identity = (database_stat.st_dev, database_stat.st_ino)
+            finally:
+                os.close(database_descriptor)
+        finally:
+            os.close(parent_descriptor)
+        connection = self._sqlite_connection(identity)
         try:
             connection.execute("PRAGMA busy_timeout=5000")
             connection.execute("PRAGMA journal_mode=WAL")
@@ -324,8 +334,125 @@ class DirectCommandJournal:
             connection.close()
             self._restrict_files()
 
+    @staticmethod
+    def _directory_flags() -> int:
+        return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+    def _open_parent(self, *, create: bool) -> int:
+        descriptor = os.open(self.path.anchor, self._directory_flags())
+        try:
+            for component in self.path.parent.parts[1:]:
+                try:
+                    child = os.open(
+                        component, self._directory_flags(), dir_fd=descriptor
+                    )
+                except FileNotFoundError:
+                    if not create:
+                        raise
+                    created = False
+                    try:
+                        os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                        created = True
+                    except FileExistsError:
+                        pass
+                    try:
+                        child = os.open(
+                            component, self._directory_flags(), dir_fd=descriptor
+                        )
+                    except OSError as error:
+                        if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                            raise ValueError(
+                                "direct command journal parent contains a symlink or non-directory"
+                            ) from error
+                        raise
+                    if created:
+                        os.fchmod(child, 0o700)
+                except OSError as error:
+                    if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                        raise ValueError(
+                            "direct command journal parent contains a symlink or non-directory"
+                        ) from error
+                    raise
+                os.close(descriptor)
+                descriptor = child
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def _open_database_file(self, parent_descriptor: int) -> int:
+        try:
+            descriptor = os.open(
+                self.path.name, os.O_RDWR | os.O_NOFOLLOW, dir_fd=parent_descriptor
+            )
+        except OSError as error:
+            if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise ValueError(
+                    "direct command journal path must not be a symlink"
+                ) from error
+            raise
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            os.close(descriptor)
+            raise ValueError("direct command journal path must be a regular file")
+        return descriptor
+
+    def _database_identity(self) -> tuple[int, int]:
+        parent_descriptor = self._open_parent(create=False)
+        try:
+            database_descriptor = self._open_database_file(parent_descriptor)
+            try:
+                database_stat = os.fstat(database_descriptor)
+                return database_stat.st_dev, database_stat.st_ino
+            finally:
+                os.close(database_descriptor)
+        finally:
+            os.close(parent_descriptor)
+
+    def _guard_sidecar_targets(self) -> None:
+        parent_descriptor = self._open_parent(create=False)
+        try:
+            self._guard_sidecars_in_parent(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
+
+    def _guard_sidecars_in_parent(self, parent_descriptor: int) -> None:
+        for suffix in _SQLITE_SIDECAR_SUFFIXES:
+            name = f"{self.path.name}{suffix}"
+            try:
+                descriptor = os.open(
+                    name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_descriptor
+                )
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise ValueError(
+                        "direct command journal sidecar must not be a symlink"
+                    ) from error
+                raise
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise ValueError("direct command journal sidecar must be regular")
+            finally:
+                os.close(descriptor)
+
+    def _sqlite_connection(self, expected_identity: tuple[int, int]) -> sqlite3.Connection:
+        self._guard_sidecar_targets()
+        uri = f"file:{quote(str(self.path), safe='/')}?mode=rw"
+        connection = sqlite3.connect(
+            uri, timeout=5, isolation_level=None, uri=True
+        )
+        try:
+            if self._database_identity() != expected_identity:
+                raise ValueError("direct command journal path changed while opening")
+            return connection
+        except BaseException:
+            connection.close()
+            raise
+
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=5, isolation_level=None)
+        identity = self._database_identity()
+        connection = self._sqlite_connection(identity)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout=5000")
         connection.execute("PRAGMA synchronous=NORMAL")
@@ -337,13 +464,19 @@ class DirectCommandJournal:
         command_id: str,
         issued_at: int,
         digest: str,
-        now: int,
     ) -> DirectCommandAdmission:
         with self._lock:
             self._require_open()
             connection = self._connect()
             try:
                 connection.execute("BEGIN IMMEDIATE")
+                now = self._now()
+                if type(issued_at) is not int:
+                    raise ValueError("issued_at must be an integer Unix timestamp")
+                if issued_at > now + _REQUEST_FUTURE_SECONDS:
+                    raise ValueError("issued_at is too far in the future")
+                if issued_at < now - _REQUEST_PAST_SECONDS:
+                    raise ValueError("issued_at is expired")
                 connection.execute(
                     "DELETE FROM direct_commands WHERE expires_at <= ?", (now,)
                 )
@@ -389,7 +522,8 @@ class DirectCommandJournal:
                     "INSERT INTO direct_commands ("
                     "account_origin, host_device_id, host_epoch, peer_device_id, peer_epoch, "
                     "command_id, issued_at, payload_digest, state, process_owner, result_json, "
-                    "expires_at, reserved_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'admitted', ?, NULL, ?, ?)",
+                    "expires_at, reserved_bytes) VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, 'admitted', ?, NULL, ?, ?)",
                     (
                         *key,
                         issued_at,
@@ -580,11 +714,34 @@ class DirectCommandJournal:
             raise RuntimeError("direct command journal is closed")
 
     def _restrict_files(self) -> None:
-        for path in (self.path, Path(f"{self.path}-wal"), Path(f"{self.path}-shm")):
-            try:
-                path.chmod(0o600)
-            except FileNotFoundError:
-                pass
+        parent_descriptor = self._open_parent(create=False)
+        try:
+            for name in (
+                self.path.name,
+                *(f"{self.path.name}{suffix}" for suffix in _SQLITE_SIDECAR_SUFFIXES),
+            ):
+                try:
+                    descriptor = os.open(
+                        name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_descriptor
+                    )
+                except FileNotFoundError:
+                    continue
+                except OSError as error:
+                    if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                        raise ValueError(
+                            "direct command journal file must not be a symlink"
+                        ) from error
+                    raise
+                try:
+                    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                        raise ValueError(
+                            "direct command journal file must be regular"
+                        )
+                    os.fchmod(descriptor, 0o600)
+                finally:
+                    os.close(descriptor)
+        finally:
+            os.close(parent_descriptor)
 
 
 __all__ = ["DirectCommandAdmission", "DirectCommandJournal"]

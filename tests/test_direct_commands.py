@@ -42,7 +42,8 @@ def _peer(**changes: object) -> DirectPeer:
 class DirectCommandJournalTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
-        self.path = Path(self.temporary.name) / "private" / "direct-commands.sqlite3"
+        self.root = Path(self.temporary.name).resolve()
+        self.path = self.root / "private" / "direct-commands.sqlite3"
         self.clock = _Clock()
 
     def tearDown(self) -> None:
@@ -59,8 +60,8 @@ class DirectCommandJournalTests(unittest.IsolatedAsyncioTestCase):
         issued_at = int(self.clock())
 
         admissions = await asyncio.gather(
-            first.admit(_peer(), "command.concurrent.1", issued_at, {"value": 1}),
-            second.admit(_peer(), "command.concurrent.1", issued_at, {"value": 1}),
+            first.admit(_peer(), "command_concurrent_1", issued_at, {"value": 1}),
+            second.admit(_peer(), "command_concurrent_1", issued_at, {"value": 1}),
         )
 
         self.assertEqual(sum(admission.is_new for admission in admissions), 1)
@@ -73,7 +74,7 @@ class DirectCommandJournalTests(unittest.IsolatedAsyncioTestCase):
         completed = await owner.complete(winner, {"executed": True})
         self.assertEqual(completed.state, "completed")
         replay = await second.admit(
-            _peer(), "command.concurrent.1", issued_at, {"value": 1}
+            _peer(), "command_concurrent_1", issued_at, {"value": 1}
         )
         self.assertEqual(replay.result, {"executed": True})
         first.close()
@@ -83,10 +84,10 @@ class DirectCommandJournalTests(unittest.IsolatedAsyncioTestCase):
         journal = self._journal()
         issued_at = int(self.clock())
         first = await journal.admit(
-            _peer(), "command.conflict.1", issued_at, {"nested": {"a": 1, "b": 2}}
+            _peer(), "command_conflict_1", issued_at, {"nested": {"a": 1, "b": 2}}
         )
         duplicate = await journal.admit(
-            _peer(), "command.conflict.1", issued_at, {"nested": {"b": 2, "a": 1}}
+            _peer(), "command_conflict_1", issued_at, {"nested": {"b": 2, "a": 1}}
         )
 
         self.assertTrue(first.is_new)
@@ -94,11 +95,11 @@ class DirectCommandJournalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(duplicate.state, "admitted")
         with self.assertRaises(ValueError):
             await journal.admit(
-                _peer(), "command.conflict.1", issued_at, {"nested": {"a": 2}}
+                _peer(), "command_conflict_1", issued_at, {"nested": {"a": 2}}
             )
         with self.assertRaises(ValueError):
             await journal.admit(
-                _peer(), "command.conflict.1", issued_at - 1, {"nested": {"a": 1, "b": 2}}
+                _peer(), "command_conflict_1", issued_at - 1, {"nested": {"a": 1, "b": 2}}
             )
         journal.close()
 
@@ -115,7 +116,7 @@ class DirectCommandJournalTests(unittest.IsolatedAsyncioTestCase):
         )
 
         admissions = [
-            await journal.admit(peer, "command.scoped.001", issued_at, {"value": 1})
+            await journal.admit(peer, "command_scoped_001", issued_at, {"value": 1})
             for peer in peers
         ]
 
@@ -126,7 +127,7 @@ class DirectCommandJournalTests(unittest.IsolatedAsyncioTestCase):
         journal = self._journal()
         issued_at = int(self.clock())
         original = await journal.admit(
-            _peer(), "command.route-key.1", issued_at, {"value": "same"}
+            _peer(), "command_route-key_1", issued_at, {"value": "same"}
         )
         rotated = await journal.admit(
             _peer(
@@ -134,7 +135,7 @@ class DirectCommandJournalTests(unittest.IsolatedAsyncioTestCase):
                 host_key_fingerprint="n" * 43,
                 peer_key_fingerprint="q" * 43,
             ),
-            "command.route-key.1",
+            "command_route-key_1",
             issued_at,
             {"value": "same"},
         )
@@ -147,10 +148,10 @@ class DirectCommandJournalTests(unittest.IsolatedAsyncioTestCase):
         first = self._journal()
         issued_at = int(self.clock())
         unfinished = await first.admit(
-            _peer(), "command.restart.01", issued_at, {"operation": "one"}
+            _peer(), "command_restart_01", issued_at, {"operation": "one"}
         )
         completed_source = await first.admit(
-            _peer(), "command.restart.02", issued_at, {"operation": "two"}
+            _peer(), "command_restart_02", issued_at, {"operation": "two"}
         )
         completed = await first.complete(
             completed_source, {"ok": True, "nested": {"count": 2}}
@@ -160,10 +161,10 @@ class DirectCommandJournalTests(unittest.IsolatedAsyncioTestCase):
 
         reopened = self._journal()
         uncertain = await reopened.admit(
-            _peer(), "command.restart.01", issued_at, {"operation": "one"}
+            _peer(), "command_restart_01", issued_at, {"operation": "one"}
         )
         replayed = await reopened.admit(
-            _peer(), "command.restart.02", issued_at, {"operation": "two"}
+            _peer(), "command_restart_02", issued_at, {"operation": "two"}
         )
 
         self.assertFalse(uncertain.is_new)
@@ -184,12 +185,12 @@ class DirectCommandJournalTests(unittest.IsolatedAsyncioTestCase):
         other = self._journal()
         issued_at = int(self.clock())
         admission = await journal.admit(
-            _peer(), "command.capability.1", issued_at, {"operation": "mutate"}
+            _peer(), "command_capability_1", issued_at, {"operation": "mutate"}
         )
 
         with self.assertRaises(ValueError):
             await other.complete(admission, {"ok": True})
-        forged = dataclasses.replace(admission, command_id="command.capability.2")
+        forged = dataclasses.replace(admission, command_id="command_capability_2")
         with self.assertRaises(ValueError):
             await journal.complete(forged, {"ok": True})
         completed = await journal.complete(admission, {"ok": True})
@@ -202,17 +203,59 @@ class DirectCommandJournalTests(unittest.IsolatedAsyncioTestCase):
     async def test_expired_request_cannot_be_readmitted_after_record_pruning(self) -> None:
         journal = self._journal()
         issued_at = int(self.clock())
-        await journal.admit(_peer(), "command.expired.001", issued_at, {"value": 1})
+        await journal.admit(_peer(), "command_expired_001", issued_at, {"value": 1})
         self.clock.advance(24 * 60 * 60 + 61)
 
         with self.assertRaises(ValueError):
-            await journal.admit(_peer(), "command.expired.001", issued_at, {"value": 1})
+            await journal.admit(_peer(), "command_expired_001", issued_at, {"value": 1})
 
         fresh = await journal.admit(
-            _peer(), "command.fresh.0001", int(self.clock()), {"value": 2}
+            _peer(), "command_fresh_0001", int(self.clock()), {"value": 2}
         )
         self.assertTrue(fresh.is_new)
         journal.close()
+
+    async def test_delayed_worker_rechecks_expiry_before_prune_and_insert(self) -> None:
+        delayed = self._journal()
+        pruning = self._journal()
+        issued_at = int(self.clock())
+        await delayed.admit(
+            _peer(), "command_delayed-old", issued_at, {"value": "original"}
+        )
+        self.clock.advance(24 * 60 * 60)
+        original = delayed._admit_sync
+        worker_ready = threading.Event()
+        release_worker = threading.Event()
+
+        def wait_before_transaction(*args: object):
+            worker_ready.set()
+            release_worker.wait(5)
+            return original(*args)
+
+        delayed._admit_sync = wait_before_transaction  # type: ignore[method-assign]
+        retry = asyncio.create_task(
+            delayed.admit(
+                _peer(), "command_delayed-old", issued_at, {"value": "original"}
+            )
+        )
+        self.assertTrue(await asyncio.to_thread(worker_ready.wait, 5))
+        self.clock.advance(61)
+        fresh = await pruning.admit(
+            _peer(), "command_prunes-old", int(self.clock()), {"value": "fresh"}
+        )
+        self.assertTrue(fresh.is_new)
+        release_worker.set()
+
+        with self.assertRaises(ValueError):
+            await retry
+        with sqlite3.connect(self.path) as connection:
+            old_rows = connection.execute(
+                "SELECT COUNT(*) FROM direct_commands WHERE command_id=?",
+                ("command_delayed-old",),
+            ).fetchone()[0]
+        self.assertEqual(old_rows, 0)
+        delayed.close()
+        pruning.close()
 
     async def test_rejects_clock_skew_invalid_command_peer_and_noncanonical_bodies(self) -> None:
         journal = self._journal()
@@ -234,15 +277,20 @@ class DirectCommandJournalTests(unittest.IsolatedAsyncioTestCase):
         for index, payload in enumerate(payload_cases):
             with self.subTest(payload=index), self.assertRaises(ValueError):
                 await journal.admit(
-                    _peer(), f"command.invalid.{index:02d}", now, payload  # type: ignore[arg-type]
+                    _peer(), f"command_invalid_{index:02d}", now, payload  # type: ignore[arg-type]
                 )
-        for command_id in ("short", "contains spaces 1", "a" * 129):
+        for command_id in (
+            "short",
+            "contains spaces 1",
+            "command.with.dot",
+            "a" * 129,
+        ):
             with self.subTest(command_id=command_id), self.assertRaises(ValueError):
                 await journal.admit(_peer(), command_id, now, {"value": 1})
         for issued_at in (True, now + 61, now - 24 * 60 * 60 - 1):
             with self.subTest(issued_at=issued_at), self.assertRaises(ValueError):
                 await journal.admit(
-                    _peer(), "command.clock-skew", issued_at, {"value": 1}  # type: ignore[arg-type]
+                    _peer(), "command_clock-skew", issued_at, {"value": 1}  # type: ignore[arg-type]
                 )
         for peer in (
             object(),
@@ -253,7 +301,7 @@ class DirectCommandJournalTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(peer=peer), self.assertRaises(ValueError):
                 await journal.admit(
-                    peer, "command.invalid-peer", now, {"value": 1}  # type: ignore[arg-type]
+                    peer, "command_invalid-peer", now, {"value": 1}  # type: ignore[arg-type]
                 )
         journal.close()
 
@@ -261,27 +309,27 @@ class DirectCommandJournalTests(unittest.IsolatedAsyncioTestCase):
         issued_at = int(self.clock())
         entry_limited = self._journal(maximum_entries=1)
         first = await entry_limited.admit(
-            _peer(), "command.capacity.01", issued_at, {"value": 1}
+            _peer(), "command_capacity_01", issued_at, {"value": 1}
         )
         with self.assertRaises(ValueError):
             await entry_limited.admit(
-                _peer(), "command.capacity.02", issued_at, {"value": 2}
+                _peer(), "command_capacity_02", issued_at, {"value": 2}
             )
         replay = await entry_limited.admit(
-            _peer(), "command.capacity.01", issued_at, {"value": 1}
+            _peer(), "command_capacity_01", issued_at, {"value": 1}
         )
         self.assertTrue(first.is_new)
         self.assertFalse(replay.is_new)
         entry_limited.close()
 
-        byte_path = Path(self.temporary.name) / "bytes" / "journal.sqlite3"
+        byte_path = self.root / "bytes" / "journal.sqlite3"
         byte_limited = self._journal(byte_path, maximum_entries=10, maximum_bytes=525_000)
         await byte_limited.admit(
-            _peer(), "command.byte-cap.01", issued_at, {"value": 1}
+            _peer(), "command_byte-cap_01", issued_at, {"value": 1}
         )
         with self.assertRaises(ValueError):
             await byte_limited.admit(
-                _peer(), "command.byte-cap.02", issued_at, {"value": 2}
+                _peer(), "command_byte-cap_02", issued_at, {"value": 2}
             )
         byte_limited.close()
 
@@ -296,14 +344,17 @@ class DirectCommandJournalTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(sqlite3.IntegrityError):
             await journal.admit(
-                _peer(), "command.persist-fail", int(self.clock()), {"value": 1}
+                _peer(), "command_persist-fail", int(self.clock()), {"value": 1}
             )
         with sqlite3.connect(self.path) as connection:
-            self.assertEqual(connection.execute("SELECT COUNT(*) FROM direct_commands").fetchone()[0], 0)
+            count = connection.execute(
+                "SELECT COUNT(*) FROM direct_commands"
+            ).fetchone()[0]
+            self.assertEqual(count, 0)
             connection.execute("DROP TRIGGER reject_direct_command_insert")
 
         admitted = await journal.admit(
-            _peer(), "command.persist-fail", int(self.clock()), {"value": 1}
+            _peer(), "command_persist-fail", int(self.clock()), {"value": 1}
         )
         self.assertTrue(admitted.is_new)
         journal.close()
@@ -327,7 +378,7 @@ class DirectCommandJournalTests(unittest.IsolatedAsyncioTestCase):
         journal._admit_sync = committed_then_wait  # type: ignore[method-assign]
         issued_at = int(self.clock())
         task = asyncio.create_task(
-            journal.admit(_peer(), "command.cancelled.1", issued_at, {"value": 1})
+            journal.admit(_peer(), "command_cancelled_1", issued_at, {"value": 1})
         )
         self.assertTrue(await asyncio.to_thread(committed.wait, 5))
         task.cancel()
@@ -338,23 +389,23 @@ class DirectCommandJournalTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await asyncio.to_thread(finished.wait, 5))
 
         replay = await journal.admit(
-            _peer(), "command.cancelled.1", issued_at, {"value": 1}
+            _peer(), "command_cancelled_1", issued_at, {"value": 1}
         )
         self.assertFalse(replay.is_new)
         self.assertEqual(replay.state, "admitted")
         journal.close()
 
-    async def test_oversized_result_leaves_record_unfinished_and_retryable_only_for_completion(self) -> None:
+    async def test_oversized_result_leaves_record_unfinished(self) -> None:
         journal = self._journal()
         issued_at = int(self.clock())
         admission = await journal.admit(
-            _peer(), "command.result-size.1", issued_at, {"value": 1}
+            _peer(), "command_result-size_1", issued_at, {"value": 1}
         )
 
         with self.assertRaises(ValueError):
             await journal.complete(admission, {"value": "x" * (512 * 1024)})
         replay = await journal.admit(
-            _peer(), "command.result-size.1", issued_at, {"value": 1}
+            _peer(), "command_result-size_1", issued_at, {"value": 1}
         )
         self.assertEqual(replay.state, "admitted")
         completed = await journal.complete(admission, {"unavailable": True})
@@ -365,7 +416,7 @@ class DirectCommandJournalTests(unittest.IsolatedAsyncioTestCase):
         journal = self._journal()
         await journal.admit(
             _peer(),
-            "command.no-body.001",
+            "command_no-body_001",
             int(self.clock()),
             {"syntheticSecret": "fixture-value-that-must-not-persist"},
         )
@@ -380,8 +431,51 @@ class DirectCommandJournalTests(unittest.IsolatedAsyncioTestCase):
         journal.close()
         with self.assertRaises(RuntimeError):
             await journal.admit(
-                _peer(), "command.closed.0001", int(self.clock()), {"value": 1}
+                _peer(), "command_closed_0001", int(self.clock()), {"value": 1}
             )
+
+    async def test_constructor_rejects_symlink_parent_without_touching_target(self) -> None:
+        root = self.root
+        target = root / "caller-owned-target"
+        target.mkdir()
+        target.chmod(0o755)
+        alias = root / "journal-parent"
+        alias.symlink_to(target, target_is_directory=True)
+
+        with self.assertRaises(ValueError):
+            self._journal(alias / "direct-commands.sqlite3")
+
+        self.assertEqual(os.stat(target).st_mode & 0o777, 0o755)
+        self.assertFalse((target / "direct-commands.sqlite3").exists())
+
+    async def test_constructor_preserves_existing_parent_permissions(self) -> None:
+        parent = self.root / "caller-owned-parent"
+        parent.mkdir()
+        parent.chmod(0o755)
+
+        journal = self._journal(parent / "direct-commands.sqlite3")
+
+        self.assertEqual(os.stat(parent).st_mode & 0o777, 0o755)
+        self.assertEqual(os.stat(journal.path).st_mode & 0o777, 0o600)
+        journal.close()
+
+    async def test_constructor_rejects_symlink_sidecar_without_touching_target(self) -> None:
+        parent = self.root / "sidecar-parent"
+        parent.mkdir()
+        database = parent / "direct-commands.sqlite3"
+        target = self.root / "unrelated-sidecar-target"
+        target.write_bytes(b"synthetic unrelated content")
+        target.chmod(0o644)
+        sidecar = Path(f"{database}-wal")
+        sidecar.symlink_to(target)
+
+        with self.assertRaises(ValueError):
+            self._journal(database)
+
+        self.assertTrue(sidecar.is_symlink())
+        self.assertFalse(database.exists())
+        self.assertEqual(target.read_bytes(), b"synthetic unrelated content")
+        self.assertEqual(os.stat(target).st_mode & 0o777, 0o644)
 
 
 if __name__ == "__main__":

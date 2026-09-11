@@ -723,6 +723,7 @@ class LoopdyAdapter(BasePlatformAdapter):
                 pass
         health = self.service.health()
         if self.link_client is not None:
+            self.device_tool_bridge.bind_link_client(self.link_client)
             self.link_client.start(
                 self.receive_link_payload,
                 status_callback=self._on_link_status,
@@ -925,6 +926,7 @@ class LoopdyAdapter(BasePlatformAdapter):
             )
 
     async def disconnect(self) -> None:
+        self.device_tool_bridge.bind_link_client(None)
         if self.activity_broker is not None:
             await self.activity_broker.detach()
         active_voice_tasks = tuple(self._voice_tasks)

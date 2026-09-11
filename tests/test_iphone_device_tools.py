@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import tempfile
 import time
 import unittest
 from types import SimpleNamespace
@@ -286,6 +287,150 @@ class DeviceToolContractTests(unittest.TestCase):
 
 
 class DeviceToolHandlerTests(unittest.TestCase):
+    def test_registered_health_tool_uses_gateway_loop_for_real_link_delivery(self):
+        from pathlib import Path
+        from loopdy_plugin.device_tools import DeviceToolBridge, register
+        from loopdy_plugin.link_client import LoopdyLinkClient
+        from loopdy_plugin.link_contracts import device_tool_result, device_tool_status
+
+        async def run(root):
+            gateway_loop = asyncio.get_running_loop()
+            client = LoopdyLinkClient(SimpleNamespace(
+                device_id="host-1", authorization_epoch=3, account_key=b"k" * 32,
+            ), attachment_root=Path(root))
+            client._connected.set()
+            client.peer_capabilities = frozenset({"directed-frames-v1"})
+            bridge = DeviceToolBridge(clock=lambda: 100)
+            bridge.bind_link_client(client)
+            bridge.accept_status(device_tool_status(
+                device_id="phone-1", host_id="host-1", authorization_epoch=7,
+                enabled=["health"], available=True, sent_at=100,
+            ), sender_device_id="phone-1", sender_epoch=7, target_device_id="host-1")
+            registry = SimpleNamespace(tools={})
+            registry.register_tool = lambda *, name, handler, **kwargs: registry.tools.update({name: handler})
+            register(registry, bridge=bridge)
+            sent = []
+            errors = []
+            original_send = client.send_payload
+
+            async def observed_send(*args, **kwargs):
+                try:
+                    return await original_send(*args, **kwargs)
+                except Exception as exc:
+                    errors.append(f"{type(exc).__name__}: {exc}")
+                    raise
+
+            client.send_payload = observed_send
+
+            class Socket:
+                async def send(_self, encoded):
+                    self.assertIs(asyncio.get_running_loop(), gateway_loop)
+                    frame = json.loads(encoded)
+                    request = client.cipher.open(frame["ciphertext"])
+                    sent.append((frame, request))
+                    self.assertIs(bridge._pending[request["requestId"]].future.get_loop(), gateway_loop)
+                    client._accept_outbound({"id": frame["id"], "sequence": frame["sequence"]})
+                    result = device_tool_result(
+                        request=request, status="completed", payload={"items": []}, sent_at=101,
+                    )
+                    self.assertTrue(bridge.accept_result(result, sender_device_id="phone-1",
+                        sender_epoch=7, target_device_id="host-1"))
+
+            client._socket = Socket()
+            # Real chat sends contend on this gateway-owned asyncio lock. Bind
+            # it with an actual waiting acquisition, then leave one send ahead
+            # of the phone tool. A tool-worker loop cannot acquire this lock.
+            await client._send_lock.acquire()
+            waiter = asyncio.create_task(client._send_lock.acquire())
+            await asyncio.sleep(0)
+            client._send_lock.release()
+            await waiter
+            release = gateway_loop.call_later(0.1, client._send_lock.release)
+            try:
+                # Hermes' async tool registry uses a separate worker loop.
+                result = await asyncio.wait_for(asyncio.to_thread(lambda: json.loads(asyncio.run(
+                    registry.tools["iphone_health"]({
+                        "start": "2026-09-09T20:54:46.165731-05:00",
+                        "end": "2026-09-10T20:54:46.165731-05:00",
+                        "timeZone": "America/Chicago", "limit": 20,
+                        "types": ["step_count", "heart_rate", "sleep_analysis"],
+                    }, tool_execution_context=self._execution_context(), session_id="session-1",
+                    turn_id="session-1:session:loopdy_link:phone-1:9e4a120b", tool_call_id="call-1")
+                ))), timeout=3)
+                self.assertEqual(result["status"], "completed", {"result": result, "transport_errors": errors})
+                self.assertEqual(result["payload"], {"items": []})
+                self.assertEqual(len(sent), 1)
+                self.assertEqual(sent[0][0]["targetDeviceId"], "phone-1")
+                self.assertEqual(sent[0][1]["operation"], "health.read")
+                self.assertFalse(client._accepted)
+                self.assertFalse(bridge._pending)
+                self.assertFalse(bridge._outcomes)
+            finally:
+                release.cancel()
+                if client._send_lock.locked():
+                    client._send_lock.release()
+
+        with tempfile.TemporaryDirectory() as root:
+            asyncio.run(run(root), debug=True)
+
+    def test_cross_loop_health_call_honors_disable_and_disconnect_while_waiting(self):
+        from loopdy_plugin.device_tools import DeviceToolBridge, register
+        from loopdy_plugin.link_contracts import device_tool_status
+
+        async def run(disconnect):
+            sent = asyncio.Event()
+
+            class Client:
+                connected = True
+                peer_capabilities = {"directed-frames-v1"}
+                config = SimpleNamespace(device_id="host-1")
+
+                async def send_payload(self, request, **kwargs):
+                    sent.set()
+
+            bridge = DeviceToolBridge(Client(), clock=lambda: 100)
+            status = device_tool_status(device_id="phone-1", host_id="host-1",
+                authorization_epoch=7, enabled=["health"], available=True, sent_at=100)
+            bridge.accept_status(status, sender_device_id="phone-1", sender_epoch=7, target_device_id="host-1")
+            registry = SimpleNamespace(tools={})
+            registry.register_tool = lambda *, name, handler, **kwargs: registry.tools.update({name: handler})
+            register(registry, bridge=bridge)
+            task = asyncio.create_task(asyncio.to_thread(lambda: json.loads(asyncio.run(
+                registry.tools["iphone_health"]({
+                    "start": "2026-09-09T00:00:00Z", "end": "2026-09-10T00:00:00Z", "timeZone": "UTC",
+                }, tool_execution_context=self._execution_context(), session_id="session-1",
+                turn_id="session-1:loopdy:turn", tool_call_id="call-1")
+            ))))
+            await asyncio.wait_for(sent.wait(), timeout=2)
+            if disconnect:
+                bridge.bind_link_client(None)
+            else:
+                self.assertTrue(bridge.accept_status({**status, "enabled": []},
+                    sender_device_id="phone-1", sender_epoch=7, target_device_id="host-1"))
+            result = await asyncio.wait_for(task, timeout=2)
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["code"], "owner_changed" if disconnect else "authorization_required")
+            self.assertEqual(result["payload"], {})
+            self.assertFalse(bridge._pending)
+            self.assertFalse(bridge._outcomes)
+
+        for disconnect in (False, True):
+            with self.subTest(disconnect=disconnect):
+                asyncio.run(run(disconnect), debug=True)
+
+    def test_closed_gateway_loop_fails_without_sending_on_tool_worker(self):
+        from loopdy_plugin.device_tools import DeviceToolBridge
+
+        client = SimpleNamespace(connected=True, send_payload=AsyncMock())
+
+        async def bind():
+            return DeviceToolBridge(client)
+
+        bridge = asyncio.run(bind())
+        result = asyncio.run(bridge.execute())
+        self.assertEqual(result["code"], "unavailable")
+        client.send_payload.assert_not_awaited()
+
     def test_registered_phone_tools_complete_with_canonical_hermes_turn_coordinates(self):
         from loopdy_plugin.device_tools import DeviceToolBridge, register
         from loopdy_plugin.link_contracts import device_tool_result, device_tool_status

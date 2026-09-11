@@ -11,6 +11,11 @@ Plugin 2.11.1 fixes pre-send `invalid_arguments` for valid Health queries by
 accepting Hermes' canonical composite turn IDs. Update the host plugin; build 13
 already accepts these IDs and does not require new permissions or an app update.
 
+Plugin 2.11.2 fixes immediate `delivery_uncertain` after validation: async Hermes
+tools run on worker loops, while Link locks and WebSocket delivery belong to the
+gateway loop. Update the plugin and restart the host gateway. No iOS rebuild or
+permission reset is needed for this threading fix.
+
 ## User contract
 
 Permissions contains independent Apple Health, Calendar and Reminders controls.
@@ -47,7 +52,7 @@ Native harness is not required and is not treated as operational.
 | Component | Responsibility |
 | --- | --- |
 | Hermes `ToolExecutionContext` extension | Carries immutable authenticated ingress ownership to official plugin handlers and hooks, with official session/turn/tool-call IDs. |
-| Loopdy plugin 2.11.1 | Registers `iphone_health`, `iphone_calendar`, `iphone_reminders`; targets the verified originating phone and correlates results using canonical Hermes turn IDs. |
+| Loopdy plugin 2.11.2 | Registers `iphone_health`, `iphone_calendar`, `iphone_reminders`; uses the gateway connection loop to target the verified originating phone and correlate results using canonical Hermes turn IDs. |
 | Link relay with `directed-frames-v1` | Negotiates exact-recipient delivery and queues only for that active paired device. Legacy sockets never receive a broadcast fallback. |
 | iOS `DeviceToolPermissions` | Persists opt-in grants and fences asynchronous work by scope/revision. |
 | iOS `DeviceToolCoordinator` | Validates envelopes, deadlines, ownership and grants; bounds concurrency and journals mutation outcomes. |
@@ -68,6 +73,16 @@ phone epoch, with the authenticated host ID as an attribute and profile as
 scope. Phone and host authorization epochs are independent.
 
 ## Transport and ownership
+
+The adapter binds the bridge to its running gateway event loop during connection
+and detaches it during disconnect. Hermes' async tool worker must dispatch the
+whole operation to that owner loop: validation against live status, sending,
+pending-future creation, response matching and outcome recording belong together.
+Scheduling only the WebSocket send still leaves result futures on the wrong loop.
+Reject a stopped loop or a client replacement before queued work starts. Continue
+honoring disable/disconnect while waiting; never weaken those checks to make a
+cross-thread call complete. Activity publishing and chat streaming retain their
+existing loop ownership and ordering.
 
 The existing encrypted Link connection carries version-1
 `device.tool.status`, `device.tool.request` and `device.tool.result` payloads.
@@ -173,6 +188,12 @@ mutation deduplication, uncertain writes and non-caching of private reads.
 Hermes tests cover runtime-only context propagation, queued owner separation,
 delegation isolation and official tool-call identifiers. Relay tests verify
 single-device queues and negative routing without legacy fallback.
+
+The registered Health test must also run on a separate tool-worker loop against
+the real Link client with a contended gateway send lock, verify exactly one
+encrypted directed frame and keep response futures on the gateway loop. Include
+cross-loop permission disable, disconnect and stopped-loop cases. Same-loop
+injected clients alone do not qualify the Hermes-to-phone delivery boundary.
 
 Run iPhone and iPad composer interaction checks alongside this integration.
 Preserve the full visible input focus target and microphone/Send alignment in

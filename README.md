@@ -20,6 +20,20 @@ compatibility, but the app does not offer it for new selection.
 
 All modes support proactive messages even when no chat session is active.
 
+## Release 2.11.2 iPhone tool delivery
+
+Fixes immediate `delivery_uncertain` failures after iPhone permissions and query
+validation succeed. Hermes executes async tools on worker event loops, while the
+paired Link connection belongs to the gateway loop. The bridge now schedules
+the complete request/result operation on that connection's loop, including its
+send lock, pending futures and response correlation. Disconnect and permission
+revocation still invalidate waiting calls.
+
+Update the host plugin and restart its gateway to activate the fix. The current
+iOS build and granted permissions remain compatible. Regression coverage uses
+the registered Health handler, a separate worker thread, the real encrypted Link
+client and a contended send lock; a single-loop fake client cannot catch this bug.
+
 ## Release 2.11.1 iPhone Health argument validation
 
 Fixes `invalid_arguments` before a valid iPhone Health request reaches the phone.
@@ -469,6 +483,11 @@ GET    /api/plugins/loopdy/attachments/{attachment_id}?profile={profile}
 See [PROTOCOL.md](PROTOCOL.md) for request contracts and [SECURITY.md](SECURITY.md) for trust boundaries.
 
 ## Development
+
+Run the suite with an isolated `HERMES_HOME` and a real temporary directory outside
+any Git worktree. On macOS, use `/private/tmp` rather than its symlinked alias;
+otherwise filesystem-security fixtures correctly reject the parent path. Tests
+must not inherit a live profile's paired connection or personalization.
 
 From this repository's root, run the deterministic offline suite with the Python environment bundled with Hermes:
 

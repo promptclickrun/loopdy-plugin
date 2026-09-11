@@ -64,14 +64,20 @@ class DeviceToolBridge:
         clock: Callable[[], float] | None = None,
         timeout: float = DEVICE_TOOL_TIMEOUT_SECONDS,
     ) -> None:
-        self.link_client = link_client
+        self.link_client = None
+        self._loop: asyncio.AbstractEventLoop | None = None
         self.clock = clock or time.time
         self.timeout = max(20.0, min(60.0, float(timeout)))
         self._pending: dict[str, _Pending] = {}
         self._outcomes: OrderedDict[str, _Outcome] = OrderedDict()
         self._status: OrderedDict[tuple[str, str, int], dict[str, Any]] = OrderedDict()
+        self.bind_link_client(link_client)
 
     def bind_link_client(self, link_client: Any | None) -> None:
+        try:
+            loop = asyncio.get_running_loop() if link_client is not None else None
+        except RuntimeError:
+            loop = None
         if link_client is not self.link_client:
             self._status.clear()
             # A mutation outcome is only a safe replay for the authenticated
@@ -83,6 +89,7 @@ class DeviceToolBridge:
                 if not pending.future.done():
                     pending.future.set_exception(DeviceToolError("owner_changed"))
         self.link_client = link_client
+        self._loop = loop
 
     def accept_status(
         self,
@@ -191,6 +198,33 @@ class DeviceToolBridge:
         return True
 
     async def execute(
+        self,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        # Hermes runs async tools on worker loops. The Link socket, send lock,
+        # pending futures and inbound results all belong to the gateway loop.
+        # Marshal the entire operation there, not only the WebSocket send.
+        owner_loop = self._loop
+        client = self.link_client
+        if owner_loop is None or owner_loop is asyncio.get_running_loop():
+            return await self._execute(**kwargs)
+        if owner_loop.is_closed() or not owner_loop.is_running():
+            return _failed_result(None, "unavailable")
+
+        async def on_owner() -> dict[str, Any]:
+            if self._loop is not owner_loop or self.link_client is not client:
+                return _failed_result(None, "owner_changed")
+            return await self._execute(**kwargs)
+
+        operation = on_owner()
+        try:
+            future = asyncio.run_coroutine_threadsafe(operation, owner_loop)
+        except RuntimeError:
+            operation.close()
+            return _failed_result(None, "unavailable")
+        return await asyncio.wrap_future(future)
+
+    async def _execute(
         self,
         *,
         context: Any,

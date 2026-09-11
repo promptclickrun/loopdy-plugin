@@ -13,6 +13,35 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+DIRECT_ENROLLMENT_CAPABILITY = "direct-enrollment-v1"
+STATE_BACKED_PRESENTATION_CAPABILITY = "state-backed-presentation-v1"
+
+
+def is_transient_presentation(payload: dict[str, Any]) -> bool:
+    """Only negotiated replaceable presentation, never reliable settlement."""
+    kind = payload.get("type")
+    if kind == "assistant.message":
+        return payload.get("delivery") == "draft"
+    return kind in {"activity.event", "session.context", "session.todos",
+                    "session.subagents", "generative.ui"}
+
+
+def parse_direct_enrollment(payload: dict[str, Any]) -> dict[str, Any]:
+    """Strict application envelope; proof verification is authority-owned."""
+    if (type(payload) is not dict or set(payload) != {"version", "type", "enrollment"}
+            or type(payload["version"]) is not int or payload["version"] != 1
+            or payload["type"] != "direct.enroll"):
+        raise ValueError("direct enrollment envelope is invalid")
+    enrollment = payload["enrollment"]
+    fields = {"version", "exchangeId", "phoneNonce", "phonePublicKey", "phoneProof"}
+    if (type(enrollment) is not dict or set(enrollment) != fields
+            or type(enrollment["version"]) is not int or enrollment["version"] != 1
+            or any(not isinstance(enrollment[key], str) or not 1 <= len(enrollment[key]) <= 512
+                   for key in fields - {"version"})):
+        raise ValueError("direct enrollment request is invalid")
+    return dict(enrollment)
+
+
 from .events import EVENT_TYPES
 from .wiki_contract import (
     WIKI_OPERATIONS,
@@ -79,7 +108,7 @@ HEALTH_TYPES = (
     "body_fat_percentage",
     "workout",
 )
-PLUGIN_VERSION = "2.11.0"
+PLUGIN_VERSION = "2.12.0"
 AVAILABLE_WIKI_OPERATIONS = available_wiki_operations()
 GROUPS_OPERATIONS = frozenset(
     {
@@ -103,6 +132,14 @@ GROUPS_OPERATIONS = frozenset(
         "groups.peer.register",
     }
 )
+# Live controls are adapter-owned, not generic backend handlers. Keep the
+# controller invariant scoped to its actual handlers. Both sets share the same
+# authenticated workspace envelope and reliable result serializer.
+LIVE_VOICE_OPERATIONS = frozenset({
+    "voice.live.status", "voice.live.offer", "voice.live.close",
+    "voice.live.jobs", "voice.live.control",
+})
+
 WORKSPACE_OPERATIONS = frozenset(
     {
         *AVAILABLE_WIKI_OPERATIONS,
@@ -176,6 +213,7 @@ class EncryptedFrame:
     ack: int
     ciphertext: str
     target_device_id: str | None = None
+    delivery_class: str | None = None
 
     def wire_value(self) -> dict[str, Any]:
         value = {
@@ -190,6 +228,10 @@ class EncryptedFrame:
         }
         if self.target_device_id is not None:
             value["targetDeviceId"] = self.target_device_id
+        if self.delivery_class is not None:
+            if self.delivery_class != "presentation":
+                raise ValueError("frame delivery class is invalid")
+            value["deliveryClass"] = self.delivery_class
         return value
 
 
@@ -450,12 +492,15 @@ def parse_encrypted_frame(encoded: str) -> EncryptedFrame:
         raise ValueError("Loopdy Link frame is invalid") from exc
     if (
         not isinstance(value, dict)
-        or set(value) not in ({"version", "type", "id", "senderDeviceId", "senderEpoch", "sequence", "ack", "ciphertext"},
-                              {"version", "type", "id", "senderDeviceId", "senderEpoch", "sequence", "ack", "ciphertext", "targetDeviceId"})
+        or set(value) - {"targetDeviceId", "deliveryClass"} != {
+            "version", "type", "id", "senderDeviceId", "senderEpoch", "sequence", "ack", "ciphertext"}
         or value.get("version") != 1
         or value.get("type") != "frame"
     ):
         raise ValueError("Loopdy Link frame is invalid")
+    delivery_class = value.get("deliveryClass")
+    if "deliveryClass" in value and delivery_class != "presentation":
+        raise ValueError("Loopdy Link delivery class is invalid")
     target_device_id = value.get("targetDeviceId")
     if target_device_id is not None:
         target_device_id = _opaque(target_device_id, "targetDeviceId", 1, 96)
@@ -474,6 +519,7 @@ def parse_encrypted_frame(encoded: str) -> EncryptedFrame:
             MAX_ENCRYPTED_FRAME_CHARACTERS,
         ),
         target_device_id=target_device_id,
+        delivery_class=delivery_class,
     )
 
 
@@ -702,7 +748,7 @@ def parse_workspace_request(value: dict[str, Any]) -> WorkspaceRequest:
     ):
         raise ValueError("Loopdy Link workspace request is invalid")
     operation = value.get("operation")
-    if not isinstance(operation, str) or operation not in WORKSPACE_OPERATIONS:
+    if not isinstance(operation, str) or operation not in WORKSPACE_OPERATIONS | LIVE_VOICE_OPERATIONS:
         raise ValueError("Loopdy Link workspace operation is invalid")
     if operation in AVAILABLE_WIKI_OPERATIONS:
         if type(value.get("version")) is not int:
@@ -1878,19 +1924,22 @@ def generative_ui_form_result(
     }
 
 
-def workspace_capabilities() -> dict[str, Any]:
+def workspace_capabilities(*, live_voice: bool = True) -> dict[str, Any]:
     wiki_operations = available_wiki_operations()
     features = [
         "workspace-rejected-v1", "backpressure-v1", "plugin-update-v1",
         "host-runtime-diagnostics-v1", "voice-settings-v1", "session-state-v1",
     ]
+    if live_voice:
+        features.append("live-voice-v1")
     if wiki_operations:
         features.append("wiki.v1")
     return {
         "protocolVersion": 1,
         "pluginVersion": PLUGIN_VERSION,
         "features": features,
-        "operations": sorted(WORKSPACE_OPERATIONS - WIKI_OPERATIONS | wiki_operations),
+        "operations": sorted(WORKSPACE_OPERATIONS - WIKI_OPERATIONS | wiki_operations
+                             | (LIVE_VOICE_OPERATIONS if live_voice else frozenset())),
     }
 
 
@@ -1911,7 +1960,7 @@ def workspace_rejection(value: Any, *, sent_at: int) -> dict[str, Any] | None:
         type(value.get("version")) is int and value.get("version") == 1
         and isinstance(operation, str)
         and re.fullmatch(r"[A-Za-z0-9_.-]{1,96}", operation) is not None
-        and operation not in WORKSPACE_OPERATIONS
+        and operation not in WORKSPACE_OPERATIONS | LIVE_VOICE_OPERATIONS
     )
     return {
         "version": 1,

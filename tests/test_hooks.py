@@ -44,19 +44,16 @@ class HookNormalizationTests(unittest.TestCase):
             )
         )
 
-        self.assertIsNone(
-            normalize_hook(
-                "on_session_end",
-                profile="default",
-                platform="webui",
-                session_id="session-still-open",
-                session_title="Release readiness",
-                turn_id="turn-2",
-                completed=True,
-                failed=False,
-                assistant_response="private response",
-            )
+        completed = normalize_hook(
+            "on_session_end", profile="default", platform="webui",
+            session_id="session-still-open", session_title="Release readiness",
+            turn_id="turn-2", completed=True, failed=False,
+            assistant_response="private response",
         )
+        self.assertIsNotNone(completed)
+        self.assertEqual(completed.type, "session.completed")
+        self.assertEqual(completed.detail["turn_id"], "turn-2")
+        self.assertNotIn("private response", repr(completed.detail))
 
     def test_normalizes_only_shipped_lifecycle_signals(self) -> None:
         attention = normalize_hook(
@@ -85,7 +82,7 @@ class HookNormalizationTests(unittest.TestCase):
         self.assertEqual(completed.type, "job.completed")
         self.assertEqual(completed.job_id, "job-123")
         self.assertEqual(completed.task_id, "job-123")
-        self.assertEqual(completed.detail, {"status": "completed"})
+        self.assertEqual(completed.detail["status"], "completed")
         self.assertNotIn("private response", str(completed.detail))
         notification = shape_notification(completed)
         self.assertEqual(notification.title, "Completion alert")
@@ -111,7 +108,7 @@ class HookNormalizationTests(unittest.TestCase):
         self.assertEqual(compressed.type, "job.completed")
         self.assertEqual(compressed.job_id, "")
         self.assertEqual(compressed.task_id, "")
-        self.assertEqual(compressed.detail, {"status": "completed"})
+        self.assertEqual(compressed.detail, {"status": "completed", "turn_id": "turn-3"})
 
         task = normalize_hook(
             "kanban_task_completed",
@@ -159,11 +156,12 @@ class HookNormalizationTests(unittest.TestCase):
         )
 
         self.assertEqual(started.type, "delegation.started")
-        self.assertEqual(started.detail, {"status": "running"})
+        self.assertEqual(started.detail["status"], "running")
+        self.assertEqual(started.detail["parent_session_id"], "parent-1")
         self.assertEqual(updated.type, "delegation.updated")
-        self.assertEqual(updated.detail, {"status": "failed"})
+        self.assertEqual(updated.detail["status"], "failed")
         self.assertEqual(completed.type, "delegation.completed")
-        self.assertEqual(completed.detail, {"status": "completed"})
+        self.assertEqual(completed.detail["status"], "completed")
         self.assertIsNone(
             normalize_hook(
                 "on_session_end",

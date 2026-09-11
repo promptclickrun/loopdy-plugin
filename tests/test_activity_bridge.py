@@ -9,6 +9,18 @@ from types import SimpleNamespace
 
 
 class ActivityBridgeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_presentation_observer_is_independent_of_relay_connection(self):
+        from loopdy_plugin.activity_bridge import LinkActivityBroker
+        broker = LinkActivityBroker()
+        observed = []
+        broker.set_presentation_observer(lambda value: observed.append(value))
+        payload = {"type": "activity.event", "eventId": "independent", "sessionId": "chat"}
+        self.assertTrue(broker.publish(payload))
+        self.assertEqual(observed, [payload])
+        broker.set_presentation_observer(None)
+        self.assertFalse(broker.publish(payload))
+        self.assertEqual(len(observed), 1)
+
     async def test_hook_burst_schedules_one_bounded_event_loop_wakeup(self):
         from loopdy_plugin.activity_bridge import LinkActivityBroker
         broker = LinkActivityBroker()

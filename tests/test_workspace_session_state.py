@@ -23,7 +23,7 @@ class WorkspaceSessionStateTests(unittest.IsolatedAsyncioTestCase):
         self.backend._session_runtime = AsyncMock(return_value={"model": "test-model"})
         self.backend._session_catalog = AsyncMock(return_value={"sessions": [{"id": "stored-one", "chat_id": "visible-one"}]})
         self.backend._session_messages = AsyncMock(side_effect=AssertionError("Legacy transcript read"))
-        self.opener = patch("hermes_cli.web_routers.sessions._with_db", side_effect=self.open_db)
+        self.opener = patch("loopdy_plugin.session_state.open_profile_store", side_effect=self.open_db)
         self.opener_threads = []
         self.opener.start()
 
@@ -108,7 +108,7 @@ class WorkspaceSessionStateTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(failure.exception.code, "session_state_invalid")
 
     async def test_state_index_failure_is_explicit_and_never_loads_legacy_history(self):
-        with patch.object(self.db, "_ensure_display_order", return_value=False):
+        with patch("loopdy_plugin.session_state.display_index_ready", return_value=False):
             with self.assertRaises(WorkspaceControlError) as failure:
                 await self.request("sessions.state")
         self.assertEqual(failure.exception.code, "session_state_unavailable")

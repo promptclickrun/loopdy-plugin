@@ -38,6 +38,8 @@ from .link_contracts import (
     WorkspaceRequest,
     AVAILABLE_WIKI_OPERATIONS,
     DIRECTED_FRAMES_CAPABILITY,
+    STATE_BACKED_PRESENTATION_CAPABILITY,
+    is_transient_presentation,
     parse_attachment_chunk,
     parse_backpressure,
     parse_encrypted_frame,
@@ -277,6 +279,13 @@ class LinkRuntimeConfig:
 
 
 @dataclass(frozen=True)
+class InboundLinkDirectEnrollment:
+    enrollment: dict[str, Any]
+    sender_device_id: str
+    sender_epoch: int
+
+
+@dataclass(frozen=True)
 class InboundLinkTurn:
     message: UserMessage
     sender_id: str
@@ -305,24 +314,28 @@ class _InboundLinkPayloadRejection:
 class InboundLinkRelayReady:
     registration: RelayReady
     sender_device_id: str
+    sender_epoch: int | None = None
 
 
 @dataclass(frozen=True)
 class InboundLinkVoiceSpeak:
     request: VoiceSpeakRequest
     sender_device_id: str
+    sender_epoch: int | None = None
 
 
 @dataclass(frozen=True)
 class InboundLinkPickerOpen:
     request: PickerOpen
     sender_device_id: str
+    sender_epoch: int | None = None
 
 
 @dataclass(frozen=True)
 class InboundLinkPickerSelection:
     selection: PickerSelection
     sender_device_id: str
+    sender_epoch: int | None = None
 
 
 @dataclass(frozen=True)
@@ -330,24 +343,28 @@ class InboundLinkSessionFork:
     request: SessionForkRequest
     sender_id: str
     sender_device_id: str
+    sender_epoch: int | None = None
 
 
 @dataclass(frozen=True)
 class InboundLinkCommandCatalog:
     request: CommandCatalogRequest
     sender_device_id: str
+    sender_epoch: int | None = None
 
 
 @dataclass(frozen=True)
 class InboundLinkPersonalityRequest:
     request: PersonalityRequest
     sender_device_id: str
+    sender_epoch: int | None = None
 
 
 @dataclass(frozen=True)
 class InboundLinkGenerativeUIFormSubmission:
     request: GenerativeUIFormSubmission
     sender_device_id: str
+    sender_epoch: int | None = None
 
 
 @dataclass(frozen=True)
@@ -612,6 +629,10 @@ class LoopdyLinkClient:
                     ack=int(self._transport_get("last_received_sequence", 0) or 0),
                     ciphertext=self.cipher.seal(payload),
                     target_device_id=target_device_id,
+                    delivery_class=("presentation" if
+                        STATE_BACKED_PRESENTATION_CAPABILITY in self.peer_capabilities
+                        and STATE_BACKED_PRESENTATION_CAPABILITY in self.capabilities
+                        and is_transient_presentation(payload) else None),
                 )
                 wire = frame.wire_value()
                 self._transport_set("pending_frame", wire)
@@ -770,217 +791,29 @@ class LoopdyLinkClient:
             else:
                 await self._accept_inbound_frame(frame)
             return False
-        inbound: (
-            InboundLinkTurn
-            | _InboundLinkTurnFailure
-            | _InboundLinkPayloadRejection
-            | InboundLinkRelayReady
-            | InboundLinkVoiceSpeak
-            | InboundLinkPickerOpen
-            | InboundLinkPickerSelection
-            | InboundLinkSessionFork
-            | InboundLinkCommandCatalog
-            | InboundLinkPersonalityRequest
-            | InboundLinkGenerativeUIFormSubmission
-            | InboundLinkWorkspaceRequest
-            | InboundLinkDeviceToolResult
-            | InboundLinkDeviceToolStatus
-            | None
-        )
-        if payload.get("type") == "attachment.chunk":
-            try:
-                chunk: AttachmentChunk = parse_attachment_chunk(payload)
-                self.attachment_inbox.accept(
-                    sender_device_id=frame.sender_device_id,
-                    chunk=chunk,
-                )
-            except (OSError, ValueError) as exc:
-                await self._reject_inbound_payload(
-                    callback, frame, exc, defer_callbacks=defer_callbacks,
-                )
-                return False
-            inbound = None
-        elif payload.get("type") == "user.message":
-            try:
-                message = parse_user_message(payload)
-            except ValueError as exc:
-                await self._reject_inbound_payload(
-                    callback, frame, exc, defer_callbacks=defer_callbacks,
-                )
-                return False
-            try:
-                sender_id = self.identity_registry.remember(
-                    sender_device_id=frame.sender_device_id,
-                    actor_id=message.actor_id,
-                    actor_name=message.actor_name,
-                    device_name=message.device_name,
-                )
-                attachment_paths, attachment_types = self.attachment_inbox.resolve(
-                    sender_device_id=frame.sender_device_id,
-                    session_id=message.session_id,
-                    agent_id=message.agent_id,
-                    references=message.attachments,
-                )
-            except (OSError, ValueError) as exc:
-                logger.warning(
-                    "Loopdy Link inbound message attachment is unavailable (%s)",
-                    _connection_error_detail(exc),
-                )
-                if defer_callbacks:
-                    self._enqueue_inbound_callback(
-                        callback,
-                        frame,
-                        _InboundLinkTurnFailure(
-                            message=message,
-                            code="attachment_unavailable",
-                            detail=(
-                                "The attached file is unavailable. "
-                                "Attach it again and retry."
-                            ),
-                        ),
-                    )
-                    return False
+        from .inbound_dispatch import AttachmentUnavailable, parse_authenticated_payload
+        try:
+            inbound = parse_authenticated_payload(
+                self, payload, sender_device_id=frame.sender_device_id,
+                sender_epoch=frame.sender_epoch, target_host_id=target_host_id,
+                target_device_id=frame.target_device_id)
+        except AttachmentUnavailable as exc:
+            failure = _InboundLinkTurnFailure(exc.message, "attachment_unavailable", str(exc))
+            if defer_callbacks:
+                self._enqueue_inbound_callback(callback, frame, failure)
+            else:
                 try:
                     await self._send_user_message_result(
-                        message,
-                        status="failed",
-                        code="attachment_unavailable",
-                        message="The attached file is unavailable. Attach it again and retry.",
-                    )
+                        exc.message, status="failed", code=failure.code, message=failure.detail)
                     await self._accept_inbound_frame(frame)
-                except Exception as delivery_error:
-                    logger.warning(
-                        "Loopdy Link could not deliver the correlated attachment failure (%s)",
-                        _connection_error_detail(delivery_error),
-                    )
-                    await self._close_for_reconnect(
-                        "correlated attachment failure delivery failed"
-                    )
-                return False
-            inbound = InboundLinkTurn(
-                message=message,
-                sender_id=sender_id,
-                sender_device_id=frame.sender_device_id,
-                attachment_paths=attachment_paths,
-                attachment_types=attachment_types,
-                sender_epoch=frame.sender_epoch,
-                target_host_id=target_host_id or self.config.device_id,
-                authority_origin=_link_authority_origin(self.config),
-            )
-        elif payload.get("type") == "relay.ready":
-            registration = parse_relay_ready(payload)
-            if registration.device_id != frame.sender_device_id:
-                raise ValueError("Loopdy Link relay device does not match the verified sender")
-            if _expired_host_relay(registration):
-                await self._reject_inbound_payload(
-                    callback, frame,
-                    ExpiredHostRelayEnrollment("Loopdy Link host-relay enrollment has expired"),
-                    defer_callbacks=defer_callbacks,
-                )
-                return False
-            inbound = InboundLinkRelayReady(
-                registration=registration,
-                sender_device_id=frame.sender_device_id,
-            )
-        elif payload.get("type") == "voice.speak.request":
-            inbound = InboundLinkVoiceSpeak(
-                request=parse_voice_speak_request(payload),
-                sender_device_id=frame.sender_device_id,
-            )
-        elif payload.get("type") == "picker.open":
-            inbound = InboundLinkPickerOpen(
-                request=parse_picker_open(payload),
-                sender_device_id=frame.sender_device_id,
-            )
-        elif payload.get("type") == "picker.select":
-            inbound = InboundLinkPickerSelection(
-                selection=parse_picker_selection(payload),
-                sender_device_id=frame.sender_device_id,
-            )
-        elif payload.get("type") == "session.fork.request":
-            request = parse_session_fork_request(payload)
-            sender_id = self.identity_registry.remember(
-                sender_device_id=frame.sender_device_id,
-                actor_id=request.actor_id,
-                actor_name=request.actor_name,
-                device_name=request.device_name,
-            )
-            inbound = InboundLinkSessionFork(
-                request=request,
-                sender_id=sender_id,
-                sender_device_id=frame.sender_device_id,
-            )
-        elif payload.get("type") == "commands.catalog.request":
-            inbound = InboundLinkCommandCatalog(
-                request=parse_command_catalog_request(payload),
-                sender_device_id=frame.sender_device_id,
-            )
-        elif payload.get("type") in {
-            "personalities.catalog.request",
-            "personalities.mutate",
-        }:
-            inbound = InboundLinkPersonalityRequest(
-                request=parse_personality_request(payload),
-                sender_device_id=frame.sender_device_id,
-            )
-        elif payload.get("type") == "generative.ui.form.submit":
-            inbound = InboundLinkGenerativeUIFormSubmission(
-                request=parse_generative_ui_form_submission(payload),
-                sender_device_id=frame.sender_device_id,
-            )
-        elif payload.get("type") == "workspace.request":
-            try:
-                request = parse_workspace_request(payload)
-            except ValueError as exc:
-                await self._reject_inbound_payload(
-                    callback, frame, exc, defer_callbacks=defer_callbacks,
-                    response=workspace_rejection(payload, sent_at=int(time.time())),
-                )
-                return False
-            from .wiki_transport import authority_id
-            inbound = InboundLinkWorkspaceRequest(
-                request=request,
-                sender_device_id=frame.sender_device_id,
-                target_host_id=target_host_id,
-                authority_id=(
-                    authority_id(self.config)
-                    if request.operation in AVAILABLE_WIKI_OPERATIONS else None
-                ),
-                sender_epoch=frame.sender_epoch,
-            )
-        elif payload.get("type") == "device.tool.result":
-            if frame.target_device_id != self.config.device_id:
-                raise ValueError("Loopdy Link device tool result target is invalid")
-            inbound = InboundLinkDeviceToolResult(
-                result=parse_device_tool_result(
-                    payload,
-                    sender_device_id=frame.sender_device_id,
-                    sender_epoch=frame.sender_epoch,
-                ),
-                sender_device_id=frame.sender_device_id,
-                sender_epoch=frame.sender_epoch,
-                target_device_id=frame.target_device_id,
-            )
-        elif payload.get("type") == "device.tools.status":
-            if frame.target_device_id != self.config.device_id:
-                raise ValueError("Loopdy Link device tool status target is invalid")
-            inbound = InboundLinkDeviceToolStatus(
-                status=parse_device_tool_status(
-                    payload,
-                    sender_device_id=frame.sender_device_id,
-                    sender_epoch=frame.sender_epoch,
-                ),
-                sender_device_id=frame.sender_device_id,
-                sender_epoch=frame.sender_epoch,
-                target_device_id=frame.target_device_id,
-            )
-        else:
-            # Authenticated unfamiliar application payloads (including newer
-            # workspace.rejected responses) are not business actions to replay.
+                except Exception:
+                    await self._close_for_reconnect("correlated attachment failure delivery failed")
+            return False
+        except (OSError, ValueError) as exc:
             await self._reject_inbound_payload(
-                callback, frame, ValueError("Loopdy Link payload type is unsupported"),
-                defer_callbacks=defer_callbacks,
-            )
+                callback, frame, exc, defer_callbacks=defer_callbacks,
+                response=(workspace_rejection(payload, sent_at=int(time.time()))
+                          if payload.get("type") == "workspace.request" else None))
             return False
         if defer_callbacks:
             self._enqueue_inbound_callback(callback, frame, inbound)
@@ -1698,6 +1531,12 @@ class LoopdyLinkClient:
             if future is not None and not future.done():
                 future.set_result(None)
             return
+        if (pending.delivery_class == "presentation"
+                and STATE_BACKED_PRESENTATION_CAPABILITY not in self.peer_capabilities):
+            # Never strip a delivery class or discard an admitted frame during
+            # a service downgrade. Exact readiness ACK above may settle it;
+            # otherwise preserve ownership until compatible transport returns.
+            raise ConnectionError("Pending presentation requires negotiated state-backed transport")
         if self._transport_get("failed_pending_frame_id") == pending.frame_id:
             self._transport_set("outbound_sequence", server_sequence)
             self._transport_set("last_received_sequence", max(received, server_ack))
@@ -1741,6 +1580,7 @@ class LoopdyLinkClient:
             ack=max(pending.ack, server_ack),
             ciphertext=self.cipher.seal(self.cipher.open(pending.ciphertext)),
             target_device_id=pending.target_device_id,
+            delivery_class=pending.delivery_class,
         )
         if self._backpressured_frame_id == pending.frame_id:
             self._backpressured_frame_id = rebased.frame_id

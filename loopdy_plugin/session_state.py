@@ -10,6 +10,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import sqlite3
+from contextlib import closing
+from pathlib import Path
 from typing import Any
 
 
@@ -66,10 +69,64 @@ def _parse_revision(value: Any) -> dict[str, int]:
     return {key: _integer(number, 2**63 - 1) for key, number in value.items()}
 
 
-def _message(row: dict[str, Any]) -> dict[str, Any]:
-    from hermes_cli.web_routers.sessions import _project_for_display
+def open_profile_store(profile: str, callback: Any, *, read_only: bool = True) -> Any:
+    """Use public profile resolution and a separately owned read-only store."""
+    from hermes_cli.profiles import get_profile_dir, profile_exists, validate_profile_name
+    from hermes_state import SessionDB
+    validate_profile_name(profile)
+    if not read_only or not profile_exists(profile):
+        raise LookupError("Profile unavailable")
+    path = get_profile_dir(profile) / "state.db"
+    if not path.is_file():
+        raise SessionStateNotFound("Profile session store is unavailable")
+    with closing(SessionDB(db_path=path, read_only=True)) as db:
+        return callback(db)
 
-    projected = _project_for_display([row])[0]
+
+def read_coordinates(db: Any, sql: str, parameters: tuple[Any, ...]) -> list[Any]:
+    """Inspect schema/row coordinates without core-private connection helpers.
+
+    The documented SQLite store is opened read-only with a bounded VM budget.
+    Transcript selection remains the public SessionDB.get_messages contract.
+    Unsupported schema or excessive work is unavailable, never a full scan fallback.
+    """
+    path = Path(db.db_path).absolute()
+    try:
+        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=1)) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only = ON")
+            remaining = 200
+            def budget() -> int:
+                nonlocal remaining
+                remaining -= 1
+                return int(remaining <= 0)
+            connection.set_progress_handler(budget, 1_000)
+            return connection.execute(sql, parameters).fetchall()
+    except sqlite3.Error:
+        raise SessionStateUnavailable("Bounded session coordinates unavailable") from None
+
+
+def display_index_ready(db: Any, stored_id: str) -> bool:
+    columns = {row["name"] for row in read_coordinates(db, "PRAGMA table_info(messages)", ())}
+    if not {"display_order", "display_identity", "active", "compacted"} <= columns:
+        return False
+    return not read_coordinates(db,
+        "SELECT id FROM messages WHERE session_id = ? AND (active = 1 OR compacted = 1) "
+        "AND (display_order IS NULL OR display_identity IS NULL) LIMIT 1", (stored_id,))
+
+
+def _message(row: dict[str, Any]) -> dict[str, Any]:
+    from agent.compaction_display import project_compaction_message_for_display
+    from agent.context_compressor import is_compaction_summary_message
+
+    projected = dict(row)
+    if is_compaction_summary_message(row):
+        display = project_compaction_message_for_display(row)
+        if display is None:
+            projected.setdefault("display_kind", "hidden")
+        else:
+            projected["display_content"] = display.get("content")
+            projected.pop("display_kind", None)
     content = projected.get("display_content")
     if content is None or content == "":
         content = projected.get("content")
@@ -94,22 +151,16 @@ class SessionStateReader:
 
     async def read_profile(self, *, agent_id: str, stored_id: str,
                            cursor: dict[str, Any] | None = None) -> dict[str, Any]:
-        from hermes_cli.web_routers.sessions import _with_db
-
-        # The official opener validates/resolves the profile; no filesystem or
-        # default-profile fallback is inferred from a requested identifier.
         return await asyncio.to_thread(
-            _with_db, agent_id,
+            open_profile_store, agent_id,
             lambda db: self.read(db, agent_id=agent_id, stored_id=stored_id, cursor=cursor),
             read_only=True,
         )
 
     async def content_profile(self, *, agent_id: str, stored_id: str,
                               reference: dict[str, Any], offset: int = 0) -> dict[str, Any]:
-        from hermes_cli.web_routers.sessions import _with_db
-
         return await asyncio.to_thread(
-            _with_db, agent_id,
+            open_profile_store, agent_id,
             lambda db: self.content(db, agent_id=agent_id, stored_id=stored_id,
                                     reference=reference, offset=offset),
             read_only=True,
@@ -140,9 +191,9 @@ class SessionStateReader:
         # Bound catch-up work. Compaction archives old rows, so it cannot satisfy
         # the active-count equality even when its replacement rows have new IDs.
         # Hermes' public projection omits display_order. Inspect only these two
-        # indexed coordinates, using the same SessionDB read connection helper;
+        # indexed coordinates through our own read-only SQLite connection;
         # leave all transcript selection/deduplication to get_messages below.
-        rows = db._read_all(
+        rows = read_coordinates(db,
             "SELECT id, display_order FROM messages WHERE session_id = ? AND active = 1 AND id > ? ORDER BY id LIMIT 257",
             (stored_id, previous["head"]),
         )
@@ -164,14 +215,13 @@ class SessionStateReader:
         # resolve a visible chat alias before requesting this reader.
         if db.get_session(stored_id) is None:
             raise SessionStateNotFound("Session is no longer available")
-        ensure_index = getattr(db, "_ensure_display_order", None)
         for _ in range(3):
             resolved = db.resolve_resume_session_id(stored_id)
             if resolved != stored_id:
                 if cursor is not None:
                     raise SessionStateResetRequired("Session continuation moved")
                 stored_id = resolved
-            if not callable(ensure_index) or not ensure_index(stored_id):
+            if not display_index_ready(db, stored_id):
                 # Hermes' legacy read-only fallback scans the entire transcript.
                 # Require its indexed display reader instead of silently taking it.
                 raise SessionStateUnavailable("Hermes display history index is not ready")

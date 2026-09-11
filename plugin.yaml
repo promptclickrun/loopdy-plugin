@@ -2,7 +2,7 @@ manifest_version: 1
 name: loopdy
 label: Loopdy
 kind: platform
-version: "2.11.2"
+version: "2.12.0"
 license: Apache-2.0
 description: >
   Native Hermes platform for encrypted Loopdy Link chat and workspace controls,
@@ -10,6 +10,14 @@ description: >
   Delivers proactive notifications through Expo, Apple, or an encrypted relay while keeping
   authoritative event details on the authenticated Hermes host.
 author: Loopdy contributors
+config_schema:
+  direct:
+    type: dict
+    default: {enabled: false, origin: "", port: 0}
+    description: >
+      Private direct transport. enabled requires an explicit HTTPS origin and
+      fixed loopback port (1-65535). HTTPS/Tailscale routing is operator-owned;
+      changing settings does not activate or restart the Hermes gateway.
 optional_env:
   - LOOPDY_HOME_TARGET
   - LOOPDY_WORKSPACE_GIT_CONFIG
@@ -26,6 +34,7 @@ optional_env:
   - LOOPDY_LINK_ACCOUNT_KEY
   - LOOPDY_MARKETPLACE_TRUSTED_ED25519_KEYS
 provides_hooks:
+  - pre_approval_request
   - pre_llm_call
   - post_llm_call
   - post_api_request

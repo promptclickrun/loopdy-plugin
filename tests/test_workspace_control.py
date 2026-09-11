@@ -3237,7 +3237,7 @@ class HermesWorkspaceBackendTests(unittest.TestCase):
                 "profile": "default",
                 "sessionId": "cron_job-123_20260815_120000",
                 "approvalId": None,
-                "detail": {"agent_name": "Gordie"},
+                "detail": {"agent_name": "Gordie", "job_id": "job-123", "task_id": "job-123"},
                 "createdAt": 1_788_000_000,
                 "isRead": False,
                 "isPinned": False,
@@ -3413,6 +3413,8 @@ class HermesWorkspaceBackendTests(unittest.TestCase):
                     "detail": {
                         "agent_name": "Gordie",
                         "title": "Morning weather",
+                        "job_id": "job-completed",
+                        "task_id": "job-completed",
                         "status": "completed",
                         "summary": "Bring an umbrella after 4 PM.",
                     },
@@ -3430,6 +3432,8 @@ class HermesWorkspaceBackendTests(unittest.TestCase):
                     "detail": {
                         "agent_name": "Researcher",
                         "title": "Research digest",
+                        "job_id": "job-failed",
+                        "task_id": "job-failed",
                         "status": "failed",
                         "summary": "The source rejected the final request.",
                     },
@@ -3447,6 +3451,8 @@ class HermesWorkspaceBackendTests(unittest.TestCase):
                     "detail": {
                         "agent_name": "Gordie",
                         "title": "Compressed weather",
+                        "job_id": "job-compressed",
+                        "task_id": "job-compressed",
                         "status": "completed",
                         "summary": "The compressed run is ready.",
                     },

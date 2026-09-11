@@ -57,6 +57,7 @@ class LinkActivityBroker:
         self._pending_publications: deque[dict[str, Any]] = deque()
         self._publication_wakeup: asyncio.Queue[dict[str, Any]] | None = None
         self._sender: Callable[[dict[str, Any]], Awaitable[Any]] | None = None
+        self._presentation_observer: Callable[[dict[str, Any]], Any] | None = None
         self._live_activity_sender: Callable[[dict[str, Any]], Awaitable[Any]] | None = None
         self._drain_task: asyncio.Task[None] | None = None
         self._context_task: asyncio.Task[None] | None = None
@@ -776,12 +777,31 @@ class LinkActivityBroker:
                 )
             return delivered
 
+    def set_presentation_observer(self, observer: Callable[[dict[str, Any]], Any] | None) -> None:
+        """Observe presentation before relay queueing, including while offline.
+
+        The collaborator must be synchronous, bounded and thread-safe. Never
+        perform network or filesystem work from a Hermes hook thread here.
+        """
+        with self._lock:
+            self._presentation_observer = observer
+
     def publish(self, payload: dict[str, Any]) -> bool:
+        with self._lock:
+            observer = self._presentation_observer
+        observed = False
+        if observer is not None:
+            try:
+                observer(dict(payload))
+                observed = True
+            except Exception:
+                # Independent presentation failure cannot disable legacy Link.
+                logger.warning("Loopdy presentation observer rejected an event")
         with self._lock:
             loop = self._loop
             queue = self._queue
             if loop is None or queue is None or loop.is_closed():
-                return False
+                return observed
             # Bound work before crossing threads. Bounding only asyncio.Queue
             # left an unbounded event-loop callback (and payload) per hook.
             if len(self._pending_publications) >= self.maximum_queue_size:

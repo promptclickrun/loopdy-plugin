@@ -237,6 +237,17 @@ class SessionStreamHub:
                 self._schedule_wake_locked(subscription)
             return encoded.cursor
 
+    def reset(self, *, agent_id: str, session_id: str) -> int:
+        """End only the affected feed when current state cannot be represented."""
+        agent_id = _scope(agent_id, "agent_id", maximum=96)
+        session_id = _scope(session_id, "session_id", maximum=180)
+        with self._lock:
+            self._cursor += 1
+            for subscription in tuple(self._subscriptions.values()):
+                if subscription._agent_id == agent_id and subscription._session_id == session_id:
+                    self._reset_locked(subscription, cursor=self._cursor)
+            return self._cursor
+
     def _encode_payload(
         self, *, agent_id: str, session_id: str, payload: dict[str, Any]
     ) -> bytes:

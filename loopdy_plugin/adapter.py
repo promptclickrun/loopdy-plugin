@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import hashlib
 import inspect
 import json
 import logging
@@ -27,8 +28,15 @@ from gateway.platforms.base import (
 from gateway.session import SessionSource, build_session_key
 from hermes_constants import get_hermes_home
 
+from .inbound_dispatch import (
+    AuthenticatedRequestOwner, ReplyRoute, TurnReplyRegistry, DirectResponseCapture,
+    AttachmentUnavailable, parse_authenticated_payload, current_reply_route, current_turn_lease,
+)
+from .direct_runtime import DirectRuntime, DirectSettings, runtime_owner
+from .control_replies import capture_control_replies, capture_control_reply
 from .events import EVENT_TYPES, LoopdyEvent, build_event
 from .link_client import (
+    InboundLinkDirectEnrollment,
     InboundLinkCommandCatalog,
     InboundLinkDeviceToolResult,
     InboundLinkDeviceToolStatus,
@@ -69,6 +77,8 @@ from .link_contracts import (
     workspace_result,
     DEVICE_TOOL_CAPABILITY,
     DIRECTED_FRAMES_CAPABILITY,
+    DIRECT_ENROLLMENT_CAPABILITY,
+    STATE_BACKED_PRESENTATION_CAPABILITY,
 )
 from .device_tools import DeviceToolBridge
 from .generative_ui import (
@@ -125,6 +135,8 @@ class _PendingPickerRequest:
     request: PickerOpen
     sender_device_id: str
     expires_at: float
+    route: ReplyRoute | None = None
+    ready: Any = None
 
 
 @dataclass(frozen=True)
@@ -137,6 +149,7 @@ class _ActivePicker:
     allowed_models: frozenset[tuple[str, str]]
     allowed_values: frozenset[str]
     expires_at: float
+    route: ReplyRoute | None = None
 
 
 class VoiceSynthesisError(RuntimeError):
@@ -343,6 +356,15 @@ class LoopdyAdapter(BasePlatformAdapter):
         plugin_update_manager: PluginUpdateManager | None = None,
         device_tool_bridge: DeviceToolBridge | None = None,
         wiki_transport: Any | None = None,
+        direct_settings: DirectSettings | None = None,
+        direct_settings_getter: Callable | None = None,
+        direct_runtime_factory: Callable = DirectRuntime,
+        direct_session_opener: Callable | None = None,
+        presentation_observer: Callable | None = None,
+        voice_dispatch: Callable | None = None,
+        live_voice_settings_getter: Callable | None = None,
+        live_voice_provider_factory: Callable | None = None,
+        live_voice_storage_root: Path | None = None,
         voice_synthesizer: Callable[[VoiceSpeakRequest], SynthesizedVoiceAudio] = synthesize_voice_audio,
     ):
         # Restart and shutdown pings are operator lifecycle signals, not user
@@ -352,6 +374,32 @@ class LoopdyAdapter(BasePlatformAdapter):
         self.service = service or get_service()
         self.home_target = str((config.extra or {}).get("home_target") or "all").strip()
         self.link_client = link_client
+        self.direct_settings = direct_settings or DirectSettings()
+        self._direct_settings_getter = direct_settings_getter
+        self._direct_runtime_factory = direct_runtime_factory
+        self.direct_runtime = None
+        self.direct_configuration_error = ""
+        self._direct_start_task = None
+        self._direct_session_opener = direct_session_opener
+        self._presentation_lock = threading.RLock()
+        self._session_presentation = None
+        self._presentation_hub = None
+        self._presentation_owner = None
+        self._presentation_scopes: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
+        self._presentation_evicted = False
+        self._presentation_runs = {}
+        self._presentation_observer = presentation_observer
+        self._voice_dispatch = voice_dispatch
+        self._live_voice_runtime = None
+        self._live_voice_settings_getter = live_voice_settings_getter
+        self._live_voice_provider_factory = live_voice_provider_factory
+        self._live_voice_storage_root = live_voice_storage_root
+        self._turn_replies = TurnReplyRegistry()
+        self._processing_turns = set()
+        self._transport_generation = encode_base64url(os.urandom(18))
+        self._link_state = link_state
+        self._control_response_task: contextvars.ContextVar[Any] = contextvars.ContextVar("loopdy_control_task", default=None)
+        self._busy_response: contextvars.ContextVar[Any] = contextvars.ContextVar("loopdy_busy_response", default=None)
         self._wiki_uses_runtime_config = link_client is None
         from .wiki_transport import production_factory
         self.wiki_transport = wiki_transport or production_factory(
@@ -374,6 +422,7 @@ class LoopdyAdapter(BasePlatformAdapter):
                 ),
                 session_goal_getter=self.goal_snapshot_for_session,
                 session_runtime_getter=self.runtime_snapshot_for_session,
+                session_presentation_getter=self.session_presentation_snapshot,
                 connection_id_getter=self._link_workspace_connection_id,
                 plugin_update_manager=plugin_update_manager,
                 workspace_git_state_path=(
@@ -417,6 +466,8 @@ class LoopdyAdapter(BasePlatformAdapter):
                     CARD_TEMPLATE_CAPABILITY,
                     DEVICE_TOOL_CAPABILITY,
                     DIRECTED_FRAMES_CAPABILITY,
+                    DIRECT_ENROLLMENT_CAPABILITY,
+                    STATE_BACKED_PRESENTATION_CAPABILITY,
                 ]
                 try:
                     marketplace_client = build_marketplace_gateway_client(runtime_config)
@@ -458,6 +509,8 @@ class LoopdyAdapter(BasePlatformAdapter):
                     store=self.service.store,
                     release_client=marketplace_client,
                 )
+
+        self._start_session_presentation()
 
     def _wiki_current_config(self):
         from .wiki_transport import authority_id
@@ -714,8 +767,467 @@ class LoopdyAdapter(BasePlatformAdapter):
 
         return snapshot
 
+    def set_voice_dispatch(self, dispatcher: Callable | None) -> None:
+        """Bind a plugin-owned voice coordinator after adapter construction."""
+        if dispatcher is not None and not callable(dispatcher):
+            raise TypeError("voice dispatcher must be callable")
+        self._voice_dispatch = dispatcher
+
+    def _ensure_live_voice_runtime(self):
+        if self._live_voice_runtime is None:
+            from .live_voice_runtime import LiveVoiceRuntime
+            self._live_voice_runtime = LiveVoiceRuntime(
+                self, storage_root=self._live_voice_storage_root or
+                get_hermes_home() / "plugin-data" / "loopdy" / "live-voice",
+                provider_factory=self._live_voice_provider_factory,
+                settings_getter=self._live_voice_settings_getter)
+        return self._live_voice_runtime
+
+    async def _dispatch_live_voice(self, context, payload, route):
+        dispatch = self._voice_dispatch or self._ensure_live_voice_runtime().dispatch
+        return await dispatch(context, payload, route)
+
+    def _direct_current_config(self):
+        # Configuration is reread without depending on the relay socket's state.
+        if self._wiki_uses_runtime_config:
+            return load_runtime_config()
+        return getattr(self.link_client, "config", None)
+
+    def _on_direct_status(self, runtime, available):
+        if self.direct_runtime is not runtime:
+            return
+        if available or bool(getattr(self.link_client, "connected", False)):
+            self._mark_connected()
+        else:
+            self._mark_disconnected()
+        if runtime.retired:
+            # A listener-only configuration change must not erase relay state;
+            # a changed pairing must. This lifecycle callback may read config,
+            # unlike the synchronous broker capture hook.
+            try:
+                config = self._direct_current_config()
+                owner = runtime_owner(config) if config is not None else None
+            except Exception:
+                owner = None
+            if owner != self._presentation_owner:
+                self._close_session_presentation()
+            self.device_tool_bridge.retire_direct(runtime.generation)
+            self._pending_picker_requests = {
+                key: value for key, value in self._pending_picker_requests.items()
+                if value.route is None or value.route.owner.generation != runtime.generation}
+            self._active_pickers = {
+                key: value for key, value in self._active_pickers.items()
+                if value.route is None or value.route.owner.generation != runtime.generation}
+
+    def _start_session_presentation(self):
+        """Gateway/account ownership, independent of either transport socket."""
+        from .session_presentation import SessionPresentationStore
+        from .session_stream import SessionStreamHub
+        with self._presentation_lock:
+            config = getattr(self.link_client, "config", None)
+            owner = runtime_owner(config) if config is not None else None
+            if self._session_presentation is not None and owner == self._presentation_owner:
+                return
+            if owner != self._presentation_owner:
+                self._link_session_profiles.clear()
+            self._close_session_presentation()
+            self._presentation_owner = owner
+            self._presentation_hub = SessionStreamHub()
+            # Leave room for the canonical 128-KiB page and workspace envelope.
+            self._session_presentation = SessionPresentationStore(
+                self._presentation_hub, maximum_bytes=48_000)
+            setter = getattr(self.activity_broker, "set_presentation_observer", None)
+            if callable(setter):
+                setter(self._capture_broker_presentation)
+
+    def _close_session_presentation(self):
+        with self._presentation_lock:
+            setter = getattr(self.activity_broker, "set_presentation_observer", None)
+            if callable(setter):
+                setter(None)
+            if self._session_presentation is not None:
+                assert self._presentation_hub is not None
+                for agent_id, session_id in self._presentation_scopes:
+                    self._presentation_hub.reset(agent_id=agent_id, session_id=session_id)
+                self._session_presentation.close()
+            self._session_presentation = None
+            self._presentation_scopes.clear()
+            self._presentation_runs.clear()
+            self._presentation_evicted = False
+
+    def _check_presentation_owner(self):
+        config = getattr(self.link_client, "config", None)
+        owner = runtime_owner(config) if config is not None else None
+        if owner != self._presentation_owner:
+            self._close_session_presentation()
+            self._link_session_profiles.clear()
+            raise ConnectionError("Session presentation account retired")
+        if self._session_presentation is None:
+            raise ConnectionError("Session presentation gateway retired")
+
+    def _presentation_scope(self, agent_id, session_id):
+        import re
+        # Reject normalization, contradictory bindings and unknown bare events.
+        if (not isinstance(agent_id, str) or not agent_id
+                or not re.fullmatch(r"[A-Za-z0-9_-]{1,96}", agent_id)
+                or not isinstance(session_id, str) or not session_id
+                or not re.fullmatch(r"[A-Za-z0-9_-]{1,180}", session_id)):
+            raise ValueError("Session presentation scope is invalid")
+        known = self._link_session_profiles.get(session_id)
+        if known is not None and known != agent_id:
+            raise ValueError("Session presentation profile contradicts binding")
+        return agent_id, session_id
+
+    def _admit_presentation_scope(self, scope):
+        assert self._session_presentation is not None and self._presentation_hub is not None
+        record = self._presentation_scopes.get(scope)
+        if record is None:
+            if len(self._presentation_scopes) >= self._session_presentation.maximum_sessions:
+                retired, _ = self._presentation_scopes.popitem(last=False)
+                self._session_presentation.retire(agent_id=retired[0], session_id=retired[1])
+                self._presentation_hub.reset(agent_id=retired[0], session_id=retired[1])
+                self._presentation_runs.pop(retired, None)
+                self._presentation_evicted = True
+            record = {"cursor": 0, "incomplete": self._presentation_evicted}
+            self._presentation_scopes[scope] = record
+        self._presentation_scopes.move_to_end(scope)
+        return record
+
+    def _capture_broker_presentation(self, payload):
+        agent_id = payload.get("agentId")
+        if agent_id is None:
+            agent_id = self._link_session_profiles.get(payload.get("sessionId"))
+        self._capture_session_presentation(agent_id, payload)
+
+    async def _send_broker_payload(self, payload):
+        client = self.link_client
+        if client is None:
+            raise ConnectionError("Loopdy Link is not configured")
+        if payload.get("type") == "assistant.message" and payload.get("delivery") == "draft":
+            self._require_captured_draft(payload)
+            if STATE_BACKED_PRESENTATION_CAPABILITY in set(getattr(client, "capabilities", ())):
+                return await client.send_payload(payload, owner_check=lambda: self._require_captured_draft(payload))
+        return await client.send_payload(payload)
+
+    def _capture_session_presentation(self, agent_id, payload):
+        with self._presentation_lock:
+            self._check_presentation_owner()
+            assert self._session_presentation is not None and self._presentation_hub is not None
+            scope = self._presentation_scope(agent_id, payload.get("sessionId"))
+            if payload.get("agentId", agent_id) != agent_id:
+                raise ValueError("Session presentation profile mismatch")
+            record = self._admit_presentation_scope(scope)
+            try:
+                self._session_presentation.publish(agent_id=agent_id, payload=payload)
+                snapshot = self.session_presentation_snapshot(*scope)
+                if not snapshot["complete"]:
+                    raise ValueError("Current session presentation is incomplete")
+                return True
+            except Exception:
+                record["incomplete"] = True
+                record["cursor"] = self._presentation_hub.reset(
+                    agent_id=scope[0], session_id=scope[1])
+                raise
+
+    def session_presentation_snapshot(self, agent_id: str, session_id: str) -> dict[str, Any]:
+        """Synchronous, detached live state for the exact authorized visible scope.
+
+        Consumers bracket this read with canonical revision checks. They must
+        reject incomplete snapshots, and use exact platform message IDs only
+        when reconciling canonical rows with these presentation events.
+        """
+        from .link_contracts import _workspace_json
+        with self._presentation_lock:
+            self._check_presentation_owner()
+            assert self._session_presentation is not None and self._presentation_hub is not None
+            scope = self._presentation_scope(agent_id, session_id)
+            snapshot = self._session_presentation.snapshot(agent_id=agent_id, session_id=session_id)
+            record = self._presentation_scopes.get(scope)
+            if record is not None:
+                snapshot["coverageCursor"] = max(snapshot["coverageCursor"], record["cursor"])
+                snapshot["complete"] = snapshot["complete"] and not record["incomplete"]
+            elif self._presentation_evicted:
+                snapshot["complete"] = False
+            try:
+                # Validate at the actual workspace nesting depth, not just the
+                # event's standalone JSON size (cards may be more deeply nested).
+                _workspace_json({"live": snapshot}, depth=0)
+            except ValueError:
+                record = self._admit_presentation_scope(scope)
+                record["incomplete"] = True
+                record["cursor"] = self._presentation_hub.reset(agent_id=agent_id, session_id=session_id)
+                snapshot = {"coverageCursor": record["cursor"], "events": [], "complete": False}
+            return snapshot
+
+    def _require_captured_draft(self, payload):
+        if payload.get("type") != "assistant.message" or payload.get("delivery") != "draft":
+            return
+        snapshot = self.session_presentation_snapshot(payload.get("agentId"), payload.get("sessionId"))
+        if not snapshot["complete"] or payload not in snapshot["events"]:
+            # Link currently labels negotiated drafts as disposable. Do not
+            # submit one unless this exact projection really is recoverable.
+            raise ValueError("Draft has no complete state-backed presentation")
+
+    async def _start_direct(self) -> bool:
+        runtime = None
+        try:
+            settings = (self._direct_settings_getter() if self._direct_settings_getter
+                        else self.direct_settings)
+            if not settings.enabled:
+                return False
+            client = self.link_client
+            config = self._direct_current_config()
+            if config is None or client is None:
+                raise ValueError("Direct requires an existing Link pairing")
+            with self._presentation_lock:
+                self._check_presentation_owner()
+                if runtime_owner(config) != self._presentation_owner:
+                    self._close_session_presentation()
+                    raise ValueError("Direct pairing contradicts presentation owner")
+                hub = self._presentation_hub
+            runtime = self._direct_runtime_factory(
+                settings=settings, config=config,
+                state=self._link_state or client.state,
+                journal_path=get_hermes_home() / "plugin-data" / "loopdy" / "direct-commands.sqlite3",
+                dispatch=self.dispatch_direct, open_session=self.open_direct_session,
+                config_getter=self._direct_current_config,
+                settings_getter=self._direct_settings_getter,
+                status_callback=self._on_direct_status, hub=hub)
+            self.direct_runtime = runtime
+            await runtime.start()
+            self.direct_configuration_error = ""
+            self._observe_presentation("runtime_started", runtime=runtime)
+            return True
+        except asyncio.CancelledError:
+            if runtime is not None:
+                await runtime.stop()
+            if self.direct_runtime is runtime:
+                self.direct_runtime = None
+            raise
+        except Exception as error:
+            self.direct_configuration_error = type(error).__name__
+            if runtime is not None:
+                await runtime.stop()
+            if self.direct_runtime is runtime:
+                self.direct_runtime = None
+            return False
+
+    async def _wait_for_transport(self) -> bool:
+        # Race independently owned readiness, not direct behind a relay wait.
+        if self.direct_runtime is not None and self.direct_runtime.available:
+            return True
+        direct = self._direct_start_task
+        link = asyncio.create_task(self._wait_for_link_connection())
+        pending = {link}
+        if direct is not None:
+            pending.add(direct)
+        try:
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    if task.result() and (task is link or
+                            self.direct_runtime is not None and self.direct_runtime.available):
+                        return True
+            return False
+        finally:
+            if not link.done():
+                link.cancel()
+                await asyncio.gather(link, return_exceptions=True)
+            # Direct startup is adapter-owned and may complete after relay ready.
+
+    def _observe_presentation(self, event_name: str, **coordinates) -> bool:
+        captured = False
+        try:
+            with self._presentation_lock:
+                lease = coordinates.get("lease")
+                if lease is not None:
+                    lease.route.check_current()
+                if event_name == "assistant_message":
+                    captured = self._capture_session_presentation(
+                        coordinates["profile"], coordinates["payload"])
+                elif event_name == "processing_start":
+                    event = coordinates.get("event")
+                    source = getattr(event, "source", None)
+                    # Real Link and direct turns both carry registered leases;
+                    # legacy hooks require an explicit, verified source binding.
+                    agent_id = lease.profile if lease else getattr(source, "profile", None)
+                    session_id = lease.session_id if lease else getattr(source, "chat_id", None)
+                    if (lease is not None or (isinstance(session_id, str) and agent_id
+                                             and self._link_session_profiles.get(session_id) == agent_id)):
+                        self._check_presentation_owner()
+                        assert self._session_presentation is not None and self._presentation_hub is not None
+                        scope = self._presentation_scope(agent_id, session_id)
+                        generation = lease.generation if lease else getattr(event, "message_id", None)
+                        if not generation:
+                            raise ValueError("Processing start has no exact run identity")
+                        if self._presentation_runs.get(scope) != generation:
+                            record = self._admit_presentation_scope(scope)
+                            self._session_presentation.retire(agent_id=scope[0], session_id=scope[1])
+                            record["cursor"] = self._presentation_hub.reset(agent_id=scope[0], session_id=scope[1])
+                            record["incomplete"] = False
+                            self._presentation_runs[scope] = generation
+                elif event_name == "processing_complete" and lease is not None:
+                    scope = (lease.profile, lease.session_id)
+                    if self._presentation_runs.get(scope) == lease.generation:
+                        self._presentation_runs.pop(scope, None)
+                        # Hermes's processing-complete boundary follows its
+                        # durable turn flush. Finals belong to canonical history,
+                        # not an uncorrelated overlay retained until another turn.
+                        if self._session_presentation is not None and self._presentation_hub is not None:
+                            self._session_presentation.retire(agent_id=scope[0], session_id=scope[1])
+                            record = self._admit_presentation_scope(scope)
+                            record["cursor"] = self._presentation_hub.reset(agent_id=scope[0], session_id=scope[1])
+                            record["incomplete"] = False
+        except Exception:
+            logger.warning("Loopdy session presentation update unavailable")
+        voice = self._live_voice_runtime
+        if voice is not None:
+            try:
+                voice.observe(event_name, **coordinates)
+            except Exception:
+                logger.warning("Loopdy live job observer unavailable")
+        observer = self._presentation_observer
+        if observer is not None:
+            try:
+                observer(event_name, **coordinates)
+            except Exception:
+                logger.warning("Loopdy presentation observer failed (%s)", event_name)
+        return captured
+
+    async def open_direct_session(self, context, agent_id: str, session_id: str):
+        runtime = self.direct_runtime
+        if runtime is None:
+            raise ValueError("session snapshots are unavailable")
+        route = runtime.reply_route(context)
+        route.check_current()
+        opener = self._direct_session_opener or self._open_session_snapshot
+        view = await opener(runtime, context, agent_id, session_id)
+        try:
+            route.check_current()
+            return view
+        except BaseException:
+            view.subscription.close()
+            raise
+
+    async def _open_session_snapshot(self, runtime, context, agent_id, session_id):
+        from .direct_server import DirectSessionView
+        from .link_contracts import parse_workspace_request
+        if self._session_presentation is None or runtime.hub is not self._presentation_hub:
+            raise ValueError("session presentation unavailable")
+        # Authenticated scope is authorized by the existing canonical state
+        # operation, not by a caller-supplied stored/visible alias relationship.
+        request = parse_workspace_request({"version": 1, "type": "workspace.request",
+            "requestId": encode_base64url(os.urandom(18)), "operation": "sessions.state",
+            "payload": {"agentId": agent_id, "storedId": session_id}, "sentAt": int(time.time())})
+        feed = runtime.subscribe(agent_id=agent_id, session_id=session_id)
+        cursor = feed.cursor
+        try:
+            state = await self.workspace_controller.execute(request)
+            if state.get("agentId") != agent_id or state.get("sessionId") != session_id:
+                raise ValueError("canonical session scope mismatch")
+            live = state.pop("live", None)
+            if not isinstance(live, dict) or live.get("complete") is not True:
+                raise ValueError("complete session presentation unavailable")
+            runtime.validate_peer(context.peer)
+            return DirectSessionView({"state": state, "live": live}, feed,
+                                     runtime.hub.process_epoch, cursor)
+        except BaseException:
+            feed.close()
+            raise
+
+    async def dispatch_direct(self, context, payload: dict[str, Any]) -> dict[str, Any]:
+        runtime = self.direct_runtime
+        if runtime is None:
+            raise ConnectionError("direct runtime unavailable")
+        route = runtime.reply_route(context)
+        body = dict(payload)
+        for key, expected in (("targetHostId", route.owner.host_id),
+                              ("targetDeviceId", route.owner.host_id)):
+            if key in body and body.pop(key) != expected:
+                raise ValueError("direct request target mismatch")
+        # Claimed sender/epoch fields are never a substitute for the peer proof.
+        if any(key in body for key in ("senderDeviceId", "senderEpoch", "hostEpoch", "peerEpoch")):
+            raise ValueError("unexpected direct authority claims")
+        if body.get("type") == "direct.enroll":
+            raise ValueError("enrollment is available only through directed Link")
+        capture = DirectResponseCapture(route)
+        token = current_reply_route.set(capture.route())
+        try:
+            if (isinstance(body.get("type"), str) and body["type"].startswith("voice.")
+                    and body["type"] != "voice.speak.request"):
+                return await self._dispatch_live_voice(context, body, route)
+            try:
+                inbound = parse_authenticated_payload(
+                    self.link_client, body, sender_device_id=route.owner.device_id,
+                    sender_epoch=route.owner.device_epoch, target_host_id=route.owner.host_id,
+                    target_device_id=route.owner.host_id)
+            except AttachmentUnavailable as error:
+                return self._user_message_result(error.message, status="failed",
+                                                 code="attachment_unavailable", message=str(error))
+            route.check_current()
+            if inbound is not None:
+                request = getattr(inbound, "request", None) or getattr(inbound, "message", None)
+                profile = getattr(request, "agent_id", None)
+                session = getattr(request, "session_id", None)
+                if profile and session:
+                    known = self._link_session_profiles.get(session)
+                    if known and known != profile:
+                        raise ValueError("direct request profile contradicts session binding")
+                await self.receive_link_payload(inbound)
+            route.check_current()
+            if isinstance(inbound, InboundLinkTurn):
+                # This is admission, not a model final. Synchronous command output
+                # is a separate reliable response, never a second receipt result.
+                if capture.result is not None:
+                    await route.send(capture.result)
+                return self._user_message_result(inbound.message, status="accepted")
+            return capture.finish()
+        finally:
+            capture.closed = True
+            current_reply_route.reset(token)
+
+    @staticmethod
+    def _user_message_result(request, *, status, code=None, **details):
+        result = {"version": 1, "type": "user.message.result", "requestId": request.message_id,
+                  "sessionId": request.session_id, "agentId": request.agent_id,
+                  "status": status, "sentAt": int(time.time())}
+        if code is not None:
+            result["code"] = code
+        result.update(details)
+        return result
+
+    def _link_reply_route(self, device_id: str, device_epoch: int = 0) -> ReplyRoute:
+        from .wiki_transport import authority_id
+        client = self.link_client
+        config = getattr(client, "config", None)
+        generation = self._transport_generation
+        if config is None:
+            raise ConnectionError("Link owner unavailable")
+        identity = runtime_owner(config)
+        owner = AuthenticatedRequestOwner(authority_id(config), config.device_id,
+            config.authorization_epoch, device_id, device_epoch, generation, "link", generation)
+        def check():
+            current = self._direct_current_config()
+            if (self.link_client is not client or self._transport_generation != generation
+                    or current is None or runtime_owner(current) != identity):
+                raise ConnectionError("Link response owner retired")
+        async def send(payload):
+            check()
+            def checked_presentation():
+                check()
+                self._require_captured_draft(payload)
+            if DIRECTED_FRAMES_CAPABILITY in set(getattr(client, "peer_capabilities", ())):
+                return await client.send_payload(payload, target_device_id=device_id, owner_check=checked_presentation)
+            return await client.send_payload(payload, owner_check=checked_presentation)
+        return ReplyRoute(owner, check, send)
+
+    def _response_route(self, chat_id, metadata, reply_to=None):
+        inherited = current_turn_lease.get()
+        profile = self._link_response_profile(chat_id, metadata)
+        message_id = reply_to or metadata.get("reply_to_message_id")
+        return self._turn_replies.resolve(profile, chat_id, message_id, inherited)
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
-        _install_runtime_cwd_bridge(getattr(self, "gateway_runner", None))
         plugin_update_manager = getattr(
             getattr(self.workspace_controller, "backend", None),
             "plugin_update_manager",
@@ -730,18 +1242,30 @@ class LoopdyAdapter(BasePlatformAdapter):
                 # Update status can fail closed without disabling ordinary Link.
                 pass
         health = self.service.health()
+        has_direct_owner = self.direct_runtime is not None or (self._direct_start_task and not self._direct_start_task.done())
+        if has_direct_owner and not is_reconnect:
+            await self.disconnect()
+        self._start_session_presentation()
+        runtime = self.direct_runtime
+        if runtime is not None and (runtime.retired or runtime.hub is not self._presentation_hub):
+            await runtime.stop()
+            self.direct_runtime = None
+        if self.direct_runtime is None and (self._direct_start_task is None or self._direct_start_task.done()):
+            self._direct_start_task = asyncio.create_task(self._start_direct(), name="loopdy-direct-start")
         if self.link_client is not None:
-            self.device_tool_bridge.bind_link_client(self.link_client)
-            self.link_client.start(
-                self.receive_link_payload,
-                status_callback=self._on_link_status,
-            )
-            if self.activity_broker is not None:
-                await self.activity_broker.attach(
-                    self.link_client.send_payload,
-                    live_activity_sender=self.link_client.send_live_activity_update,
-                )
-            if not await self._wait_for_link_connection():
+            try:
+                self.device_tool_bridge.bind_link_client(self.link_client)
+                self.link_client.start(
+                    self.receive_link_payload, status_callback=self._on_link_status)
+                if self.activity_broker is not None:
+                    await self.activity_broker.attach(
+                        self._send_broker_payload,
+                        live_activity_sender=self.link_client.send_live_activity_update)
+                usable = await self._wait_for_transport()
+            except BaseException:
+                await self.disconnect()
+                raise
+            if not usable:
                 detail = "Loopdy Link did not complete the socket-ready handshake."
                 link_state = "disconnected"
                 status = getattr(self.link_client, "status", None)
@@ -762,6 +1286,7 @@ class LoopdyAdapter(BasePlatformAdapter):
                     detail,
                     retryable=not superseded,
                 )
+                await self.disconnect()
                 return False
         if not health.get("configured") and self.link_client is None:
             self._set_fatal_error(
@@ -774,6 +1299,7 @@ class LoopdyAdapter(BasePlatformAdapter):
                 or str(health.get("detail") or "Configure Loopdy notifications first."),
                 retryable=False,
             )
+            await self.disconnect()
             return False
         self._mark_connected()
         return True
@@ -793,6 +1319,17 @@ class LoopdyAdapter(BasePlatformAdapter):
         return bool(getattr(client, "connected", False))
 
     def _on_link_status(self, state: str, detail: str = "") -> None:
+        voice = self._live_voice_runtime
+        if voice is not None and state != "connected":
+            voice.transport_lost(transport="link",
+                revoked=state in {"authentication_error", "superseded", "unready"})
+        if state in {"authentication_error", "superseded"}:
+            self._close_session_presentation()
+            if self.direct_runtime is not None:
+                self.direct_runtime.retire()
+        if state != "connected" and self.direct_runtime is not None and self.direct_runtime.available:
+            self._mark_connected()
+            return
         if state == "connected":
             self._mark_connected()
         elif state == "unready":
@@ -811,8 +1348,18 @@ class LoopdyAdapter(BasePlatformAdapter):
             self._mark_disconnected()
 
     async def _send_link_payload(self, payload: dict[str, Any], *,
-                                 owner_check: Callable[[], None] | None = None) -> str:
-        """Send control traffic after a verified reconnect, with one retry."""
+                                 owner_check: Callable[[], None] | None = None,
+                                 reply_route: ReplyRoute | None = None) -> str:
+        """Direct routes never fall through to Link, even after socket loss."""
+        self._require_captured_draft(payload)
+        route = reply_route or current_reply_route.get()
+        if route is not None:
+            if owner_check is not None:
+                owner_check()
+            result = await route.send(payload)
+            if owner_check is not None:
+                owner_check()
+            return result
         client = self.link_client
         if client is None:
             raise ConnectionError("Loopdy Link is not configured")
@@ -828,9 +1375,14 @@ class LoopdyAdapter(BasePlatformAdapter):
                 last_error = ConnectionError("Loopdy Link is not connected")
                 continue
             try:
-                if owner_check is not None:
-                    owner_check()
-                    return await client.send_payload(payload, owner_check=owner_check)
+                def checked_presentation():
+                    if owner_check is not None:
+                        owner_check()
+                    self._require_captured_draft(payload)
+                checked_presentation()
+                if owner_check is not None or (payload.get("delivery") == "draft" and
+                        STATE_BACKED_PRESENTATION_CAPABILITY in set(getattr(client, "capabilities", ()))):
+                    return await client.send_payload(payload, owner_check=checked_presentation)
                 return await client.send_payload(payload)
             except Exception as exc:
                 if owner_check is not None:
@@ -934,6 +1486,21 @@ class LoopdyAdapter(BasePlatformAdapter):
             )
 
     async def disconnect(self) -> None:
+        voice, self._live_voice_runtime = self._live_voice_runtime, None
+        if voice is not None:
+            await voice.shutdown()
+        self._transport_generation = encode_base64url(os.urandom(18))
+        start, self._direct_start_task = self._direct_start_task, None
+        if start is not None and not start.done():
+            start.cancel()
+            await asyncio.gather(start, return_exceptions=True)
+        runtime, self.direct_runtime = self.direct_runtime, None
+        self._close_session_presentation()
+        if runtime is not None:
+            await runtime.stop()
+            self._observe_presentation("runtime_stopped", runtime=runtime)
+        self._turn_replies.clear()
+        self._processing_turns.clear()
         self.device_tool_bridge.bind_link_client(None)
         if self.activity_broker is not None:
             await self.activity_broker.detach()
@@ -960,10 +1527,30 @@ class LoopdyAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
+        if capture_control_reply(self, chat_id, content):
+            # Command acceptance travels as user.message.result, never as an
+            # assistant final that would seal the active draft/run.
+            return SendResult(success=True)
         if self.link_client is not None and _is_link_chat_id(chat_id):
-            values = metadata or {}
+            if self._control_response_task.get() is asyncio.current_task():
+                return SendResult(success=True)
+            busy = self._busy_response.get()
+            if (busy is not None and busy["task"] is asyncio.current_task()
+                    and busy["chat_id"] == chat_id and reply_to == busy["message_id"]):
+                # This inline reply is a command acknowledgement, not the
+                # running assistant final. The originating submission receipt
+                # owns its admission; retain bounded text for diagnostics only.
+                busy["response"] = str(content)[:2000]
+                return SendResult(success=True)
+            values = dict(metadata or {})
+            inherited_lease = current_turn_lease.get()
+            if reply_to:
+                values["reply_to_message_id"] = reply_to
+            elif inherited_lease is not None and not values.get("reply_to_message_id"):
+                values["reply_to_message_id"] = inherited_lease.message_id
             is_interim = values.get("_interim_send") is True
             try:
+                route = self._response_route(chat_id, values, reply_to)
                 agent_id = self._link_response_profile(chat_id, values)
                 agent_name = (
                     _text(values.get("agent_name") or values.get("sender_name"), 80)
@@ -977,8 +1564,7 @@ class LoopdyAdapter(BasePlatformAdapter):
                     requested_message_id
                     or (active_draft[1] if active_draft else self._new_message_id())
                 )
-                await self._send_link_payload(
-                    assistant_message(
+                payload = assistant_message(
                         message_id=message_id,
                         session_id=chat_id,
                         text=content,
@@ -994,7 +1580,10 @@ class LoopdyAdapter(BasePlatformAdapter):
                             else None
                         ),
                     )
-                )
+                self._observe_presentation("assistant_message", payload=payload,
+                    profile=agent_id, session_id=chat_id, lease=current_turn_lease.get(),
+                    reply_to=values.get("reply_to_message_id"), final=not is_interim)
+                await self._send_link_payload(payload, reply_route=route)
                 if active_draft is not None:
                     self._finish_link_draft(chat_id, values, active_draft[0])
                 if not is_interim and self.activity_broker is not None:
@@ -1245,6 +1834,11 @@ class LoopdyAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Render Hermes' prompt, then enqueue one request-bound Home card."""
+        voice = self._live_voice_runtime
+        if voice is not None and await voice.clarification(
+                chat_id=chat_id, question=question, clarify_id=clarify_id,
+                session_key=session_key, lease=current_turn_lease.get()):
+            return SendResult(success=True, message_id=clarify_id)
         from tools.clarify_gateway import (
             get_clarify_timeout,
             get_pending_for_session,
@@ -1398,8 +1992,13 @@ class LoopdyAdapter(BasePlatformAdapter):
     ) -> SendResult:
         if self.link_client is None or not _is_link_chat_id(chat_id):
             return SendResult(success=False, error="Loopdy Link is not connected")
-        values = metadata or {}
+        values = dict(metadata or {})
         try:
+            route = self._response_route(chat_id, values)
+            lease = current_turn_lease.get()
+            if lease is not None and not values.get("reply_to_message_id"):
+                values["reply_to_message_id"] = lease.message_id
+            agent_id = self._link_response_profile(chat_id, values)
             draft_key = (str(chat_id), int(draft_id))
             turn_key = self._link_draft_turn_key(chat_id, values)
             previous = self._link_active_drafts.pop(turn_key, None)
@@ -1416,6 +2015,16 @@ class LoopdyAdapter(BasePlatformAdapter):
             if previous is not None and previous[0] != draft_key:
                 self._link_draft_messages.pop(previous[0], None)
             self._trim_link_draft_identities()
+            payload = assistant_message(
+                message_id=message_id, session_id=chat_id, text=content,
+                sent_at=int(time.time()), agent_name=(
+                    _text(values.get("agent_name") or values.get("sender_name"), 80)
+                    or profile_display_name(agent_id)), agent_id=agent_id,
+                delivery="draft", draft_id=draft_id)
+            self._observe_presentation("assistant_message", payload=payload,
+                profile=agent_id, session_id=chat_id, lease=current_turn_lease.get(),
+                reply_to=values.get("reply_to_message_id"), final=False)
+            self._require_captured_draft(payload)
             now = time.monotonic()
             last_sent_at = self._link_draft_sent_at.get(turn_key)
             if (
@@ -1426,22 +2035,7 @@ class LoopdyAdapter(BasePlatformAdapter):
                 # token snapshots are presentation hints, so bound Link/APNs
                 # backlog without weakening durable final/tool history.
                 return SendResult(success=True)
-            agent_id = self._link_response_profile(chat_id, values)
-            await self._send_link_payload(
-                assistant_message(
-                    message_id=message_id,
-                    session_id=chat_id,
-                    text=content,
-                    sent_at=int(time.time()),
-                    agent_name=(
-                        _text(values.get("agent_name") or values.get("sender_name"), 80)
-                        or profile_display_name(agent_id)
-                    ),
-                    agent_id=agent_id,
-                    delivery="draft",
-                    draft_id=draft_id,
-                )
-            )
+            await self._send_link_payload(payload, reply_route=route)
             self._link_draft_sent_at[turn_key] = now
             self._link_draft_sent_at.move_to_end(turn_key)
             return SendResult(success=True)
@@ -1538,9 +2132,12 @@ class LoopdyAdapter(BasePlatformAdapter):
                     allowed_models=allowed,
                     allowed_values=frozenset(),
                     expires_at=time.monotonic() + 600,
+                    route=pending.route,
                 )
             )
-            await self._send_link_payload(payload)
+            await self._send_link_payload(payload, reply_route=pending.route)
+            if pending.ready is not None and not pending.ready.done():
+                pending.ready.set_result(True)
             return SendResult(success=True, message_id=pending.request.request_id)
         except Exception as exc:
             self._active_pickers.pop(pending.request.request_id, None)
@@ -1590,9 +2187,12 @@ class LoopdyAdapter(BasePlatformAdapter):
                     allowed_models=frozenset(),
                     allowed_values=frozenset(row["value"] for row in payload["choices"]),
                     expires_at=time.monotonic() + 600,
+                    route=pending.route,
                 )
             )
-            await self._send_link_payload(payload)
+            await self._send_link_payload(payload, reply_route=pending.route)
+            if pending.ready is not None and not pending.ready.done():
+                pending.ready.set_result(True)
             return SendResult(success=True, message_id=pending.request.request_id)
         except Exception as exc:
             self._active_pickers.pop(pending.request.request_id, None)
@@ -1606,6 +2206,28 @@ class LoopdyAdapter(BasePlatformAdapter):
             )
 
     async def receive_link_turn(self, turn: InboundLinkTurn) -> None:
+        route = current_reply_route.get()
+        # Synthetic/legacy clients without a paired config keep ordinary behavior.
+        if route is None and getattr(self.link_client, "config", None) is not None:
+            route = self._link_reply_route(turn.sender_device_id, turn.sender_epoch or 0)
+        if route is None:
+            await self._dispatch_link_turn(turn)
+            return
+        route.check_current()
+        lease = self._turn_replies.register(turn.message.agent_id, turn.message.session_id,
+                                             turn.message.message_id, route)
+        route_token = current_reply_route.set(route)
+        lease_token = current_turn_lease.set(lease)
+        try:
+            await self._dispatch_link_turn(turn)
+        except BaseException:
+            self._turn_replies.complete(lease)
+            raise
+        finally:
+            current_turn_lease.reset(lease_token)
+            current_reply_route.reset(route_token)
+
+    async def _dispatch_link_turn(self, turn: InboundLinkTurn) -> None:
         self._remember_verified_link_profile(
             turn.message.session_id,
             turn.message.agent_id,
@@ -1645,9 +2267,14 @@ class LoopdyAdapter(BasePlatformAdapter):
             source,
         )
         behavior = turn.message.behavior
+        has_pending_intercept = self._has_pending_link_intercept(source)
+        if not has_pending_intercept and event.get_command() in {"steer", "queue"}:
+            await self._dispatch_link_control(event)
+            await self._refresh_goal_for_source(source)
+            return
         if (
             behavior is None
-            or self._has_pending_link_intercept(source)
+            or has_pending_intercept
             or self._has_registered_command(event.text)
         ):
             await self.handle_message(event)
@@ -1661,14 +2288,20 @@ class LoopdyAdapter(BasePlatformAdapter):
             # attachments by using Hermes' official FIFO /queue fallback.
             behavior = "queue"
 
-        if behavior == "steer":
-            event.text = f"/steer {event.text}"
-            await self.handle_message(event)
-            return
-
-        if behavior == "queue":
-            event.text = f"/queue {event.text}"
-            await self.handle_message(event)
+        if behavior in {"steer", "queue"}:
+            event.text = f"/{behavior} {event.text}"
+            busy = {"task": asyncio.current_task(), "chat_id": source.chat_id,
+                    "message_id": event.message_id, "response": None}
+            token = self._busy_response.set(busy)
+            try:
+                await self._dispatch_link_control(event)
+            finally:
+                self._busy_response.reset(token)
+            # Inline control requests do not reach processing_complete. An idle
+            # request starts a distinct task and has no captured inline reply.
+            lease = current_turn_lease.get()
+            if behavior == "steer" and busy["response"] is not None and lease is not None:
+                self._turn_replies.complete(lease)
             return
 
         session_key = self._link_session_key(source)
@@ -1691,14 +2324,43 @@ class LoopdyAdapter(BasePlatformAdapter):
             },
         )
         token = _suppress_link_control_ephemeral.set(True)
+        control = self._control_response_task.set(asyncio.current_task())
         try:
             # BasePlatformAdapter's interrupt_then_dispatch path does not
             # return until Hermes has handled /stop, cancelled the old owner,
             # released its command guard, and drained any pending handoff.
             await self.handle_message(stop_event)
         finally:
+            self._control_response_task.reset(control)
             _suppress_link_control_ephemeral.reset(token)
         await self.handle_message(event)
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        lease = self._turn_replies.lookup(
+            getattr(event.source, "profile", None) or _active_profile_id(),
+            event.source.chat_id, event.message_id)
+        # Queued work may inherit a previous task's context; bind the event's
+        # exact registered owner before any processing callbacks can send.
+        current_turn_lease.set(lease)
+        picker_id = (event.metadata or {}).get("loopdy_picker_control")
+        pending_picker = self._pending_picker_requests.get(picker_id or "")
+        current_reply_route.set(lease.route if lease else
+                                pending_picker.route if pending_picker else None)
+        if pending_picker is not None:
+            self._control_response_task.set(asyncio.current_task())
+        if lease is not None:
+            lease.route.check_current()
+            self._processing_turns.add(lease.generation)
+        self._observe_presentation("processing_start", event=event, lease=lease)
+        await super().on_processing_start(event)
+    async def _dispatch_link_control(self, event: MessageEvent) -> None:
+        with capture_control_replies(
+            self,
+            event.source.chat_id,
+            event.get_command(),
+            event.get_command_args().strip(),
+        ):
+            await self.handle_message(event)
 
     async def on_processing_complete(
         self,
@@ -1716,6 +2378,13 @@ class LoopdyAdapter(BasePlatformAdapter):
                 release = getattr(self.link_client, "release_attachment_paths", None)
                 if callable(release) and event.media_urls:
                     release(tuple(event.media_urls))
+            lease = self._turn_replies.lookup(
+                getattr(event.source, "profile", None) or _active_profile_id(),
+                event.source.chat_id, event.message_id)
+            self._observe_presentation("processing_complete", event=event, outcome=outcome, lease=lease)
+            if lease is not None:
+                self._processing_turns.discard(lease.generation)
+                self._turn_replies.complete(lease)
             # Runs after the goal judge. The text/outcome are never verdicts.
             # Release attachments first even if this readback is cancelled.
             if event.source is not None:
@@ -2066,10 +2735,25 @@ class LoopdyAdapter(BasePlatformAdapter):
             return envelope
         return {"sessionId": requested, "available": True, "snapshot": snapshot}
 
-    async def receive_link_payload(
+    async def receive_link_payload(self, payload) -> None:
+        if (not isinstance(payload, InboundLinkDirectEnrollment)
+                and current_reply_route.get() is None
+                and getattr(self.link_client, "config", None) is not None):
+            route = self._link_reply_route(payload.sender_device_id,
+                                           getattr(payload, "sender_epoch", None) or 0)
+            token = current_reply_route.set(route)
+            try:
+                await self._dispatch_inbound_payload(payload)
+            finally:
+                current_reply_route.reset(token)
+        else:
+            await self._dispatch_inbound_payload(payload)
+
+    async def _dispatch_inbound_payload(
         self,
         payload: (
-            InboundLinkTurn
+            InboundLinkDirectEnrollment
+            | InboundLinkTurn
             | InboundLinkRelayReady
             | InboundLinkVoiceSpeak
             | InboundLinkPickerOpen
@@ -2083,6 +2767,18 @@ class LoopdyAdapter(BasePlatformAdapter):
             | InboundLinkDeviceToolStatus
         ),
     ) -> None:
+        if isinstance(payload, InboundLinkDirectEnrollment):
+            runtime = self.direct_runtime
+            client = self.link_client
+            if runtime is None or client is None or current_reply_route.get() is not None:
+                raise ValueError("direct enrollment is unavailable")
+            if DIRECTED_FRAMES_CAPABILITY not in set(getattr(client, "peer_capabilities", ())):
+                raise ValueError("directed enrollment is not negotiated")
+            outcome = await runtime.enroll(payload.enrollment,
+                sender_device_id=payload.sender_device_id, sender_epoch=payload.sender_epoch)
+            await client.send_payload({"version": 1, "type": "direct.enrolled", "enrollment": outcome},
+                target_device_id=payload.sender_device_id, owner_check=runtime.check_current)
+            return
         if isinstance(payload, InboundLinkWorkspaceRequest):
             request = payload.request
             # Opt in only via the existing read-only operation; the v1 envelope
@@ -2100,13 +2796,26 @@ class LoopdyAdapter(BasePlatformAdapter):
                 self._link_metadata_devices.move_to_end(payload.sender_device_id)
             while len(self._link_metadata_devices) > _MAX_LINK_METADATA_DEVICES:
                 self._link_metadata_devices.popitem(last=False)
+            route = current_reply_route.get()
+            if request.operation.startswith("voice.live.") and route is None:
+                route = self._link_reply_route(payload.sender_device_id, payload.sender_epoch or 0)
             connection_token = _link_workspace_connection.set(
-                payload.sender_device_id
+                ("direct_" + hashlib.sha256(
+                    repr(route.owner).encode()).hexdigest())
+                if route is not None and route.owner.transport == "direct"
+                else payload.sender_device_id
             )
             try:
                 if self.workspace_controller is None:
                     raise RuntimeError("Workspace controls are unavailable")
-                if request.operation.startswith("wiki."):
+                if request.operation.startswith("voice.live."):
+                    if payload.target_host_id != route.owner.host_id:
+                        raise ValueError("Live voice requires an exact host target")
+                    if "type" in request.payload:
+                        raise ValueError("Invalid live voice envelope")
+                    result_payload = await self._dispatch_live_voice(
+                        None, {"type": request.operation, **request.payload}, route)
+                elif request.operation.startswith("wiki."):
                     from .wiki_transport import WikiRequestContext
                     wiki_context = WikiRequestContext(
                         target_host_id=payload.target_host_id,
@@ -2169,7 +2878,7 @@ class LoopdyAdapter(BasePlatformAdapter):
                             raise WikiServiceError("WIKI_OWNER_CHANGED", "Wiki response owner changed")
                     await self._send_link_payload(result, owner_check=check_response_owner)
                 else:
-                    await self._send_link_payload(result)
+                    await self._send_link_payload(result, reply_route=route)
                 manager = getattr(getattr(self.workspace_controller, "backend", None), "plugin_update_manager", None)
                 if (manager is not None and result["status"] == "completed"
                         and request.operation != "host_runtime.status"):
@@ -2269,6 +2978,8 @@ class LoopdyAdapter(BasePlatformAdapter):
             await self._receive_picker_selection(payload)
             return
         if isinstance(payload, InboundLinkVoiceSpeak):
+            if len(self._voice_tasks) >= 4:
+                raise ValueError("voice synthesis capacity exhausted")
             task = asyncio.create_task(
                 self._serve_voice_request(payload.request),
                 name=f"loopdy-voice-{payload.request.request_id}",
@@ -2459,11 +3170,14 @@ class LoopdyAdapter(BasePlatformAdapter):
     async def _receive_picker_open(self, inbound: InboundLinkPickerOpen) -> None:
         self._clean_picker_state()
         request = inbound.request
+        if request.request_id in self._pending_picker_requests or request.request_id in self._active_pickers:
+            raise ValueError("picker request identity already in use")
+        route = current_reply_route.get()
+        ready = asyncio.get_running_loop().create_future()
         self._pending_picker_requests[request.request_id] = _PendingPickerRequest(
-            request=request,
-            sender_device_id=inbound.sender_device_id,
-            expires_at=time.monotonic() + 60,
-        )
+            request=request, sender_device_id=inbound.sender_device_id,
+            expires_at=time.monotonic() + 60, route=route, ready=ready)
+        self._remember_verified_link_profile(request.session_id, request.agent_id)
         source = self.build_source(
             chat_id=request.session_id,
             chat_name="Loopdy chat",
@@ -2473,14 +3187,8 @@ class LoopdyAdapter(BasePlatformAdapter):
             message_id=request.request_id,
         )
         source.profile = request.agent_id
-        # Picker opens are control-plane requests from an already verified
-        # Link device.  Dispatch them through Hermes' installed message
-        # handler so the canonical slash-command implementation builds the
-        # native picker, but do not send the handler's return value through
-        # BasePlatformAdapter.handle_message().  The latter treats every
-        # non-empty return as a user-visible chat response; when the picker
-        # cannot be built it would leak Hermes' textual provider listing into
-        # the session and occupy the current turn.
+        # Use the supported ordinary message entry point. Only this plugin
+        # control event's textual fallback is suppressed, never another turn.
         event = MessageEvent(
             text="/model" if request.kind == "model" else "/reasoning",
             source=source,
@@ -2488,23 +3196,17 @@ class LoopdyAdapter(BasePlatformAdapter):
             metadata={
                 "loopdy_link_verified": True,
                 "loopdy_link_control": True,
+                "loopdy_picker_control": request.request_id,
             },
         )
-        handler = getattr(self, "_message_handler", None)
-        if not callable(handler):
-            self._pending_picker_requests.pop(request.request_id, None)
-            await self._send_picker_open_failure(
-                request,
-                "Hermes could not open this picker because its message handler is unavailable.",
-            )
-            return
         try:
             token = _picker_request_id.set(request.request_id)
+            control = self._control_response_task.set(asyncio.current_task())
             try:
-                result = handler(event)
-                if inspect.isawaitable(result):
-                    await result
+                await self.handle_message(event)
+                await asyncio.wait_for(asyncio.shield(ready), timeout=10)
             finally:
+                self._control_response_task.reset(control)
                 _picker_request_id.reset(token)
         except Exception:
             # The native picker is best effort.  Its control response must
@@ -2547,11 +3249,15 @@ class LoopdyAdapter(BasePlatformAdapter):
         self._clean_picker_state()
         selection = inbound.selection
         state = self._active_pickers.get(selection.picker_id)
+        selection_route = current_reply_route.get()
         valid = bool(
             state is not None
             and state.session_id == selection.session_id
             and state.kind == selection.kind
             and state.sender_device_id == inbound.sender_device_id
+            and (state.route is None or (
+                selection_route is not None
+                and selection_route.owner == state.route.owner))
             and (
                 (selection.provider, selection.model) in state.allowed_models
                 if selection.kind == "model"
@@ -2567,6 +3273,8 @@ class LoopdyAdapter(BasePlatformAdapter):
             return
         self._active_pickers.pop(selection.picker_id, None)
         try:
+            if state.route is not None:
+                state.route.check_current()
             if selection.kind == "model":
                 result = state.callback(
                     selection.session_id, selection.model, selection.provider
@@ -2646,6 +3354,9 @@ class LoopdyAdapter(BasePlatformAdapter):
         if self.link_client is None:
             return
         try:
+            route = current_reply_route.get()
+            if route is not None:
+                route.check_current()
             result = await asyncio.to_thread(self.voice_synthesizer, request)
             payloads = voice_audio_chunks(
                 request=request,

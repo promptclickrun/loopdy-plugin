@@ -29,6 +29,20 @@ class SessionStateTests(unittest.TestCase):
         return [self.db.append_message("session-one", "user", "Repeated text", timestamp=100 - start - index)
                 for index in range(count)]
 
+    def test_reader_does_not_call_private_hermes_helpers(self):
+        self.append(8)
+        backing = self.db
+        class PublicSessionStore:
+            def __getattr__(self, name):
+                if name.startswith("_"):
+                    raise AssertionError("private Hermes access: " + name)
+                return getattr(backing, name)
+        reader = self.reader(maximum_rows=4)
+        page = reader.read(PublicSessionStore(), agent_id="default", stored_id="session-one")
+        self.append(2)
+        earlier = reader.read(PublicSessionStore(), agent_id="default", stored_id="session-one", cursor=page["nextCursor"])
+        self.assertEqual(len(earlier["messages"]), 4)
+
     def test_replaced_display_generation_requires_a_fresh_snapshot(self):
         from loopdy_plugin.session_state import SessionStateResetRequired
         self.append(8)
@@ -143,7 +157,7 @@ class SessionStateTests(unittest.TestCase):
 
     def test_missing_profile_does_not_fall_back_to_default(self):
         reader = self.reader()
-        with patch("hermes_cli.web_routers.sessions._with_db", side_effect=LookupError("Profile unavailable")) as opener:
+        with patch("loopdy_plugin.session_state.open_profile_store", side_effect=LookupError("Profile unavailable")) as opener:
             with self.assertRaises(LookupError):
                 asyncio.run(reader.read_profile(agent_id="missing", stored_id="session-one"))
         self.assertEqual(opener.call_count, 1)
@@ -176,7 +190,7 @@ class SessionStateTests(unittest.TestCase):
             threads.append(threading.get_ident())
             return callback(self.db)
 
-        with patch("hermes_cli.web_routers.sessions._with_db", side_effect=open_profile):
+        with patch("loopdy_plugin.session_state.open_profile_store", side_effect=open_profile):
             result = asyncio.run(reader.read_profile(agent_id="default", stored_id="session-one"))
         self.assertEqual(len(result["messages"]), 2)
         self.assertNotEqual(threads, [main_thread])
@@ -204,7 +218,7 @@ class SessionStateTests(unittest.TestCase):
     def test_legacy_unindexed_history_does_not_trigger_a_full_transcript_read(self):
         from loopdy_plugin.session_state import SessionStateUnavailable
         reader = self.reader()
-        with patch.object(self.db, "_ensure_display_order", return_value=False), patch.object(self.db, "get_messages") as read:
+        with patch("loopdy_plugin.session_state.display_index_ready", return_value=False), patch.object(self.db, "get_messages") as read:
             with self.assertRaises(SessionStateUnavailable):
                 reader.read(self.db, agent_id="default", stored_id="session-one")
         read.assert_not_called()

@@ -143,19 +143,27 @@ class VoiceSynthesisError(RuntimeError):
     pass
 
 
-def _verified_tool_execution_context(link_client: Any, turn: InboundLinkTurn) -> Any:
-    """Map only verified Link frame coordinates into Hermes' generic context."""
-    if turn.sender_epoch is None:
+def tool_execution_context_type() -> Any:
+    """Require both halves of the optional host context contract."""
+    if "tool_execution_context" not in inspect.signature(MessageEvent).parameters:
         return None
     try:
         from tool_execution_context import ToolExecutionContext
-    except ImportError:
+    except (ImportError, AttributeError):
+        return None
+    return ToolExecutionContext if callable(ToolExecutionContext) else None
+
+
+def _verified_tool_execution_context(link_client: Any, turn: InboundLinkTurn) -> Any:
+    """Map only verified Link frame coordinates into Hermes' generic context."""
+    context_type = tool_execution_context_type()
+    if turn.sender_epoch is None or context_type is None:
         return None
     config = getattr(link_client, "config", None)
     host_id = turn.target_host_id or getattr(config, "device_id", "")
     if not host_id or host_id != getattr(config, "device_id", host_id):
         return None
-    return ToolExecutionContext(
+    return context_type(
         source="loopdy_link",
         owner_id=turn.sender_device_id,
         scope_id=turn.message.agent_id,
@@ -1611,6 +1619,7 @@ class LoopdyAdapter(BasePlatformAdapter):
             message_id=turn.message.message_id,
         )
         source.profile = turn.message.agent_id
+        execution_context = _verified_tool_execution_context(self.link_client, turn)
         event = MessageEvent(
             text=turn.message.text,
             source=source,
@@ -1625,7 +1634,10 @@ class LoopdyAdapter(BasePlatformAdapter):
                     else {}
                 ),
             },
-            tool_execution_context=_verified_tool_execution_context(self.link_client, turn),
+            **(
+                {"tool_execution_context": execution_context}
+                if execution_context is not None else {}
+            ),
         )
         await self._materialize_pending_link_session_workspace(
             turn.message.agent_id,

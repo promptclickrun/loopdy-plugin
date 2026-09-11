@@ -493,9 +493,9 @@ class DeviceToolHandlerTests(unittest.TestCase):
 
     @staticmethod
     def _execution_context(*, source="loopdy_link", owner_id="phone-1", scope_id="finance", epoch=7, attributes=None):
-        from tool_execution_context import ToolExecutionContext
-
-        return ToolExecutionContext(
+        # Bridge inputs are structural; do not require an optional host module
+        # just to exercise plugin-owned authorization and transport behavior.
+        return SimpleNamespace(
             source=source,
             owner_id=owner_id,
             scope_id=scope_id,

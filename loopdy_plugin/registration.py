@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import time
+import weakref
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
@@ -37,10 +38,11 @@ from .activity_bridge import (
     publish_hook_activity,
 )
 from .attachments import AttachmentStore
+from .events import LoopdyEvent
 from .hooks import normalize_hook
 from .generative_ui import parse_v2_json, validate_rendered_envelope
 from .link_client import load_runtime_config
-from .link_contracts import generative_ui_event
+from .link_contracts import generative_ui_event, notification_event
 from .link_identity import pre_llm_context_from_state
 from .link_pairing import LINK_ENV_KEYS, pair_host
 from .marketplace import MarketplaceGatewayClient, MarketplacePublisher
@@ -70,6 +72,7 @@ HOOKS = (
     "pre_llm_call",
     "post_llm_call",
     "post_tool_call",
+    "pre_approval_request",
     *DIRECT_OBSERVER_HOOKS,
     *NOTIFICATION_HOOKS,
 )
@@ -109,6 +112,9 @@ def register(
     activity_broker: LinkActivityBroker | Any | None = None,
     marketplace_gateway_client: Any | None = None,
     attachment_store: AttachmentStore | Any | None = None,
+    direct_session_opener: Any | None = None,
+    presentation_observer: Any | None = None,
+    voice_dispatch: Any | None = None,
 ) -> None:
     active_service = service or get_service()
     broker = activity_broker or LinkActivityBroker()
@@ -119,6 +125,46 @@ def register(
     identity_state = getattr(ctx, "state", None)
     update_manager = production_manager(profile)
     device_tool_bridge = DeviceToolBridge()
+    from .direct_runtime import DirectSettings
+    def direct_settings_getter():
+        getter = getattr(ctx, "get_config", None)
+        values = getter("direct", {}) if callable(getter) else {}
+        return DirectSettings.from_mapping(values)
+
+    def live_voice_settings_getter():
+        getter = getattr(ctx, "get_config", None)
+        return getter("live_voice", {}) if callable(getter) else {}
+
+    # Registration owns the supported approval callback; runtime instances remain
+    # adapter-owned and lazy. Non-voice approvals retain the existing presenter.
+    voice_adapters = weakref.WeakSet()
+    def adapter_factory(config):
+        adapter = LoopdyAdapter(
+            config, service=active_service, link_state=identity_state,
+            activity_broker=broker, plugin_update_manager=update_manager,
+            device_tool_bridge=device_tool_bridge,
+            direct_settings_getter=direct_settings_getter,
+            direct_session_opener=direct_session_opener,
+            presentation_observer=presentation_observer, voice_dispatch=voice_dispatch,
+            live_voice_settings_getter=live_voice_settings_getter)
+        voice_adapters.add(adapter)
+        return adapter
+
+    def voice_agent_started(**kwargs):
+        from .inbound_dispatch import current_turn_lease
+        lease = current_turn_lease.get()
+        if lease is None:
+            return
+        for adapter in tuple(voice_adapters):
+            runtime = adapter._live_voice_runtime
+            if runtime is not None:
+                runtime.agent_started(lease=lease, stored_session_id=kwargs.get("session_id"))
+
+    def approval_requested(**kwargs):
+        for adapter in tuple(voice_adapters):
+            runtime = adapter._live_voice_runtime
+            if runtime is not None:
+                runtime.approval_requested(**kwargs)
 
     selected_attachment_store = attachment_store or AttachmentStore(
         get_hermes_home()
@@ -157,14 +203,7 @@ def register(
     ctx.register_platform(
         name="loopdy",
         label="Loopdy",
-        adapter_factory=lambda config: LoopdyAdapter(
-            config,
-            service=active_service,
-            link_state=identity_state,
-            activity_broker=broker,
-            plugin_update_manager=update_manager,
-            device_tool_bridge=device_tool_bridge,
-        ),
+        adapter_factory=adapter_factory,
         check_fn=check_requirements,
         validate_config=validate_config,
         is_connected=is_connected,
@@ -196,7 +235,17 @@ def register(
         profile=profile,
         agent_name=profile_display_name(profile),
     )
-    ctx.register_approval_transport("loopdy", approval.present)
+    def present_approval(request):
+        for adapter in tuple(voice_adapters):
+            runtime = adapter._live_voice_runtime
+            if runtime is not None:
+                response = runtime.present_approval(request)
+                if response is not None:
+                    return response
+        return approval.present(request)
+
+    ctx.register_approval_transport("loopdy", present_approval)
+    ctx.register_hook("pre_approval_request", approval_requested)
 
     ctx.register_hook(
         "pre_llm_call",
@@ -206,6 +255,7 @@ def register(
             profile=profile,
             identity_state=identity_state,
             activity_broker=broker,
+            voice_observer=voice_agent_started,
         ),
     )
     ctx.register_hook(
@@ -251,6 +301,7 @@ def register(
             profile=profile,
             identity_state=identity_state,
             plugin_update_manager=update_manager,
+            plugin_context=ctx,
         ),
     )
     ctx.on_unload(partial(release_service, active_service))
@@ -262,8 +313,14 @@ def _pre_llm_call(
     profile: str,
     identity_state: Any | None = None,
     activity_broker: LinkActivityBroker | Any,
+    voice_observer: Any | None = None,
     **payload: Any,
 ):
+    if voice_observer is not None:
+        try:
+            voice_observer(**payload)
+        except Exception:
+            logger.warning("Loopdy live session binding unavailable")
     publish_hook_activity(
         "pre_llm_call",
         broker=activity_broker,
@@ -319,9 +376,8 @@ def _post_llm_call(
         profile=profile,
         payload=payload,
     )
-    service.store.dismiss_attention_for_session(
-        str(payload.get("session_id") or payload.get("task_id") or "")
-    )
+    # A finished turn cannot clear session-wide attention: a newer turn may
+    # already be waiting. Explicit clarify/approval resolution owns cleanup.
     _queue_live_activity_update(
         service,
         session_id=str(payload.get("session_id") or payload.get("task_id") or ""),
@@ -409,12 +465,10 @@ def _deliver_hook(
     if hook_name in {"subagent_start", "subagent_stop"} and callable(profile_getter):
         # PluginContext resolves the current profile scope, not load-time defaults.
         profile = str(profile_getter() or profile)
-    if hook_name == "on_session_end":
-        service.store.dismiss_attention_for_session(
-            str(payload.get("session_id") or payload.get("task_id") or "")
-        )
     event = normalize_hook(hook_name, profile=profile, **payload)
     if event is not None:
+        if hook_name == "subagent_stop":
+            event = _with_subagent_start_metadata(event, service=service, payload=payload)
         if not event.detail.get("agent_name"):
             event = replace(
                 event,
@@ -423,7 +477,23 @@ def _deliver_hook(
                     "agent_name": profile_display_name(event.profile),
                 },
             )
-        service.enqueue(event, target=_home_target())
+        if event.type == "session.completed":
+            # Home history only: persist before requesting an encrypted refresh.
+            # There is no push delivery and no sessionId on this invalidation:
+            # finishing one turn must not terminate a newer turn's Live Activity.
+            if service.store.record_event(event, target=_home_target()):
+                activity_broker.publish(notification_event(
+                    event_id=event.event_id,
+                    event_type=event.type,
+                    agent_id=event.profile,
+                    agent_name=event.detail["agent_name"],
+                    session_id="",
+                    title="Completed work updated",
+                    body="Open Home to view completed work.",
+                    sent_at=int(time.time()),
+                ))
+        else:
+            service.enqueue(event, target=_home_target())
     _live_activity_from_hook(hook_name, service=service, profile=profile, payload=payload)
     if hook_name == "on_session_end":
         finish_failed_turn_activity(broker=activity_broker, payload=payload)
@@ -434,6 +504,38 @@ def _deliver_hook(
             profile=profile,
             payload=payload,
         )
+
+
+def _with_subagent_start_metadata(
+    event: LoopdyEvent, *, service: Any, payload: dict[str, Any]
+) -> LoopdyEvent:
+    # Hermes stop observers need not repeat child_goal/child_subagent_id.
+    # Recover only bounded metadata from the exact plugin-owned start record,
+    # not runtime internals or the child's raw final summary.
+    start = normalize_hook("subagent_start", profile=event.profile, **payload)
+    if start is None or not event.detail.get("child_session_id"):
+        return event
+    stored = service.store.get_event(start.event_id)
+    if not isinstance(stored, dict):
+        return event
+    detail = stored.get("detail")
+    if (
+        stored.get("type") != "delegation.started"
+        or stored.get("profile") != event.profile
+        or stored.get("session_id") != event.session_id
+        or not isinstance(detail, dict)
+        or detail.get("child_session_id") != event.detail["child_session_id"]
+    ):
+        return event
+    restored = dict(event.detail)
+    for key in ("title", "delegation_id", "turn_id"):
+        value = detail.get(key)
+        if isinstance(value, str) and value:
+            restored[key] = value
+    return replace(
+        event, detail=restored,
+        delegation_id=restored.get("delegation_id", event.delegation_id),
+    )
 
 
 def _live_activity_from_hook(
@@ -478,6 +580,14 @@ def setup_cli(parser: Any) -> None:
     setup_wiki_cli(actions)
 
     actions.add_parser("status", help="Show provider health and registered devices")
+    direct = actions.add_parser("direct", help="Configure the private loopback transport (no activation)")
+    direct_actions = direct.add_subparsers(dest="loopdy_direct_action", required=True)
+    direct_actions.add_parser("status", help="Show direct settings, not a live health probe")
+    direct_config = direct_actions.add_parser("configure", help="Save HTTPS origin and fixed loopback port")
+    direct_config.add_argument("--origin", required=True)
+    direct_config.add_argument("--port", type=int, required=True)
+    direct_config.add_argument("--enabled", action="store_true")
+    direct_actions.add_parser("disable", help="Retire direct authorization without restarting Hermes")
 
     files = actions.add_parser(
         "files",
@@ -598,8 +708,36 @@ def handle_cli(
     profile: str,
     identity_state: Any | None = None,
     plugin_update_manager: PluginUpdateManager | None = None,
+    plugin_context: Any | None = None,
 ) -> None:
     action = str(getattr(args, "loopdy_action", "") or "")
+    if action == "direct":
+        from .direct_runtime import DirectSettings
+        import secrets
+        get_config = getattr(plugin_context, "get_config", None)
+        set_config = getattr(plugin_context, "set_config", None)
+        if not callable(get_config) or not callable(set_config):
+            raise ValueError("This Hermes host does not expose plugin settings")
+        direct_action = str(getattr(args, "loopdy_direct_action", ""))
+        if direct_action == "status":
+            settings = DirectSettings.from_mapping(get_config("direct", {}))
+            _print_json({**settings.as_mapping(), "activation": "not_probed",
+                         "detail": "Settings only; no listener, Tailscale or gateway was started."})
+            return
+        if direct_action == "configure":
+            settings = DirectSettings.from_mapping({"enabled": bool(args.enabled),
+                "origin": args.origin, "port": args.port})
+        elif direct_action == "disable":
+            settings = DirectSettings()
+        else:
+            raise ValueError("Unknown direct command")
+        # One atomic namespace update, plus a durable fence visible to already
+        # loaded runtimes even when this SDK caches its config object.
+        if identity_state is not None:
+            identity_state.set("direct.configuration_revision", secrets.token_urlsafe(18))
+        set_config("direct", settings.as_mapping())
+        _print_json({**settings.as_mapping(), "activation": "pending_adapter_connect"})
+        return
     if action == "wiki":
         from .wiki_cli import handle_wiki_cli
         from .wiki_transport import production_factory
@@ -845,6 +983,8 @@ def _handle_link_cli(args: Any, *, identity_state: Any | None = None) -> None:
             removed += int(bool(remove_env_value(key)))
         if identity_state is not None:
             identity_state.set("link.runtime_status", None)
+            import secrets
+            identity_state.set("direct.configuration_revision", secrets.token_urlsafe(18))
         _print_json({"configured": False, "state": "unpaired", "removed": removed})
         return
     raise ValueError("Unknown Loopdy Link command")

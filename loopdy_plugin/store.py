@@ -59,6 +59,10 @@ class LoopdyStore:
                 (session_id, turn_id, final_timestamp, duration_ms),
             )
 
+    def delete_turn_durations(self, session_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM turn_durations WHERE session_id = ?", (session_id,))
+
     def turn_durations(self, session_id: str) -> dict[float, int]:
         with self._connect() as connection:
             rows = connection.execute(

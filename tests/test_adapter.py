@@ -1026,7 +1026,8 @@ class AdapterTests(unittest.TestCase):
         from loopdy_plugin.link_contracts import UserMessage
 
         link = _LinkClient()
-        link.config = SimpleNamespace(device_id="hermes-host-private-coordinate")
+        from test_live_voice_runtime import signing_fixture
+        link.config = signing_fixture("hermes-host-private-coordinate")
         adapter = LoopdyAdapter(
             PlatformConfig(enabled=True), service=_Service(), link_client=link
         )
@@ -1895,9 +1896,8 @@ class AdapterTests(unittest.TestCase):
         adapter = LoopdyAdapter(
             PlatformConfig(enabled=True), service=_Service(), link_client=link
         )
-        adapter.handle_message = AsyncMock()
         handler = AsyncMock(return_value="**OpenAI** `--provider openai`: gpt-5.6")
-        adapter._message_handler = handler
+        adapter.set_message_handler(handler)
         opened = InboundLinkPickerOpen(
             request=PickerOpen(
                 request_id="picker_request_fixture_control_0001",
@@ -1915,12 +1915,11 @@ class AdapterTests(unittest.TestCase):
         control_event = handler.await_args.args[0]
         self.assertEqual(control_event.text, "/model")
         self.assertTrue(control_event.metadata["loopdy_link_control"])
-        adapter.handle_message.assert_not_awaited()
         self.assertEqual(len(link.payloads), 1)
         self.assertEqual(link.payloads[0]["type"], "picker.result")
         self.assertEqual(link.payloads[0]["pickerId"], opened.request.request_id)
         self.assertEqual(link.payloads[0]["status"], "failed")
-        self.assertIn("without opening", link.payloads[0]["message"].lower())
+        self.assertEqual(link.payloads[0]["message"], "Hermes could not open this picker. Try again.")
 
     def test_picker_open_without_handler_returns_correlated_failure(self) -> None:
         """A missing Hermes handler must not leave the mobile picker pending."""
@@ -1963,7 +1962,7 @@ class AdapterTests(unittest.TestCase):
                 "status": "failed",
             },
         )
-        self.assertIn("handler", failure["message"].lower())
+        self.assertEqual(failure["message"], "Hermes could not open this picker. Try again.")
 
     def test_picker_open_handler_failure_returns_correlated_failure(self) -> None:
         """A Hermes picker dispatch exception must be reported to the requester."""

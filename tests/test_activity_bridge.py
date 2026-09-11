@@ -4,10 +4,81 @@ import asyncio
 import json
 import threading
 import unittest
+from unittest.mock import patch
 from types import SimpleNamespace
 
 
 class ActivityBridgeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_presentation_observer_is_independent_of_relay_connection(self):
+        from loopdy_plugin.activity_bridge import LinkActivityBroker
+        broker = LinkActivityBroker()
+        observed = []
+        broker.set_presentation_observer(lambda value: observed.append(value))
+        payload = {"type": "activity.event", "eventId": "independent", "sessionId": "chat"}
+        self.assertTrue(broker.publish(payload))
+        self.assertEqual(observed, [payload])
+        broker.set_presentation_observer(None)
+        self.assertFalse(broker.publish(payload))
+        self.assertEqual(len(observed), 1)
+
+    async def test_hook_burst_schedules_one_bounded_event_loop_wakeup(self):
+        from loopdy_plugin.activity_bridge import LinkActivityBroker
+        broker = LinkActivityBroker()
+        release = asyncio.Event()
+        delivered = asyncio.Event()
+        received = []
+
+        async def stalled_sender(payload):
+            await release.wait()
+            received.append(payload["eventId"])
+            if payload["eventId"] == "1999":
+                delivered.set()
+
+        await broker.attach(stalled_sender)
+        loop = asyncio.get_running_loop()
+        try:
+            with patch.object(loop, "call_soon_threadsafe", wraps=loop.call_soon_threadsafe) as schedule:
+                producer = threading.Thread(target=lambda: [broker.publish({"type": "activity.event", "eventId": str(index)})
+                                                            for index in range(2_000)])
+                producer.start()
+                producer.join(timeout=2)
+                self.assertFalse(producer.is_alive())
+                self.assertEqual(schedule.call_count, 1, "A burst must not leave one pending callback per tool event")
+            await asyncio.sleep(0)
+            self.assertLessEqual(broker._queue.qsize(), broker.maximum_queue_size)
+            release.set()
+            await asyncio.wait_for(delivered.wait(), timeout=1)
+            self.assertEqual(received, [str(index) for index in range(2_000 - broker.maximum_queue_size, 2_000)])
+        finally:
+            release.set()
+            await broker.detach()
+
+    async def test_old_publication_wakeup_cannot_drain_a_reattached_broker(self):
+        from loopdy_plugin.activity_bridge import LinkActivityBroker
+        broker = LinkActivityBroker()
+        received = []
+        delivered = asyncio.Event()
+
+        async def sender(payload):
+            received.append(payload["eventId"])
+            delivered.set()
+
+        await broker.attach(sender)
+        callbacks = []
+        loop = asyncio.get_running_loop()
+        try:
+            with patch.object(loop, "call_soon_threadsafe", side_effect=lambda fn, *args: callbacks.append((fn, args))):
+                broker.publish({"type": "activity.event", "eventId": "old"})
+                await broker.detach()
+                await broker.attach(sender)
+                broker.publish({"type": "activity.event", "eventId": "new"})
+            for callback, args in callbacks:
+                callback(*args)
+            await asyncio.wait_for(delivered.wait(), timeout=1)
+            self.assertEqual(received, ["new"])
+        finally:
+            await broker.detach()
+
     async def test_detached_children_keep_parent_owned_roster_until_last_stop(self):
         from loopdy_plugin.activity_bridge import LinkActivityBroker
         broker = LinkActivityBroker()

@@ -71,6 +71,22 @@ class _Service:
         service = self
 
         class Store:
+            def __init__(self):
+                self.records = {}
+
+            def record_event(self, event, *, target="all"):
+                if event.event_id in self.records:
+                    return False
+                self.records[event.event_id] = {
+                    "event_id": event.event_id, "type": event.type,
+                    "profile": event.profile, "session_id": event.session_id,
+                    "detail": dict(event.detail),
+                }
+                return True
+
+            def get_event(self, event_id):
+                return self.records.get(event_id)
+
             def dismiss_attention_request(
                 self, request_id, *, session_id="", dismissed_at=None
             ):
@@ -84,6 +100,7 @@ class _Service:
         self.store = Store()
 
     def enqueue(self, event, *, target):
+        self.store.record_event(event, target=target)
         self.events.append((event, target))
         return True
 
@@ -488,7 +505,7 @@ class RegistrationTests(unittest.TestCase):
 
         self.assertEqual(broker.payloads, [])
 
-    def test_clarify_attention_resolves_when_tool_or_session_finishes(self) -> None:
+    def test_clarify_tool_cleanup_does_not_allow_session_end_to_clear_newer_attention(self) -> None:
         from loopdy_plugin.registration import register
 
         service = _Service()
@@ -508,9 +525,9 @@ class RegistrationTests(unittest.TestCase):
         )
 
         self.assertEqual(service.dismissed_requests, [])
-        self.assertEqual(service.dismissed_sessions, ["session-1", "session-2"])
+        self.assertEqual(service.dismissed_sessions, ["session-1"])
 
-    def test_post_llm_is_a_terminal_fallback_for_pending_attention(self) -> None:
+    def test_post_llm_preserves_pending_attention_for_a_newer_turn(self) -> None:
         from loopdy_plugin.registration import register
 
         service = _Service()
@@ -519,7 +536,7 @@ class RegistrationTests(unittest.TestCase):
 
         context.hooks["post_llm_call"](session_id="session-1")
 
-        self.assertEqual(service.dismissed_sessions, ["session-1"])
+        self.assertEqual(service.dismissed_sessions, [])
 
     def test_interrupted_session_ends_live_activity_as_failed(self) -> None:
         from loopdy_plugin.registration import _live_activity_from_hook
@@ -900,6 +917,7 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(
             set(context.hooks),
             {
+                "pre_approval_request",
                 "pre_tool_call",
                 "post_tool_call",
                 "pre_llm_call",

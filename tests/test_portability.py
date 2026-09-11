@@ -19,7 +19,7 @@ class PortabilityTests(unittest.TestCase):
         manifest = yaml.safe_load((PLUGIN_ROOT / "plugin.yaml").read_text(encoding="utf-8"))
 
         self.assertEqual(manifest["kind"], "platform")
-        self.assertEqual(manifest["version"], "2.11.2")
+        self.assertEqual(manifest["version"], "2.12.0")
         self.assertEqual(set(manifest["platforms"]), {"linux", "macos", "windows"})
 
     def test_link_runtime_coordinates_never_depend_on_posix_path_syntax(self) -> None:

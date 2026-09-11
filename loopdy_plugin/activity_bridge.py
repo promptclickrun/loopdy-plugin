@@ -13,7 +13,7 @@ import shlex
 import sqlite3
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -54,7 +54,10 @@ class LinkActivityBroker:
         self._lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._queue: asyncio.Queue[dict[str, Any]] | None = None
+        self._pending_publications: deque[dict[str, Any]] = deque()
+        self._publication_wakeup: asyncio.Queue[dict[str, Any]] | None = None
         self._sender: Callable[[dict[str, Any]], Awaitable[Any]] | None = None
+        self._presentation_observer: Callable[[dict[str, Any]], Any] | None = None
         self._live_activity_sender: Callable[[dict[str, Any]], Awaitable[Any]] | None = None
         self._drain_task: asyncio.Task[None] | None = None
         self._context_task: asyncio.Task[None] | None = None
@@ -101,6 +104,8 @@ class LinkActivityBroker:
                 return
             self._loop = loop
             self._queue = asyncio.Queue(maxsize=self.maximum_queue_size)
+            self._pending_publications.clear()
+            self._publication_wakeup = None
             self._sender = sender
             self._live_activity_sender = live_activity_sender
             self._drain_task = loop.create_task(
@@ -117,6 +122,8 @@ class LinkActivityBroker:
                 context_task = self._context_task
                 self._loop = None
                 self._queue = None
+                self._pending_publications.clear()
+                self._publication_wakeup = None
                 self._sender = None
                 self._live_activity_sender = None
                 self._drain_task = None
@@ -770,17 +777,56 @@ class LinkActivityBroker:
                 )
             return delivered
 
+    def set_presentation_observer(self, observer: Callable[[dict[str, Any]], Any] | None) -> None:
+        """Observe presentation before relay queueing, including while offline.
+
+        The collaborator must be synchronous, bounded and thread-safe. Never
+        perform network or filesystem work from a Hermes hook thread here.
+        """
+        with self._lock:
+            self._presentation_observer = observer
+
     def publish(self, payload: dict[str, Any]) -> bool:
+        with self._lock:
+            observer = self._presentation_observer
+        observed = False
+        if observer is not None:
+            try:
+                observer(dict(payload))
+                observed = True
+            except Exception:
+                # Independent presentation failure cannot disable legacy Link.
+                logger.warning("Loopdy presentation observer rejected an event")
         with self._lock:
             loop = self._loop
             queue = self._queue
-        if loop is None or queue is None or loop.is_closed():
-            return False
-        try:
-            loop.call_soon_threadsafe(self._enqueue, queue, dict(payload))
-        except RuntimeError:
-            return False
-        return True
+            if loop is None or queue is None or loop.is_closed():
+                return observed
+            # Bound work before crossing threads. Bounding only asyncio.Queue
+            # left an unbounded event-loop callback (and payload) per hook.
+            if len(self._pending_publications) >= self.maximum_queue_size:
+                self._pending_publications.popleft()
+            self._pending_publications.append(dict(payload))
+            if self._publication_wakeup is queue:
+                return True
+            self._publication_wakeup = queue
+            try:
+                loop.call_soon_threadsafe(self._flush_publications, queue)
+            except RuntimeError:
+                self._pending_publications.clear()
+                self._publication_wakeup = None
+                return False
+            return True
+
+    def _flush_publications(self, queue: asyncio.Queue[dict[str, Any]]) -> None:
+        with self._lock:
+            if queue is not self._queue:
+                return
+            pending = tuple(self._pending_publications)
+            self._pending_publications.clear()
+            self._publication_wakeup = None
+        for payload in pending:
+            self._enqueue(queue, payload)
 
     async def complete(
         self,

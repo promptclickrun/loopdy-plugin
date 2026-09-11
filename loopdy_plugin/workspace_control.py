@@ -13,6 +13,7 @@ import hmac
 import inspect
 import io
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -42,7 +43,10 @@ from .workspace_git import WorkspaceGitError, WorkspaceGitService
 from . import workspace_capabilities
 from .wiki_service import WikiServiceError
 from .wiki_transport import WikiRequestContext, WikiTransport
+from .session_state import (SessionStateReader, SessionStateNotFound,
+                            SessionStateResetRequired, SessionStateUnavailable)
 
+logger = logging.getLogger(__name__)
 
 class WorkspaceControlError(RuntimeError):
     """A bounded, user-safe workspace control failure."""
@@ -131,6 +135,51 @@ _PROJECT_DIRECTORY_HIDDEN = frozenset({
 })
 
 
+def _reconcile_session_presentation(state: dict[str, Any], live: Any) -> dict[str, Any]:
+    """Reconcile only exact transport identities; never infer text/time lineage."""
+    if (not isinstance(live, dict) or set(live) != {"coverageCursor", "events", "complete"}
+            or type(live["coverageCursor"]) is not int or live["coverageCursor"] < 0
+            or live["complete"] is not True or not isinstance(live["events"], list)
+            or len(live["events"]) > 128):
+        raise ValueError("Current presentation is incomplete or invalid")
+    rows = state.get("messages", [])
+    canonical = {}
+    # A canonical assistant after the newest visible user might be the final
+    # for this overlay. Missing identity must not be 'solved' by text or time.
+    ambiguous_tail = False
+    for row in rows:
+        if row.get("role") == "user":
+            ambiguous_tail = False
+        if row.get("role") != "assistant":
+            continue
+        identity = row.get("platform_message_id")
+        if isinstance(identity, str) and identity:
+            if identity in canonical:
+                raise SessionStateResetRequired("Canonical platform identity is ambiguous")
+            canonical[identity] = row
+        elif not row.get("tool_calls") and row.get("display_kind") != "hidden" and not row.get("_compressed_summary"):
+            ambiguous_tail = True
+    events = []
+    identities = set()
+    for event in live["events"]:
+        if (not isinstance(event, dict) or event.get("sessionId") != state.get("sessionId")
+                or event.get("agentId", state.get("agentId")) != state.get("agentId")):
+            raise ValueError("Presentation scope contradicts canonical state")
+        if event.get("type") == "assistant.message":
+            identity = event.get("messageId")
+            if not isinstance(identity, str) or not identity or identity in identities:
+                raise SessionStateResetRequired("Presentation message identity is ambiguous")
+            identities.add(identity)
+            if identity in canonical:
+                # Hermes already owns this exact message, including a draft
+                # whose final was persisted before its delivery hook ran.
+                continue
+            if event.get("delivery") != "draft" or ambiguous_tail:
+                raise SessionStateResetRequired("Presentation needs exact canonical reconciliation")
+        events.append(event)
+    return {"coverageCursor": live["coverageCursor"], "events": events, "complete": True}
+
+
 class HermesWorkspaceBackend:
     """Validated projections over Hermes' existing profile/config services."""
 
@@ -146,6 +195,7 @@ class HermesWorkspaceBackend:
         session_subagents_getter: Any | None = None,
         session_goal_getter: Any | None = None,
         session_runtime_getter: Any | None = None,
+        session_presentation_getter: Any | None = None,
         connection_id_getter: Any | None = None,
         plugin_update_manager: Any | None = None,
         workspace_git: WorkspaceGitService | Any | None = None,
@@ -162,6 +212,7 @@ class HermesWorkspaceBackend:
         self.session_subagents_getter = session_subagents_getter
         self.session_goal_getter = session_goal_getter
         self.session_runtime_getter = session_runtime_getter
+        self.session_presentation_getter = session_presentation_getter
         self.connection_id_getter = connection_id_getter
         self.plugin_update_manager = plugin_update_manager
         self.workspace_git = workspace_git
@@ -1445,6 +1496,12 @@ class HermesWorkspaceBackend:
             if not target_id or target_id == stored_id:
                 raise
             await self._session_delete(target_id, agent_id)
+        try:
+            delete_durations = getattr(getattr(self.service, "store", None), "delete_turn_durations", None)
+            if callable(delete_durations):
+                delete_durations(target_id)
+        except Exception as exc:
+            logger.warning("Loopdy turn duration cleanup failed (%s)", type(exc).__name__)
         return {
             "storedId": stored_id,
             "agentId": agent_id,
@@ -1474,6 +1531,116 @@ class HermesWorkspaceBackend:
         except Exception:
             # Unavailable/legacy optional metadata must not strand history.
             return None
+
+    async def _presentation_session_id(self, agent_id: str, stored_id: str) -> str:
+        """Resolve a visible feed only from the exact profile's bounded catalog."""
+        catalog = _object(await self._session_catalog(agent_id), "Hermes session catalog")
+        rows = catalog.get("sessions")
+        if not isinstance(rows, list) or len(rows) > 500:
+            raise SessionStateUnavailable("Session presentation catalog unavailable")
+        matches = [row for row in rows if isinstance(row, dict) and row.get("id") == stored_id]
+        if len(matches) != 1:
+            raise SessionStateUnavailable("Exact session presentation binding unavailable")
+        row = matches[0]
+        if row.get("profile", agent_id) != agent_id:
+            raise SessionStateResetRequired("Session presentation profile changed")
+        visible_id = row.get("chat_id") or stored_id
+        visible_id = _coordinate(visible_id, 180)
+        # Reset siblings can share a legacy chat coordinate. Do not attach the
+        # active overlay to an arbitrary historical sibling just because it was
+        # the first catalog row, and never trust a caller-supplied alias pair.
+        owners = {item.get("id") for item in rows if isinstance(item, dict)
+                  and (item.get("chat_id") or item.get("id")) == visible_id}
+        if owners != {stored_id}:
+            raise SessionStateResetRequired("Session presentation alias is ambiguous")
+        return visible_id
+
+    async def sessions_state(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Opt-in canonical pages; never fall back to a legacy full transcript."""
+        values = _object(payload, "workspace payload")
+        if not {"storedId", "agentId"}.issubset(values) or set(values) - {"storedId", "agentId", "cursor"}:
+            raise WorkspaceControlError("Session state payload is invalid", code="session_state_invalid")
+        try:
+            stored_id = _coordinate(values["storedId"], 160)
+            agent_id = _agent_id(values["agentId"])
+        except WorkspaceControlError as exc:
+            raise WorkspaceControlError("Session state scope is invalid.", code="session_state_invalid") from exc
+        cursor = values.get("cursor")
+        reader = SessionStateReader()
+        try:
+            try:
+                result = await reader.read_profile(agent_id=agent_id, stored_id=stored_id, cursor=cursor)
+            except SessionStateNotFound:
+                if cursor is not None:
+                    raise
+                catalog = _object(await self._session_catalog(agent_id), "Hermes session catalog")
+                resolved = _stored_session_id_for_visible(catalog, stored_id)
+                if resolved is None or resolved == stored_id:
+                    raise
+                result = await reader.read_profile(agent_id=agent_id, stored_id=resolved)
+        except SessionStateResetRequired as exc:
+            raise WorkspaceControlError("Session changed. Reload its current state.",
+                                        code="session_state_reset", status="conflict") from exc
+        except SessionStateUnavailable as exc:
+            raise WorkspaceControlError("Hermes session state is not ready.", code="session_state_unavailable") from exc
+        except ValueError as exc:
+            raise WorkspaceControlError("Session state coordinate is invalid.", code="session_state_invalid") from exc
+        result["sessionId"] = stored_id
+        if cursor is None:
+            runtime = await self._session_runtime(result["storedId"], agent_id)
+            if runtime:
+                result["runtime"] = runtime
+            if self.session_presentation_getter is not None:
+                try:
+                    # Capture the live checkpoint between two canonical reads.
+                    # A direct caller subscribes before this operation; events
+                    # after coverageCursor remain in that bounded subscription.
+                    visible_id = await self._presentation_session_id(agent_id, result["storedId"])
+                    if stored_id != result["storedId"] and stored_id != visible_id:
+                        raise SessionStateResetRequired("Requested session alias changed")
+                    result["sessionId"] = visible_id
+                    live = self.session_presentation_getter(agent_id, visible_id)
+                    checked = await reader.read_profile(agent_id=agent_id, stored_id=result["storedId"])
+                    checked_visible = await self._presentation_session_id(agent_id, result["storedId"])
+                    if (checked_visible != visible_id
+                            or checked.get("storedId") != result.get("storedId")
+                            or checked.get("agentId") != result.get("agentId")
+                            or checked.get("revision") != result.get("revision")):
+                        raise SessionStateResetRequired("Canonical session changed during live snapshot")
+                    result["live"] = _reconcile_session_presentation(result, live)
+                    # Check the combined payload against the real wire bound,
+                    # including nesting, rather than adding two independent caps.
+                    _workspace_json(result, depth=0)
+                except SessionStateResetRequired as exc:
+                    raise WorkspaceControlError("Session changed. Reload its current state.",
+                                                code="session_state_reset", status="conflict") from exc
+                except (ValueError, ConnectionError, SessionStateUnavailable) as exc:
+                    raise WorkspaceControlError("Current session presentation is not ready.",
+                                                code="session_state_unavailable") from exc
+            else:
+                # Standalone/custom backends without the adapter collaborator
+                # cannot assert that an empty overlay covers a running turn.
+                result["live"] = {"coverageCursor": 0, "events": [], "complete": False}
+        return result
+
+    async def sessions_content(self, payload: dict[str, Any]) -> dict[str, Any]:
+        values = _object(payload, "workspace payload")
+        if not {"storedId", "agentId", "reference"}.issubset(values) or set(values) - {"storedId", "agentId", "reference", "offset"}:
+            raise WorkspaceControlError("Session content payload is invalid", code="session_state_invalid")
+        try:
+            stored_id = _coordinate(values["storedId"], 160)
+            agent_id = _agent_id(values["agentId"])
+        except WorkspaceControlError as exc:
+            raise WorkspaceControlError("Session content scope is invalid.", code="session_state_invalid") from exc
+        try:
+            return await SessionStateReader().content_profile(
+                agent_id=agent_id, stored_id=stored_id, reference=values["reference"], offset=values.get("offset", 0),
+            )
+        except SessionStateResetRequired as exc:
+            raise WorkspaceControlError("Session content changed. Reload its current state.",
+                                        code="session_state_reset", status="conflict") from exc
+        except ValueError as exc:
+            raise WorkspaceControlError("Session content coordinate is invalid.", code="session_state_invalid") from exc
 
     async def sessions_history(self, payload: dict[str, Any]) -> dict[str, Any]:
         values = _object(payload, "workspace payload")
@@ -4003,6 +4170,23 @@ def _event_projection(
                 if truncate_detail:
                     normalized = _utf8_prefix(normalized, detail_maximum)
                 detail[key] = _text(normalized, detail_maximum)
+    # Keep the v1 envelope unchanged while carrying exact run coordinates in
+    # scalar detail fields. Stored top-level IDs are authoritative for legacy
+    # cron/delegation records; never shorten or repair an identity for display.
+    for key in (
+        "child_session_id", "parent_session_id", "delegation_id",
+        "turn_id", "job_id", "task_id",
+    ):
+        raw = source.get(key) if key in {"delegation_id", "job_id", "task_id"} else None
+        if raw in (None, ""):
+            raw = detail_source.get(key)
+        if not isinstance(raw, str) or not raw or raw != raw.strip():
+            continue
+        try:
+            detail[key] = _coordinate(raw, 180)
+        except WorkspaceControlError:
+            # Invalid optional metadata must not hide the underlying event.
+            continue
     rendered = detail_source.get("generative_ui")
     if rendered is not None:
         try:
@@ -4233,6 +4417,8 @@ class WorkspaceController:
         "agents.avatar.set": "agents_avatar_set",
         "sessions.list": "sessions_list",
         "sessions.history": "sessions_history",
+        "sessions.state": "sessions_state",
+        "sessions.content": "sessions_content",
         "sessions.update": "sessions_update",
         "sessions.delete": "sessions_delete",
         "attachments.resolve": "attachments_resolve",

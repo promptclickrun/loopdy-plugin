@@ -11,6 +11,8 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from .inbound_dispatch import ReplyRoute, current_reply_route, current_turn_lease
+
 from .link_contracts import (
     DEVICE_TOOL_OPERATIONS,
     DIRECTED_FRAMES_CAPABILITY,
@@ -46,6 +48,7 @@ class _Pending:
     context_key: tuple[Any, ...]
     fingerprint: str
     future: asyncio.Future[dict[str, Any]]
+    route: ReplyRoute | None = None
 
 
 @dataclass
@@ -71,6 +74,7 @@ class DeviceToolBridge:
         self._pending: dict[str, _Pending] = {}
         self._outcomes: OrderedDict[str, _Outcome] = OrderedDict()
         self._status: OrderedDict[tuple[str, str, int], dict[str, Any]] = OrderedDict()
+        self._status_routes: dict[tuple[str, str, int], ReplyRoute] = {}
         self.bind_link_client(link_client)
 
     def bind_link_client(self, link_client: Any | None) -> None:
@@ -80,6 +84,7 @@ class DeviceToolBridge:
             loop = None
         if link_client is not self.link_client:
             self._status.clear()
+            self._status_routes.clear()
             # A mutation outcome is only a safe replay for the authenticated
             # Link owner that produced it.  Never let a newly bound client
             # observe a prior client's cached result, even when the request
@@ -90,6 +95,16 @@ class DeviceToolBridge:
                     pending.future.set_exception(DeviceToolError("owner_changed"))
         self.link_client = link_client
         self._loop = loop
+
+    def retire_direct(self, generation: str) -> None:
+        for key, route in tuple(self._status_routes.items()):
+            if route.owner.generation == generation:
+                self._status_routes.pop(key, None)
+                self._status.pop(key, None)
+        for pending in self._pending.values():
+            if (pending.route is not None and pending.route.owner.generation == generation
+                    and not pending.future.done()):
+                pending.future.set_exception(DeviceToolError("owner_changed"))
 
     def accept_status(
         self,
@@ -125,10 +140,17 @@ class DeviceToolBridge:
             parsed["sentAt"] < previous["sentAt"] or parsed == previous
         ):
             return False
+        route = current_reply_route.get()
+        if route is not None and route.owner.transport == "direct":
+            route.check_current()
+            self._status_routes[key] = route
+        else:
+            self._status_routes.pop(key, None)
         self._status[key] = parsed
         self._status.move_to_end(key)
         while len(self._status) > MAX_STATUS_ENTRIES:
-            self._status.popitem(last=False)
+            old, _ = self._status.popitem(last=False)
+            self._status_routes.pop(old, None)
         if not parsed["available"]:
             self._cancel_pending_for_status(key, reason="authorization_required")
         else:
@@ -187,6 +209,16 @@ class DeviceToolBridge:
             return False
         pending = self._pending.get(parsed["requestId"])
         if pending is None or not _same_coordinates(pending.request, parsed):
+            return False
+        received_route = current_reply_route.get()
+        if pending.route is not None:
+            if received_route is None or received_route.owner != pending.route.owner:
+                return False
+            try:
+                pending.route.check_current()
+            except (ValueError, ConnectionError):
+                return False
+        elif received_route is not None and received_route.owner.transport == "direct":
             return False
         # A response cannot predate the request that originated it.  The
         # builder enforces this for locally-created results; repeat the check
@@ -251,7 +283,19 @@ class DeviceToolBridge:
             if not isinstance(tool_call_id, str) or not tool_call_id:
                 raise DeviceToolError("call_identity_missing")
             client = self.link_client
-            if client is None or not bool(getattr(client, "connected", False)):
+            lease = current_turn_lease.get()
+            route = lease.route if lease is not None and lease.route.owner.transport == "direct" else None
+            if route is not None:
+                if (lease.profile != agent_id or route.owner.device_id != device_id
+                        or route.owner.host_id != host_id
+                        or route.owner.device_epoch != authorization_epoch):
+                    raise DeviceToolError("owner_changed")
+                route.check_current()
+            elif (device_id, host_id, authorization_epoch) in self._status_routes:
+                # Direct-only permission is not a grant to pick a replacement
+                # socket or silently issue this mutation through the relay.
+                raise DeviceToolError("owner_changed")
+            if client is None or (route is None and not bool(getattr(client, "connected", False))):
                 raise DeviceToolError("unavailable")
             config = getattr(client, "config", None)
             config_host_id = getattr(config, "device_id", None)
@@ -263,9 +307,13 @@ class DeviceToolBridge:
                 raise DeviceToolError("owner_changed")
             status = self._status.get((device_id, host_id, authorization_epoch))
             capability = operation.split(".", 1)[0]
-            if status is None or not status.get("available") or capability not in status.get("enabled", []):
+            if (status is None or not status.get("available") or capability not in status.get("enabled", [])
+                    or status["sentAt"] < int(self.clock()) - STATUS_MAX_AGE_SECONDS):
                 raise DeviceToolError("authorization_required")
-            if DIRECTED_FRAMES_CAPABILITY not in set(getattr(client, "peer_capabilities", ())):
+            status_route = self._status_routes.get((device_id, host_id, authorization_epoch))
+            if route is not None and (status_route is None or status_route.owner != route.owner):
+                raise DeviceToolError("authorization_required")
+            if route is None and DIRECTED_FRAMES_CAPABILITY not in set(getattr(client, "peer_capabilities", ())):
                 raise DeviceToolError("directed_frames_unavailable")
             request_id = _stable_request_id(
                 device_id, host_id, authorization_epoch, session_id, agent_id, turn_id, tool_call_id,
@@ -321,6 +369,7 @@ class DeviceToolBridge:
                 context_key=_context_key(context),
                 fingerprint=fingerprint,
                 future=loop.create_future(),
+                route=route,
             )
             self._pending[request_id] = pending
             try:
@@ -337,11 +386,12 @@ class DeviceToolBridge:
                     raise DeviceToolError("owner_changed")
                 # This is one send. A timeout or uncertain write is returned to the
                 # model for reconciliation; this bridge never submits a second request.
-                await client.send_payload(
-                    request,
-                    target_device_id=device_id,
-                    preserve_pending_on_failure=True,
-                )
+                if route is not None:
+                    await route.send(request)
+                else:
+                    await client.send_payload(
+                        request, target_device_id=device_id,
+                        preserve_pending_on_failure=True)
                 return await self._await_pending(
                     pending,
                     context=context,
@@ -370,6 +420,8 @@ class DeviceToolBridge:
                     self._pending.pop(request_id, None)
         except DeviceToolError as exc:
             return _failed_result(None, exc.code)
+        except ConnectionError:
+            return _failed_result(None, "owner_changed")
         except (TypeError, ValueError):
             return _failed_result(None, "invalid_arguments")
 
@@ -405,8 +457,15 @@ class DeviceToolBridge:
             )
             if self.link_client is not client:
                 raise DeviceToolError("owner_changed")
+            if pending.route is not None:
+                pending.route.check_current()
+                latest_route = self._status_routes.get((device_id, host_id, authorization_epoch))
+                if latest_route is None or latest_route.owner != pending.route.owner:
+                    raise DeviceToolError("owner_changed")
             current_status = self._status.get((device_id, host_id, authorization_epoch))
-            if current_status is None or not current_status.get("available") or capability not in current_status.get("enabled", []):
+            if (current_status is None or not current_status.get("available")
+                    or capability not in current_status.get("enabled", [])
+                    or current_status["sentAt"] < int(self.clock()) - STATUS_MAX_AGE_SECONDS):
                 raise DeviceToolError("authorization_required")
             self._record_outcome(request_id, pending.fingerprint, result, pending.request["operation"])
             return result

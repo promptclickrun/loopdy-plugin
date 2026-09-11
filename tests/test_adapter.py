@@ -1021,7 +1021,7 @@ class AdapterTests(unittest.TestCase):
         self.assertNotIn("mobile-private-coordinate", repr(event.metadata))
 
     def test_verified_link_turn_carries_runtime_only_tool_execution_context(self) -> None:
-        from tool_execution_context import ToolExecutionContext
+        from test_optional_device_context import supported_context_host
         from loopdy_plugin.link_client import InboundLinkTurn
         from loopdy_plugin.link_contracts import UserMessage
 
@@ -1048,7 +1048,8 @@ class AdapterTests(unittest.TestCase):
             sender_epoch=7,
         )
 
-        asyncio.run(adapter.receive_link_turn(turn))
+        with supported_context_host() as ToolExecutionContext:
+            asyncio.run(adapter.receive_link_turn(turn))
 
         event = adapter.handle_message.await_args.args[0]
         execution = event.tool_execution_context

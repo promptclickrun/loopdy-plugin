@@ -25,6 +25,7 @@ from .adapter import (
     profile_display_name,
     release_service,
     standalone_send,
+    tool_execution_context_type,
     validate_config,
 )
 from .device_tools import DeviceToolBridge, register as register_device_tools
@@ -77,11 +78,7 @@ logger = logging.getLogger("hermes.plugins.loopdy")
 
 def _device_tools_supported() -> bool:
     """Advertise phone tools only when Hermes carries verified tool context."""
-    try:
-        from tool_execution_context import ToolExecutionContext
-    except (ImportError, AttributeError):
-        return False
-    return callable(getattr(ToolExecutionContext, "__init__", None))
+    return tool_execution_context_type() is not None
 
 
 def register_marketplace_publish_skill(ctx: Any) -> None:

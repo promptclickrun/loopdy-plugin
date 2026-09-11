@@ -135,7 +135,9 @@ class SessionStateReader:
                 or previous["count"] + len(rows) != current["count"]
                 or any(row["display_order"] is None or row["display_order"] <= previous["head"] for row in rows)):
             raise SessionStateResetRequired("Session history needs reconciliation")
-        return len(rows)
+        # Several newly persisted rows can represent one display generation.
+        # Offset is a display-row count, while the counter check above is raw.
+        return len({row["display_order"] for row in rows})
 
     def read(self, db: Any, *, agent_id: str, stored_id: str,
              cursor: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -214,13 +216,17 @@ class SessionStateReader:
                 reference: dict[str, Any], offset: int = 0) -> dict[str, Any]:
         self._coordinate(reference, agent_id=agent_id, stored_id=stored_id, kind="content")
         _integer(offset, 2**63 - 1)
+        if db.resolve_resume_session_id(stored_id) != stored_id:
+            raise SessionStateResetRequired("Session continuation moved")
         current = _revision(db, stored_id)
         self._append_count(db, stored_id, reference["revision"], current)
         rows = db.get_messages_around(stored_id, reference["rowId"], window=0)["window"]
         if len(rows) != 1 or not (rows[0].get("active") or rows[0].get("compacted")):
             raise SessionStateResetRequired("Session content is no longer visible")
         encoded = _json(_message(rows[0]))
-        if hashlib.sha256(encoded).hexdigest() != reference["sha256"] or current != _revision(db, stored_id):
+        if (hashlib.sha256(encoded).hexdigest() != reference["sha256"]
+                or current != _revision(db, stored_id)
+                or db.resolve_resume_session_id(stored_id) != stored_id):
             raise SessionStateResetRequired("Session content changed")
         if offset > len(encoded):
             raise ValueError("Invalid session content offset")

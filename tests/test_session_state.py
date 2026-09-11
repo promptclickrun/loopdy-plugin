@@ -58,6 +58,15 @@ class SessionStateTests(unittest.TestCase):
         self.assertEqual([row["row_id"] for row in earlier["messages"]], ids[:4])
         self.assertNotIn("nextCursor", earlier)
 
+    def test_duplicate_new_display_generations_count_once_when_rebasing(self):
+        ids = self.append(8)
+        reader = self.reader(maximum_rows=4)
+        page = reader.read(self.db, agent_id="default", stored_id="session-one")
+        for _ in range(2):
+            self.db.append_message("session-one", "assistant", "New duplicated generation", timestamp=200)
+        earlier = reader.read(self.db, agent_id="default", stored_id="session-one", cursor=page["nextCursor"])
+        self.assertEqual([row["row_id"] for row in earlier["messages"]], ids[:4])
+
     def test_rewind_invalidates_cursor_instead_of_showing_removed_rows(self):
         from loopdy_plugin.session_state import SessionStateResetRequired
         ids = self.append(8)
@@ -119,6 +128,16 @@ class SessionStateTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 reader.content(self.db, agent_id=agent_id, stored_id=stored_id, reference=reference)
         self.db.rewind_to_message("session-one", user)
+        with self.assertRaises(SessionStateResetRequired):
+            reader.content(self.db, agent_id="default", stored_id="session-one", reference=reference)
+
+    def test_content_reference_is_invalidated_when_resume_tip_moves(self):
+        from loopdy_plugin.session_state import SessionStateResetRequired
+        self.db.append_message("session-one", "tool", "Large result " * 10_000)
+        reader = self.reader()
+        reference = reader.read(self.db, agent_id="default", stored_id="session-one")["messages"][-1]["contentReference"]
+        self.db.create_session("new-tip", source="loopdy", parent_session_id="session-one")
+        self.db.append_message("new-tip", "assistant", "New answer")
         with self.assertRaises(SessionStateResetRequired):
             reader.content(self.db, agent_id="default", stored_id="session-one", reference=reference)
 

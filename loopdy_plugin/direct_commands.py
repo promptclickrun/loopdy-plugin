@@ -420,7 +420,7 @@ class DirectCommandJournal:
             name = f"{self.path.name}{suffix}"
             try:
                 descriptor = os.open(
-                    name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_descriptor
+                    name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_descriptor
                 )
             except FileNotFoundError:
                 continue
@@ -722,7 +722,7 @@ class DirectCommandJournal:
             ):
                 try:
                     descriptor = os.open(
-                        name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_descriptor
+                        name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_descriptor
                     )
                 except FileNotFoundError:
                     continue

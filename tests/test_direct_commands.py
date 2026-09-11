@@ -5,6 +5,8 @@ import dataclasses
 import math
 import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -476,6 +478,30 @@ class DirectCommandJournalTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(database.exists())
         self.assertEqual(target.read_bytes(), b"synthetic unrelated content")
         self.assertEqual(os.stat(target).st_mode & 0o777, 0o644)
+
+    async def test_fifo_sidecar_inspection_rejects_without_waiting_for_a_writer(self) -> None:
+        for method in ("construct", "restrict"):
+            with self.subTest(method=method):
+                database = self.root / method / "journal.sqlite3"
+                database.parent.mkdir()
+                script = """
+import os, sys
+from loopdy_plugin.direct_commands import DirectCommandJournal
+path, method = sys.argv[1:]
+if method == 'restrict':
+    journal = DirectCommandJournal(path)
+os.mkfifo(path + '-wal')
+try:
+    DirectCommandJournal(path) if method == 'construct' else journal._restrict_files()
+except ValueError:
+    print('rejected')
+else:
+    raise SystemExit(2)
+"""
+                result = subprocess.run([sys.executable, "-c", script, str(database), method],
+                                        capture_output=True, text=True, timeout=2)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "rejected")
 
 
 if __name__ == "__main__":

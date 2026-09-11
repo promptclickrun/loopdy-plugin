@@ -96,7 +96,7 @@ def canonical_enrollment_result_transcript(result: Mapping[str, Any]) -> bytes:
 def canonical_session_transcript(
     *, account_origin: str, direct_origin: str, host_device_id: str,
     host_epoch: int, peer_device_id: str, peer_epoch: int, connection_id: str,
-    nonce: str,
+    nonce: str, client_nonce: str,
 ) -> bytes:
     """Build the direct-session challenge transcript shared with the peer."""
     return _SESSION_DOMAIN + _canonical_json(
@@ -110,6 +110,7 @@ def canonical_session_transcript(
             "peerEpoch": peer_epoch,
             "connectionID": connection_id,
             "nonce": nonce,
+            "clientNonce": client_nonce,
         }
     )
 
@@ -132,7 +133,16 @@ class _Challenge:
     peer_device_id: str
     peer_epoch: int
     connection_id: str
+    client_nonce: str
     expires_at: float
+
+
+@dataclass(frozen=True)
+class _Owner:
+    account_origin: str
+    direct_origin: str
+    host_device_id: str
+    host_epoch: int
 
 
 def _opaque(value: Any, field: str, *, maximum: int = 96) -> str:
@@ -244,10 +254,10 @@ class DirectConnectionAuthority:
         host_epoch: int, host_private_key: ec.EllipticCurvePrivateKey, state: Any,
         monotonic: Callable[[], float] = time.monotonic,
     ):
-        self.account_origin = _origin(account_origin, "account_origin")
-        self.direct_origin = _origin(direct_origin, "direct_origin")
-        self.host_device_id = _opaque(host_device_id, "host_device_id")
-        self.host_epoch = _positive_integer(host_epoch, "host_epoch")
+        self._owner_context = _Owner(
+            _origin(account_origin, "account_origin"), _origin(direct_origin, "direct_origin"),
+            _opaque(host_device_id, "host_device_id"), _positive_integer(host_epoch, "host_epoch"),
+        )
         if (not isinstance(host_private_key, ec.EllipticCurvePrivateKey)
                 or not isinstance(host_private_key.curve, ec.SECP256R1)):
             raise ValueError("host_private_key must be a P-256 private key")
@@ -270,10 +280,40 @@ class DirectConnectionAuthority:
         owner_scope = _fingerprint(_canonical_json(self._owner))
         self._state_key = f"{self._STATE_PREFIX}.{owner_scope}"
         self._bindings = self._load_bindings()
+        self._denied_through = self._load_lifecycle_fences()
+        self._fences_dirty = False
         self._enrollment_nonces: dict[str, float] = {}
         self._challenges: dict[str, _Challenge] = {}
         self._lifecycle_devices: dict[str, dict[str, Any]] = {}
         self._lifecycle_refreshed_at: float | None = None
+
+    @property
+    def account_origin(self) -> str:
+        return self._owner_context.account_origin
+
+    @property
+    def direct_origin(self) -> str:
+        return self._owner_context.direct_origin
+
+    @property
+    def host_device_id(self) -> str:
+        return self._owner_context.host_device_id
+
+    @property
+    def host_epoch(self) -> int:
+        return self._owner_context.host_epoch
+
+    def _load_lifecycle_fences(self) -> dict[str, int]:
+        stored = self._state.get(self._state_key + ".lifecycle", None)
+        if stored is None:
+            return {}
+        if (not isinstance(stored, dict) or set(stored) != {"version", "owner", "deniedThrough"}
+                or type(stored["version"]) is not int or stored["version"] != 1
+                or stored["owner"] != self._owner or not isinstance(stored["deniedThrough"], dict)
+                or len(stored["deniedThrough"]) > 257):
+            raise ValueError("persisted direct lifecycle fences are invalid")
+        return {_opaque(key, "deviceId"): _nonnegative_integer(value, "deniedThrough")
+                for key, value in stored["deniedThrough"].items()}
 
     def _load_bindings(self) -> dict[str, dict[str, Any]]:
         stored = self._state.get(self._state_key, {})
@@ -363,6 +403,10 @@ class DirectConnectionAuthority:
                 raise ValueError("direct enrollment version is invalid")
             phone_device_id = _opaque(trusted_sender_device_id, "trusted_sender_device_id")
             phone_epoch = _positive_integer(trusted_sender_epoch, "trusted_sender_epoch")
+            if phone_epoch <= self._denied_through.get(phone_device_id, 0):
+                raise ValueError("phone enrollment epoch has been invalidated")
+            if phone_device_id not in self._bindings and len(self._bindings) >= 256:
+                raise ValueError("direct enrollment capacity is exhausted")
             exchange_id = _opaque(payload.get("exchangeId"), "exchangeId")
             phone_nonce = _opaque(payload.get("phoneNonce"), "phoneNonce", maximum=128)
             public_key, public_der = _load_public_key(payload.get("phonePublicKey"))
@@ -455,6 +499,39 @@ class DirectConnectionAuthority:
         devices = self._parse_catalog(catalog)
         now = float(self._monotonic())
         with self._lock:
+            known = {key: ("mobile", binding["epoch"]) for key, binding in self._bindings.items()}
+            known[self.host_device_id] = ("host", self.host_epoch)
+            floors = dict(self._denied_through)
+            for device_id, (role, expected_epoch) in known.items():
+                device = devices.get(device_id)
+                if device is None:
+                    floor = expected_epoch
+                elif (device["lifecycle"] != "active" or device["revokedAt"] is not None
+                      or device["role"] != role):
+                    floor = max(expected_epoch, device["authorizationEpoch"])
+                else:
+                    floor = (device["authorizationEpoch"] - 1
+                             if device["authorizationEpoch"] > expected_epoch
+                             else floors.get(device_id, 0))
+                if floor > floors.get(device_id, 0):
+                    floors[device_id] = floor
+            if floors != self._denied_through:
+                # Publish denial in memory before persistence. Failure retires
+                # freshness immediately; it can never retain old authorization.
+                self._denied_through = floors
+                self._fences_dirty = True
+            if self._fences_dirty:
+                self._lifecycle_refreshed_at = None
+                self._state.set(self._state_key + ".lifecycle", {
+                    "version": 1, "owner": dict(self._owner), "deniedThrough": floors,
+                })
+                self._fences_dirty = False
+            if any(device["lifecycle"] == "active" and device["revokedAt"] is None
+                   and device["role"] == known[device_id][0]
+                   and device["authorizationEpoch"] <= floors.get(device_id, 0)
+                   for device_id, device in devices.items() if device_id in known):
+                self._lifecycle_refreshed_at = None
+                raise ValueError("lifecycle catalog rolls back a known invalidation")
             self._lifecycle_devices = devices
             self._lifecycle_refreshed_at = now
 
@@ -502,11 +579,12 @@ class DirectConnectionAuthority:
         return parsed
 
     def issue_challenge(
-        self, *, peer_device_id: str, peer_epoch: int, connection_id: str,
+        self, *, peer_device_id: str, peer_epoch: int, connection_id: str, client_nonce: str,
     ) -> dict[str, Any]:
         peer_id = _opaque(peer_device_id, "peer_device_id")
         epoch = _positive_integer(peer_epoch, "peer_epoch")
         connection = _opaque(connection_id, "connection_id", maximum=128)
+        _decode_canonical(client_nonce, length=32, field="clientNonce")
         with self._lock:
             self._require_current_peer(peer_id, epoch)
             now = float(self._monotonic())
@@ -521,10 +599,11 @@ class DirectConnectionAuthority:
                 account_origin=self.account_origin, direct_origin=self.direct_origin,
                 host_device_id=self.host_device_id, host_epoch=self.host_epoch,
                 peer_device_id=peer_id, peer_epoch=epoch, connection_id=connection,
-                nonce=nonce,
+                nonce=nonce, client_nonce=client_nonce,
             )
             self._challenges[nonce] = _Challenge(
                 peer_device_id=peer_id, peer_epoch=epoch, connection_id=connection,
+                client_nonce=client_nonce,
                 expires_at=now + self._CHALLENGE_TTL,
             )
             result = json.loads(transcript[len(_SESSION_DOMAIN):])
@@ -562,7 +641,7 @@ class DirectConnectionAuthority:
                 account_origin=self.account_origin, direct_origin=self.direct_origin,
                 host_device_id=self.host_device_id, host_epoch=self.host_epoch,
                 peer_device_id=peer_id, peer_epoch=epoch, connection_id=connection,
-                nonce=challenge_nonce,
+                nonce=challenge_nonce, client_nonce=challenge.client_nonce,
             )
             try:
                 public_key.verify(raw_p256_to_der(signature), transcript, ec.ECDSA(hashes.SHA256()))
@@ -595,6 +674,9 @@ class DirectConnectionAuthority:
         refreshed_at = self._lifecycle_refreshed_at
         if refreshed_at is None or now - refreshed_at > self._LIFECYCLE_TTL:
             raise ValueError("lifecycle authorization is stale")
+        if (self.host_epoch <= self._denied_through.get(self.host_device_id, 0)
+                or peer_epoch <= self._denied_through.get(peer_device_id, 0)):
+            raise ValueError("lifecycle authorization epoch was invalidated")
         host = self._lifecycle_devices.get(self.host_device_id)
         if not self._active_at_epoch(host, role="host", epoch=self.host_epoch):
             raise ValueError("host lifecycle authorization is invalid")

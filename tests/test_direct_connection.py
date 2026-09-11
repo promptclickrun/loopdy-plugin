@@ -88,6 +88,91 @@ def _catalog(*devices: dict[str, object]) -> dict[str, object]:
 
 
 class DirectConnectionTests(unittest.TestCase):
+    def test_owner_properties_cannot_change_after_enrollment(self):
+        authority = self._authority()
+        self._enrollment(authority)
+        for field, value in (("direct_origin", "https://another.example"),
+                             ("account_origin", "https://another.example"),
+                             ("host_device_id", "another_host"), ("host_epoch", 9)):
+            with self.subTest(field=field), self.assertRaises(AttributeError):
+                setattr(authority, field, value)
+
+    def test_known_invalidation_cannot_be_undone_by_a_delayed_catalog_or_restart(self):
+        from loopdy_plugin.direct_connection import DirectConnectionAuthority
+        for missing_id in ("host_1", "phone_1", None):
+            with self.subTest(missing_id=missing_id):
+                authority = self._authority()
+                self._enrollment(authority)
+                active = _catalog(_device("host_1", role="host", epoch=7),
+                                  _device("phone_1", role="mobile", epoch=11))
+                authority._refresh_lifecycle_catalog(active)
+                invalid = _catalog(*[d for d in active["devices"] if d["deviceId"] != missing_id])
+                if missing_id is None:
+                    invalid["devices"][1] = _device("phone_1", role="mobile", epoch=12,
+                                                    lifecycle="revoked", revoked_at=2)
+                authority._refresh_lifecycle_catalog(invalid)
+                with self.assertRaises(ValueError):
+                    authority._refresh_lifecycle_catalog(active)
+                restarted = DirectConnectionAuthority(account_origin="https://account.example",
+                    direct_origin="https://direct.example:8443", host_device_id="host_1", host_epoch=7,
+                    host_private_key=self.host_key, state=self.state, monotonic=self.clock)
+                with self.assertRaises(ValueError):
+                    restarted._refresh_lifecycle_catalog(active)
+
+    def test_host_challenge_proof_is_bound_to_the_fresh_phone_nonce(self):
+        from loopdy_plugin.direct_connection import canonical_session_transcript
+        authority = self._authority()
+        self._enrollment(authority)
+        authority._refresh_lifecycle_catalog(_catalog(_device("host_1", role="host", epoch=7),
+                                                      _device("phone_1", role="mobile", epoch=11)))
+        nonce = encode_base64url(bytes(range(32)))
+        challenge = authority.issue_challenge(peer_device_id="phone_1", peer_epoch=11,
+                                              connection_id="connection_1", client_nonce=nonce)
+        self.assertEqual(challenge["clientNonce"], nonce)
+        values = dict(account_origin="https://account.example", direct_origin="https://direct.example:8443",
+                      host_device_id="host_1", host_epoch=7, peer_device_id="phone_1", peer_epoch=11,
+                      connection_id="connection_1", nonce=challenge["nonce"], client_nonce=nonce)
+        proof = raw_p256_to_der(decode_base64url(challenge["hostProof"]))
+        self.host_key.public_key().verify(proof, canonical_session_transcript(**values), ec.ECDSA(hashes.SHA256()))
+        values["client_nonce"] = encode_base64url(bytes(reversed(range(32))))
+        with self.assertRaises(InvalidSignature):
+            self.host_key.public_key().verify(proof, canonical_session_transcript(**values), ec.ECDSA(hashes.SHA256()))
+
+    def test_invalidated_peer_requires_new_link_enrollment_at_a_later_epoch(self):
+        authority = self._authority()
+        self._enrollment(authority)
+        authority._refresh_lifecycle_catalog(_catalog(_device("host_1", role="host", epoch=7)))
+        active = _catalog(_device("host_1", role="host", epoch=7), _device("phone_1", role="mobile", epoch=12))
+        authority._refresh_lifecycle_catalog(active)
+        nonce = encode_base64url(bytes(range(32)))
+        with self.assertRaises(ValueError):
+            authority.issue_challenge(peer_device_id="phone_1", peer_epoch=12, connection_id="new", client_nonce=nonce)
+        self._enroll_identity(authority, key=self.phone_key, device_id="phone_1", epoch=12,
+                              exchange_id="new_exchange", phone_nonce="new_nonce")
+        self.assertIn("hostProof", authority.issue_challenge(peer_device_id="phone_1", peer_epoch=12,
+                                                            connection_id="new", client_nonce=nonce))
+        with self.assertRaises(ValueError):
+            self._enrollment(authority)
+
+    def test_failed_fence_persistence_retires_freshness_and_is_retried(self):
+        state = _FailingState()
+        state.fail = False
+        authority = self._authority(state=state)
+        self._enrollment(authority)
+        authority._refresh_lifecycle_catalog(_catalog(_device("host_1", role="host", epoch=7),
+                                                      _device("phone_1", role="mobile", epoch=11)))
+        state.fail = True
+        invalid = _catalog(_device("host_1", role="host", epoch=7))
+        for _ in range(2):
+            with self.assertRaises(OSError):
+                authority._refresh_lifecycle_catalog(invalid)
+            with self.assertRaises(ValueError):
+                authority.issue_challenge(peer_device_id="phone_1", peer_epoch=11, connection_id="denied",
+                                          client_nonce=encode_base64url(bytes(range(32))))
+        state.fail = False
+        authority._refresh_lifecycle_catalog(invalid)
+        self.assertTrue(any(key.endswith(".lifecycle") for key in state.values))
+
     def _authority(self, state: _State | None = None, clock: _Clock | None = None):
         from loopdy_plugin.direct_connection import DirectConnectionAuthority
 
@@ -266,11 +351,13 @@ class DirectConnectionTests(unittest.TestCase):
             )
         )
         challenge = authority.issue_challenge(
+            client_nonce="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
             peer_device_id="phone_1",
             peer_epoch=11,
             connection_id="connection_1",
         )
         transcript = canonical_session_transcript(
+            client_nonce="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
             account_origin="https://account.example",
             direct_origin="https://direct.example:8443",
             host_device_id="host_1",
@@ -304,6 +391,7 @@ class DirectConnectionTests(unittest.TestCase):
             )
 
         reconnect = authority.issue_challenge(
+            client_nonce="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
             peer_device_id="phone_1",
             peer_epoch=11,
             connection_id="connection_2",
@@ -424,6 +512,7 @@ class DirectConnectionTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             authority.issue_challenge(
+                client_nonce="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                 peer_device_id="phone_1", peer_epoch=11, connection_id="old_epoch"
             )
 
@@ -470,6 +559,7 @@ class DirectConnectionTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             restarted.issue_challenge(
+                client_nonce="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                 peer_device_id="phone_1", peer_epoch=11, connection_id="restart"
             )
         restarted._refresh_lifecycle_catalog(
@@ -481,6 +571,7 @@ class DirectConnectionTests(unittest.TestCase):
         self.assertIn(
             "nonce",
             restarted.issue_challenge(
+                client_nonce="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                 peer_device_id="phone_1", peer_epoch=11, connection_id="restart"
             ),
         )
@@ -502,6 +593,7 @@ class DirectConnectionTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             other_owner.issue_challenge(
+                client_nonce="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                 peer_device_id="phone_1", peer_epoch=11, connection_id="other_owner"
             )
         self.phone_key = phone_key
@@ -531,6 +623,7 @@ class DirectConnectionTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             restarted.issue_challenge(
+                client_nonce="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                 peer_device_id="phone_1", peer_epoch=11, connection_id="tampered"
             )
 
@@ -558,6 +651,7 @@ class DirectConnectionTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             restarted.issue_challenge(
+                client_nonce="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                 peer_device_id="phone_1", peer_epoch=11, connection_id="bad_schema"
             )
 
@@ -598,6 +692,7 @@ class DirectConnectionTests(unittest.TestCase):
         self.clock.advance(2)
         with self.assertRaises(ValueError):
             authority.issue_challenge(
+                client_nonce="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                 peer_device_id="phone_1", peer_epoch=11, connection_id="stale"
             )
 
@@ -618,9 +713,14 @@ class DirectConnectionTests(unittest.TestCase):
                 _device("phone_1", role="mobile", epoch=11),
             ),
         ):
+            # Independent denial cases. A known invalidated epoch is now
+            # durably fenced and cannot be reused by a later case's catalog.
+            authority = self._authority()
+            self._enrollment(authority)
             authority._refresh_lifecycle_catalog(catalog)
             with self.assertRaises(ValueError):
                 authority.issue_challenge(
+                    client_nonce="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                     peer_device_id="phone_1", peer_epoch=11, connection_id="denied"
                 )
 
@@ -636,9 +736,11 @@ class DirectConnectionTests(unittest.TestCase):
             )
         )
         challenge = authority.issue_challenge(
+            client_nonce="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
             peer_device_id="phone_1", peer_epoch=11, connection_id="connection_1"
         )
         transcript = canonical_session_transcript(
+            client_nonce="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
             account_origin="https://account.example",
             direct_origin="https://direct.example:8443",
             host_device_id="host_1",
@@ -667,6 +769,7 @@ class DirectConnectionTests(unittest.TestCase):
             )
 
         challenge = authority.issue_challenge(
+            client_nonce="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
             peer_device_id="phone_1", peer_epoch=11, connection_id="connection_3"
         )
         self.clock.advance(31)
@@ -693,6 +796,7 @@ class DirectConnectionTests(unittest.TestCase):
         )
         authority._refresh_lifecycle_catalog(catalog)
         challenge = authority.issue_challenge(
+            client_nonce="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
             peer_device_id="phone_1", peer_epoch=11, connection_id="connection_1"
         )
         with self.assertRaises(ValueError):
@@ -704,6 +808,7 @@ class DirectConnectionTests(unittest.TestCase):
                 peer_proof="AA",
             )
         transcript = canonical_session_transcript(
+            client_nonce="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
             account_origin="https://account.example",
             direct_origin="https://direct.example:8443",
             host_device_id="host_1",
@@ -723,9 +828,11 @@ class DirectConnectionTests(unittest.TestCase):
             )
 
         valid = authority.issue_challenge(
+            client_nonce="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
             peer_device_id="phone_1", peer_epoch=11, connection_id="connection_2"
         )
         valid_transcript = canonical_session_transcript(
+            client_nonce="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
             account_origin="https://account.example",
             direct_origin="https://direct.example:8443",
             host_device_id="host_1",
@@ -791,18 +898,21 @@ class DirectConnectionTests(unittest.TestCase):
         )
         for index in range(64):
             authority.issue_challenge(
+                client_nonce="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                 peer_device_id="phone_1",
                 peer_epoch=11,
                 connection_id=f"connection_{index}",
             )
         with self.assertRaises(ValueError):
             authority.issue_challenge(
+                client_nonce="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                 peer_device_id="phone_1", peer_epoch=11, connection_id="overflow"
             )
         clock.advance(31)
         self.assertIn(
             "nonce",
             authority.issue_challenge(
+                client_nonce="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                 peer_device_id="phone_1", peer_epoch=11, connection_id="after_expiry"
             ),
         )
@@ -825,6 +935,7 @@ class DirectConnectionTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             authority.issue_challenge(
+                client_nonce="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                 peer_device_id="phone_1", peer_epoch=11, connection_id="not_published"
             )
         state.fail = False

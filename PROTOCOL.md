@@ -11,6 +11,13 @@ The [native Wiki adapter](docs/NATIVE_WIKI.md) reuses existing Wiki data DTOs wi
 server-proven native principal/profile authority, not Link/device credentials.
 No second pairing or authorization ceremony is required.
 
+The separate `native-project-git-read-v1` contract uses three fixed authenticated
+native POST routes with existing camelCase Project Git DTOs, real content tokens
+and diff paging. It requires exact public Project/session metadata plus safe
+root checks; status overflow and combined-conflict diffs are explicit errors.
+See [Native Project Git](docs/NATIVE_PROJECT_GIT.md). Tokens/metadata checks are
+optimistic, not a durable immutable filesystem lease.
+
 Clients discovering `groups-results-v1` may add top-level
 `groupsResultVersion: 1` to encrypted `workspace.request` for only
 `groups.capabilities/list/create/state/send/rename/log/stop/retry/approve`.

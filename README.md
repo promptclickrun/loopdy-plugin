@@ -16,6 +16,12 @@ semantics rather than durable replay or inferred tool success.
 The older paired **Direct listener** and **direct APNs provider** are different
 features and do not provide this native authentication path.
 
+[Native Project Git](docs/NATIVE_PROJECT_GIT.md) provides fixed read-only
+capabilities/status/diff for an exact registered Project and stored session,
+including proven hidden canonical Bot Chat. It reuses content-derived tokens
+and bounded side-specific diffs; incomplete status and unsupported conflict
+diffs fail explicitly. No Files grant or Git mutation is created.
+
 Loopdy Link remains the paired account transport. The Hermes host opens one outbound WebSocket to `https://link.loopdy.app`; the app and host encrypt chat frames with the account key before they reach the service. Pairing is proof-of-possession based and gives each host its own revocable device identity. The cloud service cannot read chat plaintext.
 
 The same paired Loopdy Link connection carries a fixed, versioned set of encrypted workspace operations for agents, Hermes Projects, sessions, scheduled tasks, per-agent defaults, approvals, events, and attachments. It is not an arbitrary HTTP proxy: every operation is explicitly allowlisted, bounded, validated, and handled through Hermes-owned Project, profile, session, cron, policy, and plugin surfaces. Agent-default reads use Hermes' native profile-scoped `config.get` and `model.options` methods, with compatibility fallback for older Hermes releases. Project creation registers one existing remote folder, archive removes only the Project registration from active catalogs, and folder suggestions return bounded directory coordinates without file contents. The app never needs a Hermes gateway origin or token after pairing.

@@ -116,4 +116,7 @@ def native_context(request: Request) -> NativeContext:
     from .wiki_contract import available_wiki_operations
     if "native-card-templates-v1" in features and available_wiki_operations():
         features.extend(("native-wiki-v1", "native-wiki-disconnect-v1"))
+    from .native_project_git import CAPABILITY as project_git_capability, supported as project_git_supported
+    if project_git_supported():
+        features.append(project_git_capability)
     return NativeContext(provider, user_id, display_name, profile, tuple(features), RUNTIME_ID)

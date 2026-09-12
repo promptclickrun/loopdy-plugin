@@ -59,6 +59,15 @@ attachment IDs, safe filenames, MIME types and byte counts. See
 
 ## Workspace Files grants
 
+Native Project Git is a distinct read-only review surface, not an automatic
+Workspace Files grant. It requires a registered Project, exact ordinary stored
+session association (or public hidden canonical Bot Chat proof), safe pinned
+root, real native Session/context and content-token checks. It exposes no
+mutation/remote commands; sensitive paths/content and unsupported combined
+diffs are rejected. Public Projects lookup can initialize native metadata, but
+the Git engine does not create its mutation ledger in this mode. See
+[Native Project Git](docs/NATIVE_PROJECT_GIT.md) for observational race limits.
+
 Workspace Files is a separate read-only plugin feature, exposed through the existing authenticated host API and a host CLI. Explicit local grants bind opaque IDs to pinned root directories; there is no automatic grant from Hermes Projects, no remote grant endpoint, and no private Project/session API dependency. Authenticated host API clients can inspect the grants in that host/profile; this is not yet a per-device encrypted Link permission. Existing Link behavior is unchanged.
 
 The implementation requires secure POSIX descriptor-relative traversal and refuses unsupported hosts. It rejects traversal, symlinks, unsafe hard links, special files and sensitive control/credential paths; it scans each bounded file for known credential patterns before returning any chunk. Pattern scanning is not universal secret detection, especially for opaque binary/compressed files. A host operator must grant only an appropriate project directory. Root replacement, stale versions and revocation fail closed; already delivered content cannot be recalled. See [Workspace Files](docs/WORKSPACE_FILES.md) for bounds, authentication, pagination and deferred client integration.

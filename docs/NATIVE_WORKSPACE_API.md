@@ -52,6 +52,10 @@ are available. `native-room-activity-v1` is added only with an actual supported
 live public-hook registration. These are not universal Hermes capability or runtime health claims.
 `native-wiki-v1` advertises the fixed principal-owned Wiki adapter on secure
 traversal platforms; folder policy and local journal availability still apply.
+`native-project-git-read-v1` exposes the distinct fixed read-only Project Git
+contract using verified public Project/stored-session association and the
+existing content-token engine. See [Native Project Git](NATIVE_PROJECT_GIT.md);
+this never creates or adopts a Workspace Files grant.
 Read failures remain visible. Context responses are at most 16 KiB.
 
 ## Card templates

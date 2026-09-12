@@ -50,6 +50,10 @@ from .wiki_contract import (
     validate_payload as validate_wiki_payload,
 )
 from .generative_ui import canonical_json, validate_rendered_envelope
+from .groups_contracts import (
+    GROUPS_RESULT_PAYLOAD_BYTES, GROUPS_RESULT_ENVELOPE_BYTES, GROUPS_RESULTS_CAPABILITY,
+    validate_log_page, validate_result_version,
+)
 
 
 _OPAQUE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -429,6 +433,7 @@ class WorkspaceRequest:
     operation: str
     payload: dict[str, Any]
     sent_at: int
+    groups_result_version: int | None = None
 
     def wire_value(self) -> dict[str, Any]:
         return {
@@ -438,6 +443,8 @@ class WorkspaceRequest:
             "operation": self.operation,
             "payload": dict(self.payload),
             "sentAt": self.sent_at,
+            **({"groupsResultVersion": self.groups_result_version}
+               if self.groups_result_version is not None else {}),
         }
 
 
@@ -742,7 +749,7 @@ def parse_workspace_request(value: dict[str, Any]) -> WorkspaceRequest:
     expected = {"version", "type", "requestId", "operation", "payload", "sentAt"}
     if (
         not isinstance(value, dict)
-        or set(value) != expected
+        or not expected <= set(value) <= expected | {"groupsResultVersion"}
         or value.get("version") != 1
         or value.get("type") != "workspace.request"
     ):
@@ -750,6 +757,10 @@ def parse_workspace_request(value: dict[str, Any]) -> WorkspaceRequest:
     operation = value.get("operation")
     if not isinstance(operation, str) or operation not in WORKSPACE_OPERATIONS | LIVE_VOICE_OPERATIONS:
         raise ValueError("Loopdy Link workspace operation is invalid")
+    groups_result_version = (
+        validate_result_version(value["groupsResultVersion"], operation)
+        if "groupsResultVersion" in value else None
+    )
     if operation in AVAILABLE_WIKI_OPERATIONS:
         if type(value.get("version")) is not int:
             raise ValueError("Wiki request is invalid")
@@ -769,6 +780,7 @@ def parse_workspace_request(value: dict[str, Any]) -> WorkspaceRequest:
         operation=operation,
         payload=payload,
         sent_at=_positive(value.get("sentAt"), "sentAt"),
+        groups_result_version=groups_result_version,
     )
 
 
@@ -1928,7 +1940,7 @@ def workspace_capabilities(*, live_voice: bool = True) -> dict[str, Any]:
     wiki_operations = available_wiki_operations()
     features = [
         "workspace-rejected-v1", "backpressure-v1", "plugin-update-v1",
-        "host-runtime-diagnostics-v1", "voice-settings-v1", "session-state-v1",
+        "host-runtime-diagnostics-v1", "voice-settings-v1", "session-state-v1", GROUPS_RESULTS_CAPABILITY,
     ]
     if live_voice:
         features.append("live-voice-v1")
@@ -2005,8 +2017,12 @@ def workspace_result(
 ) -> dict[str, Any]:
     if status not in {"completed", "failed", "conflict"}:
         raise ValueError("Loopdy Link workspace result status is invalid")
+    if request.groups_result_version is not None:
+        validate_result_version(request.groups_result_version, request.operation)
     if request.operation in AVAILABLE_WIKI_OPERATIONS:
         payload = bound_wiki_result(payload)
+    if request.operation == "groups.log" and status == "completed":
+        validate_log_page(payload, request.payload)
     projected = (
         _workspace_json_allowing_dashboard_cards(payload)
         if request.operation == "dashboard.load" and status == "completed"
@@ -2024,6 +2040,12 @@ def workspace_result(
                 if request.operation.startswith("projects.git.")
                 else frozenset()
             ),
+            allowed_gateway_paths=(
+                frozenset({("authority", "gateway_id")})
+                if request.operation == "groups.log" and status == "completed"
+                else frozenset()
+            ),
+            maximum_bytes=GROUPS_RESULT_PAYLOAD_BYTES if request.groups_result_version == 1 else 196_608,
         )
     )
     if not isinstance(projected, dict):
@@ -2037,6 +2059,8 @@ def workspace_result(
         "payload": projected,
         "sentAt": _positive(sent_at, "sentAt"),
     }
+    if request.groups_result_version == 1:
+        result["groupsResultVersion"] = 1
     if (code is None) != (message is None):
         raise ValueError("Loopdy Link workspace error fields are invalid")
     if code is not None and message is not None:
@@ -2044,6 +2068,10 @@ def workspace_result(
             raise ValueError("Loopdy Link workspace error code is invalid")
         result["code"] = code
         result["message"] = _activity_label(message, "message", 2_000)
+    if request.groups_result_version == 1 and len(
+        json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ) > GROUPS_RESULT_ENVELOPE_BYTES:
+        raise ValueError("Loopdy Link workspace result envelope is too large")
     return result
 
 
@@ -2203,6 +2231,9 @@ def _workspace_json(
     *,
     depth: int,
     allowed_sensitive_keys: frozenset[str] = frozenset(),
+    allowed_gateway_paths: frozenset[tuple[str, ...]] = frozenset(),
+    path: tuple[str, ...] = (),
+    maximum_bytes: int = 196_608,
 ) -> Any:
     if depth > 8:
         raise ValueError("Loopdy Link workspace payload is invalid")
@@ -2229,8 +2260,10 @@ def _workspace_json(
                 item,
                 depth=depth + 1,
                 allowed_sensitive_keys=allowed_sensitive_keys,
+                allowed_gateway_paths=allowed_gateway_paths,
+                path=(*path, str(index)),
             )
-            for item in value
+            for index, item in enumerate(value)
         ]
     elif isinstance(value, dict):
         if len(value) > 200:
@@ -2244,7 +2277,7 @@ def _workspace_json(
                 raise ValueError("Loopdy Link workspace payload key is invalid")
             canonical = "".join(character for character in key.lower() if character.isalnum())
             if (
-                canonical.startswith("gateway")
+                (canonical.startswith("gateway") and (*path, key) not in allowed_gateway_paths)
                 or (canonical.endswith("token") and key not in allowed_sensitive_keys)
                 or any(
                     forbidden in canonical
@@ -2262,6 +2295,8 @@ def _workspace_json(
                 item,
                 depth=depth + 1,
                 allowed_sensitive_keys=allowed_sensitive_keys,
+                allowed_gateway_paths=allowed_gateway_paths,
+                path=(*path, key),
             )
     else:
         raise ValueError("Loopdy Link workspace payload is invalid")
@@ -2272,7 +2307,7 @@ def _workspace_json(
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
-    ) > 196_608:
+    ) > maximum_bytes:
         raise ValueError("Loopdy Link workspace payload is invalid")
     return projected
 

@@ -41,6 +41,14 @@ _GATEWAY_LIFECYCLE_PREFIXES = (
 )
 
 
+class CardTemplateConflict(ValueError):
+    """A template changed under the caller's expected version/content."""
+
+
+class CardTemplateLimit(ValueError):
+    """A bounded template catalog cannot represent all stored rows."""
+
+
 class LoopdyStore:
     def __init__(self, path: Path | str):
         self.path = Path(path)
@@ -536,7 +544,7 @@ class LoopdyStore:
             if existing is not None:
                 current_version = int(existing["version"])
                 if normalized["version"] < current_version:
-                    raise ValueError("Card template version cannot decrease")
+                    raise CardTemplateConflict("Card template version cannot decrease")
                 if normalized["version"] == current_version:
                     if (
                         hmac.compare_digest(str(existing["sha256"]), normalized["sha256"])
@@ -546,7 +554,7 @@ class LoopdyStore:
                         )
                     ):
                         return {"changed": False, "template": normalized}
-                    raise ValueError("Card template version conflict")
+                    raise CardTemplateConflict("Card template version conflict")
             connection.execute(
                 """
                 INSERT INTO card_templates (
@@ -575,14 +583,18 @@ class LoopdyStore:
             )
         return {"changed": True, "template": normalized}
 
-    def list_card_templates(self, *, profile: str) -> list[dict[str, Any]]:
+    def list_card_templates(self, *, profile: str, limit: int | None = None) -> list[dict[str, Any]]:
         owner = _identifier(profile, "profile")
+        if limit is not None and (type(limit) is not int or not 1 <= limit <= 500):
+            raise ValueError("Card template catalog limit is invalid")
         with self._connect() as connection:
             rows = connection.execute(
                 "SELECT template_json FROM card_templates WHERE profile=? "
-                "ORDER BY name COLLATE NOCASE, template_id",
-                (owner,),
+                "ORDER BY name COLLATE NOCASE, template_id" + (" LIMIT ?" if limit is not None else ""),
+                (owner, limit + 1) if limit is not None else (owner,),
             ).fetchall()
+        if limit is not None and len(rows) > limit:
+            raise CardTemplateLimit("Card template catalog exceeds the row limit")
         return [json.loads(str(row["template_json"])) for row in rows]
 
     def get_card_template(
@@ -623,7 +635,7 @@ class LoopdyStore:
             if int(row["version"]) != expected_version or not hmac.compare_digest(
                 str(row["sha256"]), expected_hash
             ):
-                raise ValueError("Card template removal conflict")
+                raise CardTemplateConflict("Card template removal conflict")
             connection.execute(
                 "DELETE FROM card_templates WHERE profile=? AND template_id=?",
                 (owner, identifier),

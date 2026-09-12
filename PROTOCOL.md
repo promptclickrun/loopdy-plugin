@@ -1,5 +1,35 @@
 # Loopdy protocol
 
+## Native HTTP foundation and negotiated group results
+
+The separate stock-serve native HTTP context and template contracts, exact
+precondition/request-ID headers, existing route reuse and remaining native
+authority gaps are documented in [Native workspace API](docs/NATIVE_WORKSPACE_API.md).
+No Link pairing is required by those native routes. Existing route contracts,
+Link wire version 1 and legacy ready/result envelopes remain unchanged.
+
+Clients discovering `groups-results-v1` may add top-level
+`groupsResultVersion: 1` to encrypted `workspace.request` for only
+`groups.capabilities/list/create/state/send/rename/log/stop/retry/approve`.
+It is never forwarded into Hermes params. The result echoes the marker only
+when requested; clients correlate its exact value with the pending request.
+Unknown values, booleans or non-allowlisted operations are rejected.
+
+Negotiated group payloads are bounded to 2097152 UTF-8 bytes, the whole result
+envelope to 2101248 bytes. Only those exact result types/operations/markers get
+the larger AEAD limit; generic 196608-byte payload/plaintext limits and existing
+encrypted-frame limits are not widened. Unnegotiated oversize results fail
+without truncating immutable native events. A missing capability or rejection
+does not permit an automatic mutation replay. This is a serialization
+capability, not proof of groups protocol 2 or driver readiness.
+
+Completed `groups.log` pages validate exact room, contiguous event sequence,
+cursor, actor and authority fields before allowing only
+`authority.gateway_id`. Other gateway/secret keys and paths remain rejected.
+Portable fixture: `tests/fixtures/groups-result-v1.json`.
+
+## Earlier release context
+
 Plugin release `2.8.0` aligns with app 1.8.0 while retaining the standalone
 workspace Files and public-hook context usage foundations. It adds exact-call
 `generated_media.resolve`, separates 25 MiB host artifacts from unchanged phone

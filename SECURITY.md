@@ -3,6 +3,14 @@
 ## Trust boundaries
 
 - Hermes is authoritative for tool policy, approval scope, sessions, tasks, and detailed event records.
+- New `/api/plugins/loopdy/native/*` routes require an actual verified native
+  interactive Session even when a loopback host permits legacy API access.
+  Only bounded safe person fields are copied; no Session/token serialization.
+  Process-profile proof uses public process-home helpers, not client labels or
+  request overrides. Template calls use context preconditions and request-ID
+  correlation, not a new general idempotency/auth protocol. This grants no phone
+  identity, Wiki permission or hosted-turn person attribution. See
+  [Native workspace API](docs/NATIVE_WORKSPACE_API.md).
 - Loopdy Link uses one Durable Object per minimal passkey account to coordinate multiple revocable devices. It stores opaque account and device coordinates, public keys, authorization epochs, encrypted device names, encrypted frames, bounded delivery state, and APNs routing material. It does not store email addresses, passwords, phone numbers, profile details, Hermes credentials, or chat plaintext.
 - Phone, tablet, and Hermes-host devices generate their own signing and agreement keys. The host commits its flow, device coordinate, signing key, and agreement key into the QR payload and a separately displayed manual fingerprint. The app verifies that commitment before releasing the account key. Deleting a device advances authorization state so the removed identity can no longer connect.
 - Chat frames are encrypted on the sending device with the account key, device signed for transport admission, replay protected, and decrypted only by paired account devices. The Link service is not a generic proxy and cannot invoke arbitrary Hermes APIs.

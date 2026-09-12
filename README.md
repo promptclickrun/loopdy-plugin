@@ -2,7 +2,16 @@
 
 Loopdy is a native Hermes platform for the Loopdy mobile app. It provides encrypted Loopdy Link chat, verified device/person context, proactive notifications, lifecycle events, approval transport, attachments, and Generative UI. Hermes remains authoritative for agents, sessions, scheduled tasks, policy, event details, and transcripts.
 
-Loopdy Link is the app's reliable chat transport. The Hermes host opens one outbound WebSocket to `https://link.loopdy.app`; the app and host encrypt chat frames with the account key before they reach the service. Pairing is proof-of-possession based and gives each host its own revocable device identity. The cloud service cannot read chat plaintext.
+Direct-first native clients use stock authenticated `hermes serve` REST and `/api/ws`.
+The plugin's [native HTTP foundation](docs/NATIVE_WORKSPACE_API.md) adds verified
+person/process-profile context and fixed data-only card-template routes without a
+Loopdy account. Existing forms, attachments and host-granted Files routes are
+reused. Native Wiki, phone tools and personalized hosted-group context have
+separate unresolved authority gates; this foundation is not complete native parity.
+The older paired **Direct listener** and **direct APNs provider** are different
+features and do not provide this native authentication path.
+
+Loopdy Link remains the paired account transport. The Hermes host opens one outbound WebSocket to `https://link.loopdy.app`; the app and host encrypt chat frames with the account key before they reach the service. Pairing is proof-of-possession based and gives each host its own revocable device identity. The cloud service cannot read chat plaintext.
 
 The same paired Loopdy Link connection carries a fixed, versioned set of encrypted workspace operations for agents, Hermes Projects, sessions, scheduled tasks, per-agent defaults, approvals, events, and attachments. It is not an arbitrary HTTP proxy: every operation is explicitly allowlisted, bounded, validated, and handled through Hermes-owned Project, profile, session, cron, policy, and plugin surfaces. Agent-default reads use Hermes' native profile-scoped `config.get` and `model.options` methods, with compatibility fallback for older Hermes releases. Project creation registers one existing remote folder, archive removes only the Project registration from active catalogs, and folder suggestions return bounded directory coordinates without file contents. The app never needs a Hermes gateway origin or token after pairing.
 

@@ -826,7 +826,7 @@ class HermesWorkspaceBackend:
         templates = self.service.store.list_card_templates(profile=agent_id)
         return {
             "agentId": agent_id,
-            "templates": [_card_template_projection(value) for value in templates],
+            "templates": [card_template_projection(value) for value in templates],
         }
 
     async def cards_templates_install(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -842,7 +842,7 @@ class HermesWorkspaceBackend:
         return {
             "agentId": agent_id,
             "changed": result["changed"],
-            "template": _card_template_projection(result["template"]),
+            "template": card_template_projection(result["template"]),
         }
 
     async def cards_templates_remove(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -3124,7 +3124,7 @@ def _empty_payload(payload: Any) -> None:
         raise WorkspaceControlError("Workspace payload must be empty")
 
 
-def _card_template_projection(template: Any) -> dict[str, Any]:
+def card_template_projection(template: Any) -> dict[str, Any]:
     value = _object(template, "card template")
     keys = (
         "id",

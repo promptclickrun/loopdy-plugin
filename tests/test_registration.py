@@ -914,6 +914,7 @@ class RegistrationTests(unittest.TestCase):
         )
         self.assertEqual(context.approval[0], "loopdy")
         self.assertEqual(context.cli["name"], "loopdy")
+        from hermes_cli.plugins import VALID_HOOKS
         self.assertEqual(
             set(context.hooks),
             {
@@ -930,7 +931,7 @@ class RegistrationTests(unittest.TestCase):
                 "kanban_task_claimed",
                 "kanban_task_completed",
                 "kanban_task_blocked",
-            },
+            } | ({"on_room_member_activity"} if "on_room_member_activity" in VALID_HOOKS else set()),
         )
         self.assertEqual(set(context.skills), {"loopdy-marketplace-publish"})
         self.assertTrue(context.skills["loopdy-marketplace-publish"]["path"].is_file())

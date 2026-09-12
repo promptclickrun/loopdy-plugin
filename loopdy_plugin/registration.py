@@ -304,7 +304,14 @@ def register(
             plugin_context=ctx,
         ),
     )
-    ctx.on_unload(partial(release_service, active_service))
+    from .room_activity import register_room_activity
+    stop_room_activity = register_room_activity(ctx)
+
+    def unload():
+        stop_room_activity()
+        release_service(active_service)
+
+    ctx.on_unload(unload)
 
 
 def _pre_llm_call(

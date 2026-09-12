@@ -20,6 +20,7 @@ from hermes_cli.dashboard_auth.base import DashboardAuthProvider, Session, Token
 from hermes_cli.dashboard_auth.middleware import gated_auth_middleware
 from hermes_cli.dashboard_auth.registry import register_provider, unregister_global_provider
 from loopdy_plugin import native_api, native_context
+from loopdy_plugin import room_activity
 from loopdy_plugin.store import LoopdyStore
 from test_loopdy_card_templates import _template
 
@@ -57,6 +58,9 @@ class FixtureProvider(DashboardAuthProvider):
 
 class NativeAPITests(unittest.TestCase):
     def setUp(self):
+        hub_patch = patch.object(room_activity, "_HUB", room_activity.RoomActivityHub())
+        hub_patch.start()
+        self.addCleanup(hub_patch.stop)
         temporary = tempfile.TemporaryDirectory(prefix="loopdy-native-api-", dir=Path(tempfile.gettempdir()).resolve())
         self.addCleanup(temporary.cleanup)
         self.home = Path(temporary.name)

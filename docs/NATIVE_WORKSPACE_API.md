@@ -5,8 +5,10 @@ They do not use the plugin's paired Direct listener or require a Loopdy account.
 Network/Tailscale/TLS configuration and host activation remain operator-owned.
 Stock Hermes REST and `/api/ws` still own native chat and workspace execution.
 
-This is a foundation, not full native parity. No native Wiki, phone-tool, group
-activity, or personalized hosted-group ingress route is registered or advertised.
+This is not full native parity. Optional
+[room tool observations](NATIVE_ROOM_ACTIVITY.md) extend this foundation on
+supported main builds. Native Wiki, phone-tool and personalized hosted-group
+ingress remain separate capabilities, not implied by these routes.
 
 ## Authentication and context
 
@@ -45,7 +47,8 @@ memory/logs/webhooks; an ignored `?profile` is not scope selection.
 
 Features are finite: `native-context-v1`, `serving-profile-v1` when proven, and
 `native-card-templates-v1` when the implemented routes' public profile helpers
-are available. They are not universal Hermes capability or runtime health claims.
+are available. `native-room-activity-v1` is added only with an actual supported
+live public-hook registration. These are not universal Hermes capability or runtime health claims.
 Read failures remain visible. Context responses are at most 16 KiB.
 
 ## Card templates
@@ -122,10 +125,10 @@ re-probe roots after reconnect.
 
 | Capability | Current native boundary |
 | --- | --- |
-| Wiki | Existing services bind to paired Link authority. Needs separate native device/key/grant ownership, explicit connect/revoke and transactional upload binding; never borrow account grants or fabricate device IDs. |
+| Wiki | Existing Link services retain paired authority. Native adaptation requires an explicit principal/profile ownership discriminant under the same registry/lock; native Hermes login is sufficient, with no extra device pairing/key ceremony. Never borrow Link identity or adopt its grants. |
 | Phone tools | Registration/poll auth alone cannot bind a native model/tool turn to a verified phone. No public generic ToolExecutionContext override in native prompt ingress was verified; ordinary chat stays native. |
 | Hosted person context | Public pre-LLM hooks lack authoritative hosted room/member/discussion/task-generation/person binding. Generic native durable actor remains honest; no private/task-title/text inference. |
-| Group activity | Main-only observer is asynchronous, lossy and local-member-only. No HTTP polling adapter or durable replay is advertised by this foundation. |
+| Group activity | Optional main-only public observer feeds are asynchronous, lossy and local-member-only; see the exact HTTP polling contract. No durable replay or completion-success inference. |
 | Group result size | Link negotiates `groups-results-v1` separately; native room readiness still requires protocol 2 and a running driver. See [PROTOCOL](../PROTOCOL.md). |
 
 Native auth is not a phone grant; optional cloud account erasure does not revoke

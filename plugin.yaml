@@ -34,6 +34,7 @@ optional_env:
   - LOOPDY_LINK_ACCOUNT_KEY
   - LOOPDY_MARKETPLACE_TRUSTED_ED25519_KEYS
 provides_hooks:
+  - on_room_member_activity
   - pre_approval_request
   - pre_llm_call
   - post_llm_call

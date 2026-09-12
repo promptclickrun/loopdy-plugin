@@ -110,4 +110,7 @@ def native_context(request: Request) -> NativeContext:
             set_hermes_home_override, reset_hermes_home_override,
         )):
             features.append("native-card-templates-v1")
+    from .room_activity import CAPABILITY, activity_hub
+    if activity_hub().available:
+        features.append(CAPABILITY)
     return NativeContext(provider, user_id, display_name, profile, tuple(features), RUNTIME_ID)

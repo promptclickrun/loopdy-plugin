@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any
+from typing import Any, TypeVar
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 MAX_BODY_BYTES = 196_608
 MAX_TEMPLATES = 500
 _REQUEST_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z")
+_BodyT = TypeVar("_BodyT", bound=BaseModel)
 
 
 def _error_response(error: NativeAPIError) -> JSONResponse:
@@ -104,7 +105,7 @@ def _invalid_number(_value):
     raise ValueError("Non-finite JSON number")
 
 
-async def _body(request: Request, model: type[_Body]) -> _Body:
+async def _body(request: Request, model: type[_BodyT]) -> _BodyT:
     if request.query_params:
         raise NativeAPIError(422, "invalid_request", "Query fields are not supported.")
     content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
@@ -127,10 +128,7 @@ async def _body(request: Request, model: type[_Body]) -> _Body:
                 pending.extend((child, depth + 1) for child in item.values())
             elif isinstance(item, list):
                 pending.extend((child, depth + 1) for child in item)
-        body = model.model_validate(value)
-        if PROFILE_ID.fullmatch(body.agentId) is None:
-            raise ValueError("Invalid profile")
-        return body
+        return model.model_validate(value)
     except (ValueError, UnicodeError, RecursionError, ValidationError):
         raise NativeAPIError(422, "invalid_request", "The native request is invalid.") from None
 
@@ -223,6 +221,8 @@ async def _template_request(request: Request, model: type[_Body], operation: str
     if "native-card-templates-v1" not in owner.features:
         raise NativeAPIError(503, "templates_unavailable", "Native card templates are unavailable.")
     body = await _body(request, model)
+    if PROFILE_ID.fullmatch(body.agentId) is None:
+        raise NativeAPIError(422, "invalid_request", "The profile is invalid.")
     result = await run_in_threadpool(_templates, request, owner, body, operation)
     if native_context(request) != owner:
         raise NativeAPIError(412, "context_changed", "The native context changed; reconcile the outcome.")

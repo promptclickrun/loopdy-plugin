@@ -8,6 +8,9 @@ person/process-profile context and fixed data-only card-template routes without 
 Loopdy account. Existing forms, attachments and host-granted Files routes are
 reused. Native Wiki, phone tools and personalized hosted-group context have
 separate unresolved authority gates; this foundation is not complete native parity.
+Supported current-main hosts can also expose opt-in, view-scoped
+[room tool observations](docs/NATIVE_ROOM_ACTIVITY.md), with explicit loss/reset
+semantics rather than durable replay or inferred tool success.
 The older paired **Direct listener** and **direct APNs provider** are different
 features and do not provide this native authentication path.
 

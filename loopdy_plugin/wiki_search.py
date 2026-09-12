@@ -27,7 +27,7 @@ class WikiSearch:
     def __init__(self, service: WikiService):
         self.service = service
 
-    def search(self, payload: dict, *, device_id: str) -> dict:
+    def search(self, payload: dict, *, device_id: str | None) -> dict:
         p = validate_payload("wiki.search", payload)
         with self.service._locked() as connection:
             grant = self.service._authorize(connection, p["wikiId"], p["agentId"], device_id)

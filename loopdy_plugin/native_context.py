@@ -113,4 +113,7 @@ def native_context(request: Request) -> NativeContext:
     from .room_activity import CAPABILITY, activity_hub
     if activity_hub().available:
         features.append(CAPABILITY)
+    from .wiki_contract import available_wiki_operations
+    if "native-card-templates-v1" in features and available_wiki_operations():
+        features.extend(("native-wiki-v1", "native-wiki-disconnect-v1"))
     return NativeContext(provider, user_id, display_name, profile, tuple(features), RUNTIME_ID)

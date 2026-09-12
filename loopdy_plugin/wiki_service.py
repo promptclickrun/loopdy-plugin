@@ -50,6 +50,7 @@ _MAX_EDIT_BYTES = 1024 * 1024
 _MAX_RECOVERY_BYTES = 128 * 1024 * 1024
 _MAX_OPERATIONS = 1024
 _MAX_GRANTS = 256
+_MAX_NATIVE_DISCONNECTS = 1024
 _OPERATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _REVISION = re.compile(r"wiki-v1:([0-9a-f]{32}):([0-9a-f]{64})\Z")
 _TERMINAL = {"committed", "conflict", "failed", "indeterminate"}
@@ -278,19 +279,22 @@ class _Reader(WorkspaceFilesService):
 class WikiService:
     """Separate Wiki grants and durable, owner-scoped save operations.
 
-    The trusted integration supplies authority_id from pairing/host generation,
-    and supplies verified profile/device identity on EVERY request. Do not expose
-    grant/revoke as ordinary device operations. The state directory is private
+    The trusted integration supplies either Link device authority or native
+    principal authority and verifies the profile on EVERY request. Host
+    grant/revoke is separate from native connect/disconnect. The state directory is private
     host control data; neither a Wiki root nor an existing Files grant store.
     """
 
     def __init__(self, state_dir: Path, *, authority_id: str,
                  owner_check: Callable[[], None] | None = None,
-                 protected_roots: tuple[Path, ...] = ()):
+                 protected_roots: tuple[Path, ...] = (),
+                 principal_id: str | None = None):
         self._owner_check = owner_check
         self._protected_roots = protected_roots
         try:
             self._authority_id = _opaque(authority_id, "authorityId")
+            self._principal_id = None if principal_id is None else _opaque(principal_id, "principalId")
+            self._owner_kind = "link_device" if principal_id is None else "native_principal"
             WorkspaceFilesService._require_secure_platform()
             self._state_dir = Path(state_dir)
             if not self._state_dir.is_absolute() or ".." in self._state_dir.parts:
@@ -481,13 +485,41 @@ class WikiService:
                         f"CREATE TRIGGER IF NOT EXISTS {table}_no_{action.lower()} "
                         f"BEFORE {action} ON {table} BEGIN SELECT RAISE(ABORT, 'immutable Wiki recovery'); END"
                     )
+        from .wiki_schema import migrate_owner_schema
+        migrate_owner_schema(connection)
+
+    def _validate_requester(self, profile_id: str, device_id: str | None) -> None:
+        _opaque(profile_id, "profileId")
+        if self._owner_kind == "native_principal":
+            if device_id is not None:
+                raise WikiServiceError("INVALID_REQUEST", "Native Wiki does not accept device identity")
+        else:
+            _opaque(device_id, "deviceId")
+
+    def _matches_owner(self, row: sqlite3.Row, profile_id: str, device_id: str | None) -> bool:
+        return (row["authority_id"], row["profile_id"], row["device_id"], row["owner_kind"], row["principal_id"]) == (
+            self._authority_id, profile_id, device_id, self._owner_kind, self._principal_id)
+
+    def _digest(self, values: tuple[Any, ...]) -> str:
+        return _request_digest(values if self._principal_id is None
+                               else ("native_principal", self._principal_id, *values))
+
+    def _allows_requester(self, row: sqlite3.Row, device_id: str | None) -> bool:
+        if row["owner_kind"] != self._owner_kind or row["principal_id"] != self._principal_id:
+            return False
+        return (device_id is None if self._owner_kind == "native_principal"
+                else self._allows_device(row, device_id))
 
     def grant(self, wiki_id: str, *, root: Path, label: str, profile_id: str,
               device_ids: tuple[str, ...], writable: bool = False,
               source_kind: str = "files") -> dict:
         """Host administration only. Changed policy always rotates generation."""
+        if self._principal_id is not None:
+            raise WikiServiceError("INVALID_REQUEST", "Use native connect rather than a device grant")
         with self._locked() as connection:
             wiki_id = _valid_workspace_id(wiki_id)
+            if connection.execute("SELECT 1 FROM wiki_native_disconnects WHERE wiki_id=?", (wiki_id,)).fetchone():
+                raise WikiServiceError("WIKI_NOT_ALLOWED", "This Wiki identity has been retired")
             label = _valid_label(label)
             profile_id = _opaque(profile_id, "profileId")
             if not isinstance(device_ids, tuple) or not 1 <= len(device_ids) <= 128:
@@ -527,19 +559,21 @@ class WikiService:
             self._revalidate(connection, row)
             return self._root_dto(row)
 
-    def connect(self, folder_path: str, *, profile_id: str, device_id: str,
+    def connect(self, folder_path: str, *, profile_id: str, device_id: str | None,
                 account_authorized: bool = False) -> dict:
-        """Explicit folder setup; account authority is supplied only by transport.
+        """Explicit folder setup under verified Link or native-principal authority.
 
         Verified account selection creates/converts an exact grant to account
         read/write. The default retains the legacy host-internal device policy.
         Reads and resolve never call this mutation path.
         """
         from .wiki_contract import exact_folder
+        native = self._principal_id is not None
+        if native and account_authorized:
+            raise WikiServiceError("INVALID_REQUEST", "Native Wiki cannot adopt account authority")
         folder_path = exact_folder(folder_path)
         with self._locked() as connection:
-            _opaque(profile_id, "profileId")
-            _opaque(device_id, "deviceId")
+            self._validate_requester(profile_id, device_id)
             try:
                 candidate = _Reader(self, connection, None)._valid_grant_root(Path(folder_path))
                 lineage = _directory_lineage(candidate)
@@ -570,12 +604,15 @@ class WikiService:
                 pinned = (row["root_dev"], row["root_ino"])
                 if not _overlaps_root(candidate, lineage, registered, pinned):
                     continue
+                if native and row["owner_kind"] == "link_device" and candidate == registered and (current.st_dev, current.st_ino) == pinned:
+                    raise WikiServiceError("WIKI_AUTHORITY_CONFLICT",
+                                           "This folder has a Link connection. Explicitly remove that connection before native reconnect.")
                 if (row["authority_id"] != self._authority_id or row["profile_id"] != profile_id
-                        or (not account_authorized and not self._allows_device(row, device_id))):
+                        or (not account_authorized and not self._allows_requester(row, device_id))):
                     raise WikiServiceError("WIKI_NOT_ALLOWED", "This folder overlaps an existing host grant")
                 if candidate == registered and (current.st_dev, current.st_ino) == pinned:
                     exact.append(row)
-                elif account_authorized:
+                elif account_authorized or native:
                     raise WikiServiceError("WIKI_NOT_ALLOWED", "Choose the exact registered Wiki folder")
             if len(exact) > 1:
                 raise WikiServiceError("WIKI_AMBIGUOUS", "Choose a named Wiki from the authorized roots")
@@ -583,6 +620,13 @@ class WikiService:
                 row = exact[0]
                 self._revalidate(connection, row)
                 writable = int(row["source_kind"] == "files" and self._can_write)
+                if native and row["writable"] != writable:
+                    self.check_owner()
+                    with connection:
+                        connection.execute("UPDATE wiki_grants SET writable=?, generation=? WHERE wiki_id=?",
+                                           (writable, uuid.uuid4().hex, row["wiki_id"]))
+                        row = connection.execute("SELECT * FROM wiki_grants WHERE wiki_id=?", (row["wiki_id"],)).fetchone()
+                        self._revalidate(connection, row)
                 if account_authorized and (row["access_scope"] != "account" or row["writable"] != writable):
                     self.check_owner()
                     with connection:
@@ -592,22 +636,24 @@ class WikiService:
                         row = connection.execute("SELECT * FROM wiki_grants WHERE wiki_id=?", (row["wiki_id"],)).fetchone()
                         self._revalidate(connection, row)
                 return self._root_dto(row)
-            # Only verified account selection may register ordinary data under
+            # Explicit account/native selection can register ordinary data under
             # the host home; control roots were unconditionally excluded above.
-            if protected and not account_authorized:
+            if protected and not (account_authorized or native):
                 raise WikiServiceError("WIKI_NOT_ALLOWED", "This folder cannot be connected")
             if connection.execute("SELECT COUNT(*) FROM wiki_grants").fetchone()[0] >= _MAX_GRANTS:
                 raise WikiServiceError("QUOTA_EXCEEDED", "Wiki grant limit reached")
-            wiki_id = "wiki-" + uuid.uuid4().hex
+            wiki_id = self._new_wiki_id(connection)
             label = _valid_label(candidate.name)
             self.check_owner()
             with connection:
                 connection.execute(
                     "INSERT INTO wiki_grants "
-                    "(wiki_id,label,root,root_dev,root_ino,authority_id,profile_id,device_ids,writable,source_kind,generation) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    "(wiki_id,label,root,root_dev,root_ino,authority_id,profile_id,device_ids,writable,source_kind,generation,"
+                    "owner_kind,principal_id,access_scope) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (wiki_id, label, str(candidate), current.st_dev, current.st_ino, self._authority_id,
-                     profile_id, json.dumps([device_id]), 0, "files", uuid.uuid4().hex),
+                     profile_id, "[]" if native else json.dumps([device_id]), int(native and self._can_write),
+                     "files", uuid.uuid4().hex, self._owner_kind, self._principal_id,
+                     "native_principal" if native else "device"),
                 )
                 if account_authorized:
                     connection.execute("UPDATE wiki_grants SET access_scope='account', device_ids='[]', writable=? "
@@ -615,6 +661,53 @@ class WikiService:
                 row = connection.execute("SELECT * FROM wiki_grants WHERE wiki_id=?", (wiki_id,)).fetchone()
                 self._revalidate(connection, row)
             return self._root_dto(row)
+
+    @staticmethod
+    def _new_wiki_id(connection: sqlite3.Connection) -> str:
+        for _ in range(8):
+            candidate = "wiki-" + uuid.uuid4().hex
+            if not connection.execute(
+                "SELECT 1 FROM wiki_grants WHERE wiki_id=? UNION ALL "
+                "SELECT 1 FROM wiki_native_disconnects WHERE wiki_id=?",
+                (candidate, candidate),
+            ).fetchone():
+                return candidate
+        raise WikiServiceError("STATE_UNAVAILABLE", "A new Wiki identity could not be allocated")
+
+    def disconnect(self, wiki_id: str, *, profile_id: str) -> dict:
+        """Native-principal registry removal; retain files and all recovery data."""
+        if self._principal_id is None:
+            raise WikiServiceError("INVALID_REQUEST", "Native principal ownership is required")
+        with self._locked() as connection:
+            wiki_id = _valid_workspace_id(wiki_id)
+            self._validate_requester(profile_id, None)
+            expected = (self._authority_id, profile_id, self._principal_id)
+            tombstone = connection.execute(
+                "SELECT * FROM wiki_native_disconnects WHERE wiki_id=?", (wiki_id,)
+            ).fetchone()
+            if tombstone is not None:
+                if (tombstone["authority_id"], tombstone["profile_id"], tombstone["principal_id"]) != expected:
+                    raise WikiServiceError("WIKI_NOT_ALLOWED", "Wiki connection was not found")
+                return {"wikiId": wiki_id, "disconnected": True}
+            row = connection.execute("SELECT * FROM wiki_grants WHERE wiki_id=?", (wiki_id,)).fetchone()
+            if (row is None or (row["authority_id"], row["profile_id"], row["principal_id"]) != expected
+                    or row["owner_kind"] != "native_principal"):
+                raise WikiServiceError("WIKI_NOT_ALLOWED", "Wiki connection was not found")
+            if connection.execute("SELECT COUNT(*) FROM wiki_native_disconnects").fetchone()[0] >= _MAX_NATIVE_DISCONNECTS:
+                raise WikiServiceError("QUOTA_EXCEEDED", "Wiki disconnect receipts require host-local maintenance")
+            self.check_owner()
+            with connection:
+                connection.execute(
+                    "INSERT INTO wiki_native_disconnects(wiki_id,authority_id,profile_id,principal_id,generation,created_at) "
+                    "VALUES(?,?,?,?,?,?)", (wiki_id, *expected, row["generation"], time.time_ns()),
+                )
+                deleted = connection.execute(
+                    "DELETE FROM wiki_grants WHERE wiki_id=? AND authority_id=? AND profile_id=? "
+                    "AND principal_id=? AND owner_kind='native_principal'", (wiki_id, *expected),
+                )
+                if deleted.rowcount != 1:
+                    raise WikiServiceError("WIKI_NOT_ALLOWED", "Wiki connection changed during disconnect")
+            return {"wikiId": wiki_id, "disconnected": True}
 
     def _check_host_control_root(self, candidate: Path, lineage: tuple[tuple[int, int], ...]) -> None:
         # A custom Hermes home may also be the persistent user-data volume.
@@ -656,16 +749,17 @@ class WikiService:
                 (row["access_scope"] == "device" and device_id in json.loads(row["device_ids"])))
 
     def _authorize(self, connection: sqlite3.Connection, wiki_id: str,
-                   profile_id: str, device_id: str, *, write: bool = False) -> sqlite3.Row:
+                   profile_id: str, device_id: str | None, *, write: bool = False) -> sqlite3.Row:
         _valid_workspace_id(wiki_id)
-        _opaque(profile_id, "profileId")
-        _opaque(device_id, "deviceId")
+        self._validate_requester(profile_id, device_id)
         row = connection.execute("SELECT * FROM wiki_grants WHERE wiki_id=?", (wiki_id,)).fetchone()
         if (
             row is None or row["authority_id"] != self._authority_id
-            or row["profile_id"] != profile_id or not self._allows_device(row, device_id)
+            or row["profile_id"] != profile_id or not self._allows_requester(row, device_id)
         ):
-            raise WikiServiceError("WIKI_NOT_ALLOWED", "Wiki is not authorized for this owner and device")
+            message = ("Wiki is not connected for this principal and profile" if self._principal_id is not None
+                       else "Wiki is not authorized for this owner and device")
+            raise WikiServiceError("WIKI_NOT_ALLOWED", message)
         if write and (not row["writable"] or row["source_kind"] != "files" or not self._can_write):
             raise WikiServiceError("READ_ONLY", "This Wiki does not permit editing")
         self._revalidate(connection, row)
@@ -693,7 +787,7 @@ class WikiService:
         if self._owner_check is not None:
             self._owner_check()
 
-    def grant_metadata(self, wiki_id: str, *, profile_id: str, device_id: str,
+    def grant_metadata(self, wiki_id: str, *, profile_id: str, device_id: str | None,
                        write: bool = False) -> dict:
         with self._locked() as connection:
             return self._root_dto(self._authorize(connection, wiki_id, profile_id, device_id, write=write))
@@ -709,25 +803,26 @@ class WikiService:
                                     deviceIds=json.loads(row["device_ids"]),
                                     accessScope=row["access_scope"]) for row in rows]}
 
-    def resolve(self, folder_path: str, *, profile_id: str, device_id: str) -> dict:
+    def resolve(self, folder_path: str, *, profile_id: str, device_id: str | None) -> dict:
         from .wiki_contract import exact_folder
         folder_path = exact_folder(folder_path)
         with self._locked() as connection:
-            _opaque(profile_id, "profileId")
-            _opaque(device_id, "deviceId")
+            self._validate_requester(profile_id, device_id)
             rows = connection.execute(
                 "SELECT * FROM wiki_grants WHERE authority_id=? AND profile_id=? AND root=? ORDER BY wiki_id",
                 (self._authority_id, profile_id, folder_path),
             ).fetchall()
-            visible = [row for row in rows if self._allows_device(row, device_id)]
+            visible = [row for row in rows if self._allows_requester(row, device_id)]
             if not visible:
-                raise WikiServiceError("WIKI_NOT_ALLOWED", "This folder requires host approval")
+                message = ("This folder is not connected for this native principal" if self._principal_id is not None
+                           else "This folder requires host approval")
+                raise WikiServiceError("WIKI_NOT_ALLOWED", message)
             if len(visible) != 1:
                 raise WikiServiceError("WIKI_AMBIGUOUS", "Choose a named Wiki from the authorized roots")
             self._revalidate(connection, visible[0])
             return self._root_dto(visible[0])
 
-    def read_image(self, wiki_id: str, *, profile_id: str, device_id: str,
+    def read_image(self, wiki_id: str, *, profile_id: str, device_id: str | None,
                    path: str, offset: int = 0, limit: int = 65536,
                    revision: str | None = None) -> dict:
         import base64
@@ -759,17 +854,16 @@ class WikiService:
             self._revalidate(connection, row)
             return self._native(result, row["generation"])
 
-    def roots(self, *, profile_id: str, device_id: str) -> dict:
+    def roots(self, *, profile_id: str, device_id: str | None) -> dict:
         with self._locked() as connection:
-            _opaque(profile_id, "profileId")
-            _opaque(device_id, "deviceId")
+            self._validate_requester(profile_id, device_id)
             rows = connection.execute(
                 "SELECT * FROM wiki_grants WHERE authority_id=? AND profile_id=? ORDER BY wiki_id",
                 (self._authority_id, profile_id),
             ).fetchall()
             visible = []
             for row in rows:
-                if not self._allows_device(row, device_id):
+                if not self._allows_requester(row, device_id):
                     continue
                 try:
                     self._revalidate(connection, row)
@@ -798,7 +892,7 @@ class WikiService:
                 result["nextOffset"] = result["offset"] + len(result["entries"])
         return result
 
-    def list_directory(self, wiki_id: str, *, profile_id: str, device_id: str,
+    def list_directory(self, wiki_id: str, *, profile_id: str, device_id: str | None,
                        path: str = "", offset: int = 0, limit: int = 100,
                        query: str = "", revision: str | None = None) -> dict:
         """Directory-local filename filter, not recursive/content Wiki search."""
@@ -810,7 +904,7 @@ class WikiService:
             )
             return self._native(result, row["generation"])
 
-    def read_file(self, wiki_id: str, *, profile_id: str, device_id: str,
+    def read_file(self, wiki_id: str, *, profile_id: str, device_id: str | None,
                   path: str, offset: int = 0, limit: int = 65536,
                   revision: str | None = None) -> dict:
         with self._locked() as connection:
@@ -891,12 +985,12 @@ class WikiService:
         return result
 
     def _operation(self, connection: sqlite3.Connection, operation_id: str,
-                   profile_id: str, device_id: str) -> sqlite3.Row | None:
+                   profile_id: str, device_id: str | None) -> sqlite3.Row | None:
         row = connection.execute("SELECT * FROM wiki_operations WHERE operation_id=?", (operation_id,)).fetchone()
         if row is not None:
-            if (row["authority_id"], row["profile_id"], row["device_id"]) != (self._authority_id, profile_id, device_id):
+            if not self._matches_owner(row, profile_id, device_id):
                 raise WikiServiceError("OPERATION_NOT_FOUND", "Save operation was not found")
-            expected = _request_digest((row["authority_id"], row["profile_id"], row["device_id"],
+            expected = self._digest((row["authority_id"], row["profile_id"], row["device_id"],
                                         row["wiki_id"], row["generation"], row["path"],
                                         row["base_revision"], _sha(row["proposed"])))
             if expected != row["request_digest"]:
@@ -934,11 +1028,10 @@ class WikiService:
             return self._event(connection, operation["operation_id"], status, error_code="SAVE_INTERRUPTED")
         return self._outcome(operation["operation_id"], event["status"], event["revision"], event["error_code"])
 
-    def save_status(self, operation_id: str, *, profile_id: str, device_id: str) -> dict:
+    def save_status(self, operation_id: str, *, profile_id: str, device_id: str | None) -> dict:
         with self._locked() as connection:
             operation_id = _operation_id(operation_id)
-            _opaque(profile_id, "profileId")
-            _opaque(device_id, "deviceId")
+            self._validate_requester(profile_id, device_id)
             operation = self._operation(connection, operation_id, profile_id, device_id)
             if operation is None:
                 raise WikiServiceError("OPERATION_NOT_FOUND", "Save operation was not found")
@@ -947,7 +1040,7 @@ class WikiService:
                 raise WikiServiceError("WIKI_NOT_ALLOWED", "Save belongs to an obsolete Wiki grant")
             return self._recover(connection, operation)
 
-    def save_file(self, wiki_id: str, *, profile_id: str, device_id: str,
+    def save_file(self, wiki_id: str, *, profile_id: str, device_id: str | None,
                   path: str, base_revision: str, content: bytes, operation_id: str) -> dict:
         with self._locked() as connection:
             return self._save_file_locked(
@@ -956,7 +1049,7 @@ class WikiService:
             )
 
     def _save_file_locked(self, connection: sqlite3.Connection, wiki_id: str, *,
-                          profile_id: str, device_id: str, path: str,
+                          profile_id: str, device_id: str | None, path: str,
                           base_revision: str, content: bytes, operation_id: str) -> dict:
         """Internal staged-save entry; caller holds this service's process lock."""
         row = self._authorize(connection, wiki_id, profile_id, device_id, write=True)
@@ -970,7 +1063,7 @@ class WikiService:
         if base_revision is None:
             raise WikiServiceError("REVISION_REQUIRED", "A base revision is required")
         creating = _creation_revision(base_revision, row["generation"])
-        digest = _request_digest((self._authority_id, profile_id, device_id, wiki_id,
+        digest = self._digest((self._authority_id, profile_id, device_id, wiki_id,
                                   row["generation"], path, base_revision, _sha(content)))
         operation = self._operation(connection, operation_id, profile_id, device_id)
         if operation is not None:
@@ -1008,10 +1101,11 @@ class WikiService:
             with connection:
                 connection.execute(
                     "INSERT INTO wiki_operations(operation_id,wiki_id,generation,authority_id,profile_id,device_id,"
-                    "path,base_revision,request_digest,proposed,base,observed,temp_name,reserved_bytes,created_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "path,base_revision,request_digest,proposed,base,observed,temp_name,reserved_bytes,created_at,owner_kind,principal_id) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (operation_id, wiki_id, row["generation"], self._authority_id, profile_id, device_id,
-                     path, base_revision, digest, content, base, observed, temp_name, reserved, time.time_ns()),
+                     path, base_revision, digest, content, base, observed, temp_name, reserved, time.time_ns(),
+                     self._owner_kind, self._principal_id),
                 )
                 connection.execute(
                     "INSERT INTO wiki_events(operation_id,status,revision,created_at) VALUES(?,?,?,?)",

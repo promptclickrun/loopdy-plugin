@@ -7,8 +7,9 @@ Stock Hermes REST and `/api/ws` still own native chat and workspace execution.
 
 This is not full native parity. Optional
 [room tool observations](NATIVE_ROOM_ACTIVITY.md) extend this foundation on
-supported main builds. Native Wiki, phone-tool and personalized hosted-group
-ingress remain separate capabilities, not implied by these routes.
+supported main builds. [Native Wiki](NATIVE_WIKI.md) uses the same verified
+principal without extra pairing. Phone-tool and personalized hosted-group
+ingress remain separate proof-gated capabilities.
 
 ## Authentication and context
 
@@ -49,6 +50,8 @@ Features are finite: `native-context-v1`, `serving-profile-v1` when proven, and
 `native-card-templates-v1` when the implemented routes' public profile helpers
 are available. `native-room-activity-v1` is added only with an actual supported
 live public-hook registration. These are not universal Hermes capability or runtime health claims.
+`native-wiki-v1` advertises the fixed principal-owned Wiki adapter on secure
+traversal platforms; folder policy and local journal availability still apply.
 Read failures remain visible. Context responses are at most 16 KiB.
 
 ## Card templates
@@ -121,11 +124,11 @@ revisions are file hashes or directory snapshots, not client-visible grant
 epochs. Retain the native owner and proven process profile over each await and
 re-probe roots after reconnect.
 
-## Remaining independent capability gates
+## Capability boundaries
 
 | Capability | Current native boundary |
 | --- | --- |
-| Wiki | Existing Link services retain paired authority. Native adaptation requires an explicit principal/profile ownership discriminant under the same registry/lock; native Hermes login is sufficient, with no extra device pairing/key ceremony. Never borrow Link identity or adopt its grants. |
+| Wiki | Native Session principal/profile ownership shares the existing registry/lock, with no additional pairing. Link ownership stays separate; existing Link roots are not adopted. See the exact native Wiki contract and versioned storage boundary. |
 | Phone tools | Registration/poll auth alone cannot bind a native model/tool turn to a verified phone. No public generic ToolExecutionContext override in native prompt ingress was verified; ordinary chat stays native. |
 | Hosted person context | Public pre-LLM hooks lack authoritative hosted room/member/discussion/task-generation/person binding. Generic native durable actor remains honest; no private/task-title/text inference. |
 | Group activity | Optional main-only public observer feeds are asynchronous, lossy and local-member-only; see the exact HTTP polling contract. No durable replay or completion-success inference. |

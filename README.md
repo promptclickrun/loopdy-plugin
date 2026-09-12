@@ -6,8 +6,10 @@ Direct-first native clients use stock authenticated `hermes serve` REST and `/ap
 The plugin's [native HTTP foundation](docs/NATIVE_WORKSPACE_API.md) adds verified
 person/process-profile context and fixed data-only card-template routes without a
 Loopdy account. Existing forms, attachments and host-granted Files routes are
-reused. Native Wiki, phone tools and personalized hosted-group context have
-separate unresolved authority gates; this foundation is not complete native parity.
+reused. [Native Wiki](docs/NATIVE_WIKI.md) uses verified Hermes login and
+principal/profile-scoped connections, without another pairing or device-key
+ceremony. Phone tools and personalized hosted-group context still have separate
+unresolved provenance gates; this is not complete native parity.
 Supported current-main hosts can also expose opt-in, view-scoped
 [room tool observations](docs/NATIVE_ROOM_ACTIVITY.md), with explicit loss/reset
 semantics rather than durable replay or inferred tool success.

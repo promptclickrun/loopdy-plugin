@@ -101,7 +101,11 @@ class NativeAPITests(unittest.TestCase):
         self.assertEqual(set(value), {"schemaVersion", "pluginVersion", "runtimeId",
                                      "servingProfileId", "principal", "features"})
         self.assertEqual(value["principal"], {"provider": "native-fixture", "userId": "alice", "displayName": "Alice"})
-        self.assertEqual(value["features"], ["native-context-v1", "serving-profile-v1", "native-card-templates-v1"])
+        from loopdy_plugin.wiki_contract import available_wiki_operations
+        expected = ["native-context-v1", "serving-profile-v1", "native-card-templates-v1"]
+        if available_wiki_operations():
+            expected.extend(("native-wiki-v1", "native-wiki-disconnect-v1"))
+        self.assertEqual(value["features"], expected)
         self.assertEqual(value["servingProfileId"], "default")
         self.assertEqual(result.headers["cache-control"], "no-store")
         self.assertRegex(result.headers["etag"], r'^"sha256:[0-9a-f]{64}"$')

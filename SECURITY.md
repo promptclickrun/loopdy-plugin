@@ -8,8 +8,8 @@
   Only bounded safe person fields are copied; no Session/token serialization.
   Process-profile proof uses public process-home helpers, not client labels or
   request overrides. Template calls use context preconditions and request-ID
-  correlation, not a new general idempotency/auth protocol. This grants no phone
-  identity, Wiki permission or hosted-turn person attribution. See
+  correlation, not a new general idempotency/auth protocol. Context/template
+  calls alone create no Wiki connection, phone identity or hosted-turn person attribution. See
   [Native workspace API](docs/NATIVE_WORKSPACE_API.md).
 - Optional native room-activity feeds bind the verified principal, context and
   exact room authority/roster. Only bounded public tool observations are retained
@@ -121,6 +121,14 @@ notification keys, credentials, and in-memory models only after remote deletion 
 Report vulnerabilities according to the repository's root `SECURITY.md`.
 
 ## Wiki connection authority
+
+Native HTTP Wiki accepts only the verified Hermes Session principal and an
+explicit existing profile; no extra pairing, device enrollment or proof is
+required. Connections and exact upload recovery are shared across devices of
+that principal. Versioned storage explicitly distinguishes native principals
+from legacy Link devices and uses the same registry/lock. Existing Link roots
+are not adopted or migrated; exact overlap fails explicitly. See
+[Native Wiki](docs/NATIVE_WIKI.md) for storage compatibility and revocation limits.
 
 Explicit authenticated `wiki.connect` selects a safe folder for durable paired-account access without separate host approval or a Wiki device allowlist. It creates an account-scoped file grant or converts an existing exact same-authority/profile grant to account scope, enabling writes only for ordinary file sources on capable hosts. Conversion rotates the generation once; roots, reads and resolve never upgrade access. It accepts no caller-selected account identity, authority, grant ID or writable flag. Cross-authority/profile and non-exact overlapping registrations remain rejected. Individual uploads retain immutable initiating-connection ownership so another device cannot resume a stale write. Host revocation removes the connection, but is not an account ban: a still-authenticated account may explicitly select that folder again.
 

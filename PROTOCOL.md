@@ -7,6 +7,9 @@ precondition/request-ID headers, existing route reuse and remaining native
 authority gaps are documented in [Native workspace API](docs/NATIVE_WORKSPACE_API.md).
 No Link pairing is required by those native routes. Existing route contracts,
 Link wire version 1 and legacy ready/result envelopes remain unchanged.
+The [native Wiki adapter](docs/NATIVE_WIKI.md) reuses existing Wiki data DTOs with
+server-proven native principal/profile authority, not Link/device credentials.
+No second pairing or authorization ceremony is required.
 
 Clients discovering `groups-results-v1` may add top-level
 `groupsResultVersion: 1` to encrypted `workspace.request` for only

@@ -112,6 +112,11 @@ class RoomActivityTests(unittest.TestCase):
         escaped = self.poll(2).json()
         self.assertFalse(escaped["resetRequired"])
         self.assertIn("omitted_size", {escaped["events"][0][key]["state"] for key in ("arguments", "result")})
+        self.emit(seq=4, payload={"tool_id": "call-4", "name": "terminal",
+                                 "args": {"token": "opaque-value"}, "result": '{"auth":"opaque-value"}'})
+        credentials = self.poll(3).json()["events"][0]
+        self.assertEqual(credentials["arguments"]["state"], "omitted_sensitive")
+        self.assertEqual(credentials["result"]["state"], "omitted_sensitive")
 
     def test_non_tool_sources_ignored_missing_coordinates_trigger_projection_reset(self):
         self.open()

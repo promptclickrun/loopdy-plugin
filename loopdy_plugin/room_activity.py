@@ -26,7 +26,8 @@ MAX_FEED_BYTES = 256 * 1024
 MAX_EVENT_BYTES = 20_480
 MAX_DETAIL_BYTES = 8_192
 LEASE_SECONDS = 60
-_SECRET_KEY = re.compile(r"authorization|cookie|password|secret|credential|api.?key|access.?token|refresh.?token", re.I)
+_SECRET_KEY = re.compile(r"authorization|cookie|password|secret|credential|api.?key|token|^auth$", re.I)
+_QUOTED_SECRET = re.compile(r"""["'](?:authorization|cookie|password|secret|credential|api[_-]?key|token|auth)["']\s*:\s*["']""", re.I)
 logger = logging.getLogger(__name__)
 
 
@@ -61,7 +62,7 @@ def _detail(value: Any, *, present: bool) -> dict:
         if isinstance(item, str):
             if len(item) > MAX_DETAIL_BYTES:
                 return omitted("omitted_size")
-            if contains_sensitive_credential(item):
+            if contains_sensitive_credential(item) or _QUOTED_SECRET.search(item):
                 return omitted("omitted_sensitive")
         elif isinstance(item, dict):
             if len(item) > 128:

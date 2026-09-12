@@ -86,6 +86,7 @@ class LoopdyService:
         queue_size: int = 256,
     ):
         self.store = store
+        self.managed_alert_owner: Callable[[LoopdyEvent, str], bool] | None = None
         self._providers = dict(providers or {})
         self._sleep = sleep_fn
         self._jitter = jitter_fn
@@ -1180,6 +1181,13 @@ class LoopdyService:
             target=target,
         )
 
+    def managed_notification_policy(self, event: LoopdyEvent, device_id: str) -> dict[str, Any]:
+        """Reuse existing explicit device preferences without provisioning a legacy sender."""
+        device = self.store.get_device(device_id)
+        preferences = (device or {}).get("preferences") or {}
+        return {"suppression": _suppression_reason(event, preferences, self._now()),
+                "sound": preferences.get("priority_sound") is not False}
+
     def enqueue(self, event: LoopdyEvent, *, target: str) -> bool:
         if self._closed or self._closing:
             return False
@@ -1256,7 +1264,9 @@ class LoopdyService:
                 previous = claimed
                 claim_token = str(claimed["claim_token"])
             preferences = device.get("preferences") or {}
-            suppression = _suppression_reason(event, preferences, self._now())
+            owner = getattr(self, "managed_alert_owner", None)
+            managed_owned = callable(owner) and owner(event, str(device["device_id"]))
+            suppression = "managed_notification_owner" if managed_owned else _suppression_reason(event, preferences, self._now())
             if suppression:
                 self.store.record_device_delivery(
                     event_id=event.event_id,

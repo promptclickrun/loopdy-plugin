@@ -847,9 +847,10 @@ class LinkActivityBroker:
         if state.get("ended"):
             return True
         timestamp = _next_live_timestamp(state, occurred_at)
-        state["ended"] = True
+        state["parent_outcome"] = "completed" if succeeded else "failed"
+        remaining = len(state["subagents"])
+        phase = "delegating" if remaining else state["parent_outcome"]
         name = _safe_text(agent_name, 60) or "Your agent"
-        phase = "completed" if succeeded else "failed"
         action = (
             f"{name} finished the response"
             if succeeded
@@ -862,11 +863,12 @@ class LinkActivityBroker:
             current_action=action,
             progress=100,
             completed_steps=int(state.get("completed_steps") or 0),
-            active_subagent_count=0,
-            latest_tool=state.get("latest_tool"),
+            active_subagent_count=remaining,
+            latest_tool=None,
             timestamp=timestamp,
         )
         await sender(update)
+        state["ended"] = remaining == 0
         return True
 
     def _enqueue(
@@ -900,6 +902,10 @@ class LinkActivityBroker:
                     live_update = self._project_live_activity(payload)
                     if live_update is not None:
                         await live_activity_sender(live_update)
+                        if live_update["phase"] in {"completed", "failed"}:
+                            state = self._live_state.get(str(payload.get("sessionId")))
+                            if state is not None:
+                                state["ended"] = True
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -950,12 +956,14 @@ class LinkActivityBroker:
             settled.add(event_id)
             state["completed_steps"] = min(999, int(state["completed_steps"]) + 1)
         subagents = state["subagents"]
-        if kind == "subagent":
+        if kind in {"subagent", "bot_handoff"}:
             subagent_id = _coordinate(payload.get("subagentId"), 180) or event_id
-            if lifecycle == "running":
-                subagents.add(subagent_id)
-            else:
-                subagents.discard(subagent_id)
+            roster_id = f"{kind}:{subagent_id}"
+            if lifecycle == "running" and roster_id not in state["settled_children"]:
+                subagents.add(roster_id)
+            elif lifecycle != "running" and roster_id in subagents:
+                subagents.discard(roster_id)
+                state["settled_children"].add(roster_id)
 
         if kind == "reasoning":
             if lifecycle == "running":
@@ -963,7 +971,8 @@ class LinkActivityBroker:
             elif lifecycle == "succeeded":
                 phase, action, progress = "responding", "Writing the response", 85
             else:
-                phase, action, progress = "failed", "The response could not be completed", 100
+                # A failed reasoning segment/child is not a parent terminal.
+                phase, action, progress = "thinking", "Reviewing the result", 0
         elif kind == "tool":
             state["latest_tool"] = title[:64]
             if lifecycle == "running":
@@ -983,6 +992,8 @@ class LinkActivityBroker:
                 phase, action, progress = "delegating", title, 58
             else:
                 phase, action, progress = "thinking", "Continuing the conversation", 70
+        if state.get("parent_outcome"):
+            phase = "delegating" if subagents else state["parent_outcome"]
         timestamp = _next_live_timestamp(state, occurred_at)
         return _live_activity_wire(
             session_id=session_id,
@@ -1764,6 +1775,8 @@ def _new_live_state() -> dict[str, Any]:
     return {
         "completed_steps": 0,
         "subagents": set(),
+        "settled_children": set(),
+        "parent_outcome": None,
         "settled": set(),
         "latest_tool": None,
         "last_timestamp": 0,
@@ -1811,11 +1824,16 @@ def _live_activity_wire(
         "updateId": update_id,
         "sessionReference": session_reference,
         "phase": phase,
-        "currentAction": _safe_text(current_action, 96) or "Working on your request",
-        "progress": min(max(int(progress), 0), 100),
-        "completedSteps": min(max(int(completed_steps), 0), 999),
+        "currentAction": {
+            "thinking": "Your agent is working", "waiting": "Your agent needs attention",
+            "using_tool": "Your agent is working", "delegating": "Agents are working",
+            "responding": "Your agent is responding", "completed": "Your agent finished",
+            "failed": "Your agent could not finish",
+        }.get(phase, "Your agent is working"),
+        "progress": 100 if phase in {"completed", "failed"} else 0,
+        "completedSteps": 0,
         "activeSubagentCount": min(max(int(active_subagent_count), 0), 99),
-        "latestTool": tool,
+        "latestTool": None,
         "timestamp": timestamp,
         "expires": timestamp + 120,
     }

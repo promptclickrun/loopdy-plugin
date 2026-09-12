@@ -54,13 +54,30 @@ class _Context:
         self.approval = (name, present_fn)
 
     def register_hook(self, name, callback):
-        self.hooks[name] = callback
+        previous = self.hooks.get(name)
+        if previous is None:
+            self.hooks[name] = callback
+            return
+        def dispatch(*args, **kwargs):
+            first = previous(*args, **kwargs)
+            second = callback(*args, **kwargs)
+            return second if second is not None else first
+        self.hooks[name] = dispatch
 
     def register_cli_command(self, **kwargs):
         self.cli = kwargs
 
     def on_unload(self, callback):
-        self.unload = callback
+        previous = self.unload
+        if previous is None:
+            self.unload = callback
+        else:
+            def unload():
+                try:
+                    callback()
+                finally:
+                    previous()
+            self.unload = unload
 
 
 class _Service:
@@ -918,6 +935,7 @@ class RegistrationTests(unittest.TestCase):
             set(context.hooks),
             {
                 "pre_approval_request",
+                "post_approval_response",
                 "pre_tool_call",
                 "post_tool_call",
                 "pre_llm_call",

@@ -8,7 +8,9 @@ description: >
   Native Hermes platform for encrypted Loopdy Link chat and workspace controls,
   proactive notifications, approvals, verified device identity, and native Generative UI renderers.
   Delivers proactive notifications through Expo, Apple, or an encrypted relay while keeping
-  authoritative event details on the authenticated Hermes host.
+  authoritative event details on the authenticated Hermes host. Supports optional
+  account-scoped native notification grants independently of Link chat pairing;
+  mounted notification capabilities report actual in-process producer readiness.
 author: Loopdy contributors
 config_schema:
   direct:

@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import subprocess
+import sqlite3
 import sys
 import time
 import weakref
@@ -73,6 +74,7 @@ HOOKS = (
     "post_llm_call",
     "post_tool_call",
     "pre_approval_request",
+    "post_approval_response",
     *DIRECT_OBSERVER_HOOKS,
     *NOTIFICATION_HOOKS,
 )
@@ -304,6 +306,35 @@ def register(
             plugin_context=ctx,
         ),
     )
+    # Independent, public native observers. The optional Link adapter is not
+    # constructed to enable these notifications, and no core hook is patched.
+    try:
+        from .managed_notifications import get_managed_notifications
+        managed = get_managed_notifications()
+        policy = getattr(active_service, "managed_notification_policy", None)
+        if callable(policy): managed.preference_policy = policy
+        active_service.managed_alert_owner = managed.owns_alert
+        def observe_managed(hook, **payload):
+            managed.observe(hook, profile=str(ctx.profile_name or profile), **payload)
+        for hook in ("pre_llm_call", "post_llm_call", "pre_tool_call", "post_tool_call",
+                     "on_session_end", "subagent_start", "subagent_stop"):
+            ctx.register_hook(hook, partial(observe_managed, hook))
+        # Registration is additive: retain the existing voice observer and the
+        # explicitly selected legacy transport. Older SDKs can warn-and-register
+        # unknown names, so registration alone is not proof of an emitter.
+        try:
+            from hermes_cli.plugins import VALID_HOOKS
+            approval_hooks_supported = {"pre_approval_request", "post_approval_response"} <= VALID_HOOKS
+        except ImportError:
+            approval_hooks_supported = False
+        if approval_hooks_supported:
+            for hook in ("pre_approval_request", "post_approval_response"):
+                ctx.register_hook(hook, partial(observe_managed, hook))
+        managed.producer_loaded(profile, approval_hooks_loaded=approval_hooks_supported)
+        ctx.on_unload(managed.close)
+    except (OSError, ValueError, sqlite3.Error):
+        # Notification storage/identity failure must never break foreground chat.
+        logger.warning("Managed notification producer unavailable")
     ctx.on_unload(partial(release_service, active_service))
 
 

@@ -55,6 +55,8 @@ from loopdy_plugin.workspace_files_api import router as workspace_files_router  
 
 router = APIRouter()
 router.include_router(workspace_files_router)
+from loopdy_plugin.managed_notifications_api import router as managed_notifications_router
+router.include_router(managed_notifications_router)
 _WORKSPACE_GIT_STATE_PATH = data_path().with_name("workspace-git.sqlite3")
 _service = None
 _workspace_git_service = None

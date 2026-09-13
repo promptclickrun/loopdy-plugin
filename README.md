@@ -49,7 +49,7 @@ All notification provider modes support proactive messages even when no chat ses
 
 ## Hermes runtime compatibility
 
-Loopdy 2.12.1 supports the Hermes 0.21.1 baseline as well as 0.21.2. New
+Loopdy 2.12.2 supports the Hermes 0.21.1 baseline as well as 0.21.2. New
 optional features use the runtime's published capabilities, rather than making
 the entire plugin require the newest Hermes release. The manifest lists baseline
 hooks; room-member activity is registered only when Hermes advertises

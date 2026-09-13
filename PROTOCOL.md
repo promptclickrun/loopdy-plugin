@@ -601,3 +601,18 @@ and does not adopt or upgrade these Link registrations.
 `wiki.connect` requires advertised operation support and `wiki.v1`. Its exact payload is the selected `agentId` and canonical absolute `folderPath`; caller account/device, authority, grant ID and write-policy fields are rejected. The trusted encrypted workspace boundary supplies current paired-account authority and authenticates the sending connection. Explicit selection creates a durable account-scoped read/write file connection without host approval, or converts the exact existing same-authority/profile registration. Access changes rotate its generation; generated/mirror/export sources remain read-only. A new device on the same account needs no Wiki allowlist entry. Ordinary Wiki folders under a custom data home such as `/opt/data` are allowed, but the home itself, its ancestors, credential/system roots, hidden/control subtrees and Wiki state remain excluded. Symlinks, changed pinned directory identity and conflicting overlapping registrations fail closed. Canonical paths must not end in a slash and are never silently normalized. `wiki.resolve` remains lookup-only. Clients must not fall back to another registration mechanism when connect is absent; hosts without secure descriptor-relative traversal omit Wiki operations.
 
 Root DTOs include optional `folderPath` metadata alongside the existing ID, name, source kind, writable policy and generation. Older clients ignore the added field; newer clients tolerate its absence on preexisting records and responses. The path is disclosed only with authorized root metadata and can accompany an explicitly selected reference snapshot. State failures, denied folders, unsupported operation, and stale ownership have separate bounded error meanings.
+
+## Direct readiness and live voice corrections (2.12.2)
+
+Negotiated workspace capabilities always include `direct-configuration-v1` on
+a host supporting Direct configuration. They include `direct-enrollment-v1`
+only while the authenticated Direct listener is available. Clients distinguish
+a supported but unavailable listener from an older plugin needing an update.
+Account lifecycle authorization is still required for paired Direct; native
+Hermes workspaces remain independently authenticated.
+
+Live voice preserves an open call when the provider explicitly marks an error
+nonfatal. Missing or fatal error classification still closes it. Repeated exact
+requests with different provider item IDs join existing pending work within the
+same voice owner. Each item receives the verified result, and an existing item
+cannot replay work. A fresh item after completion can request a new turn.

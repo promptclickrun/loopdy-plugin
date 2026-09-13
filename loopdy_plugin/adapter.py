@@ -2862,7 +2862,8 @@ class LoopdyAdapter(BasePlatformAdapter):
             finally:
                 _link_workspace_connection.reset(connection_token)
             if negotiated:
-                result["capabilities"] = workspace_capabilities()
+                result["capabilities"] = workspace_capabilities(
+                    direct_enrollment=self.direct_runtime is not None and self.direct_runtime.available)
                 if result["status"] == "completed" and request.operation == "sessions.history":
                     context = await self._workspace_history_context(request, result["payload"])
                     if context is not None:

@@ -112,7 +112,7 @@ HEALTH_TYPES = (
     "body_fat_percentage",
     "workout",
 )
-PLUGIN_VERSION = "2.12.1"
+PLUGIN_VERSION = "2.12.2"
 AVAILABLE_WIKI_OPERATIONS = available_wiki_operations()
 GROUPS_OPERATIONS = frozenset(
     {
@@ -1936,14 +1936,17 @@ def generative_ui_form_result(
     }
 
 
-def workspace_capabilities(*, live_voice: bool = True) -> dict[str, Any]:
+def workspace_capabilities(*, live_voice: bool = True, direct_enrollment: bool = False) -> dict[str, Any]:
     wiki_operations = available_wiki_operations()
     features = [
         "workspace-rejected-v1", "backpressure-v1", "plugin-update-v1",
         "host-runtime-diagnostics-v1", "voice-settings-v1", "session-state-v1", GROUPS_RESULTS_CAPABILITY,
+        "direct-configuration-v1",
     ]
     if live_voice:
         features.append("live-voice-v1")
+    if direct_enrollment:
+        features.append(DIRECT_ENROLLMENT_CAPABILITY)
     if wiki_operations:
         features.append("wiki.v1")
     return {

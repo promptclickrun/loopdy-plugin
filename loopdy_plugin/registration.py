@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import subprocess
+import sqlite3
 import sys
 import time
 import weakref
@@ -73,6 +74,7 @@ HOOKS = (
     "post_llm_call",
     "post_tool_call",
     "pre_approval_request",
+    "post_approval_response",
     *DIRECT_OBSERVER_HOOKS,
     *NOTIFICATION_HOOKS,
 )
@@ -304,6 +306,35 @@ def register(
             plugin_context=ctx,
         ),
     )
+    # Independent, public native observers. The optional Link adapter is not
+    # constructed to enable these notifications, and no core hook is patched.
+    try:
+        from .managed_notifications import get_managed_notifications
+        managed = get_managed_notifications()
+        policy = getattr(active_service, "managed_notification_policy", None)
+        if callable(policy): managed.preference_policy = policy
+        active_service.managed_alert_owner = managed.owns_alert
+        def observe_managed(hook, **payload):
+            managed.observe(hook, profile=str(ctx.profile_name or profile), **payload)
+        for hook in ("pre_llm_call", "post_llm_call", "pre_tool_call", "post_tool_call",
+                     "on_session_end", "subagent_start", "subagent_stop"):
+            ctx.register_hook(hook, partial(observe_managed, hook))
+        # Registration is additive: retain the existing voice observer and the
+        # explicitly selected legacy transport. Older SDKs can warn-and-register
+        # unknown names, so registration alone is not proof of an emitter.
+        try:
+            from hermes_cli.plugins import VALID_HOOKS
+            approval_hooks_supported = {"pre_approval_request", "post_approval_response"} <= VALID_HOOKS
+        except ImportError:
+            approval_hooks_supported = False
+        if approval_hooks_supported:
+            for hook in ("pre_approval_request", "post_approval_response"):
+                ctx.register_hook(hook, partial(observe_managed, hook))
+        managed.producer_loaded(profile, approval_hooks_loaded=approval_hooks_supported)
+        ctx.on_unload(managed.close)
+    except (OSError, ValueError, sqlite3.Error):
+        # Notification storage/identity failure must never break foreground chat.
+        logger.warning("Managed notification producer unavailable")
     from .room_activity import register_room_activity
     stop_room_activity = register_room_activity(ctx)
 
@@ -698,9 +729,9 @@ def setup_cli(parser: Any) -> None:
     test = actions.add_parser("test", help="Send an opaque test wakeup")
     test.add_argument("--target", default=_home_target())
 
-    link = actions.add_parser("link", help="Pair and inspect Loopdy Link")
+    link = actions.add_parser("link", help="Inspect retained legacy Loopdy Link settings")
     link_actions = link.add_subparsers(dest="loopdy_link_action", required=True)
-    pair = link_actions.add_parser("pair", help="Pair this Hermes host")
+    pair = link_actions.add_parser("pair", help="Explain the replacement native connection")
     pair.add_argument("--base-url", default="https://link.loopdy.app")
     pair.add_argument("--timeout", type=int, default=600)
     link_actions.add_parser("status", help="Show redacted Loopdy Link status")
@@ -949,26 +980,8 @@ def _handle_link_cli(args: Any, *, identity_state: Any | None = None) -> None:
 
     action = str(getattr(args, "loopdy_link_action", "") or "")
     if action == "pair":
-        timeout = int(getattr(args, "timeout", 600) or 600)
-        if timeout < 30 or timeout > 600:
-            raise ValueError("Loopdy Link pairing timeout must be 30-600 seconds")
-        result = pair_host(
-            str(args.base_url),
-            save_secret=save_env_value,
-            announce=_print_json,
-            timeout_seconds=timeout,
-        )
-        if identity_state is not None:
-            identity_state.set("link.runtime_status", None)
-        activation_requested = _request_gateway_activation()
-        _print_json(
-            {
-                **result,
-                "gateway_activation": (
-                    "requested" if activation_requested else "unavailable"
-                ),
-            }
-        )
+        _print_json({"state": "retired", "chat_transport": "native",
+            "detail": "Connect the app to the authenticated Hermes host address. Cloud pairing is no longer used for chat."})
         return
     if action == "status":
         try:

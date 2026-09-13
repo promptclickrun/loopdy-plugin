@@ -3,7 +3,7 @@
 **Current runtime: native Hermes chat, optional cloud delivery only.** The
 production platform adapter does not construct a Link chat client or start its
 paired Direct listener, even when old cloud credentials remain configured.
-Native APIs authenticate through Hermes. Legacy Link protocol details below are
+Native APIs use the dashboard address and authentication already configured by its operator, including no-sign-in dashboards. Legacy Link protocol details below are
 retained for compatibility tests and existing data; they are not a production
 chat transport. Native voice uses `/api/plugins/loopdy/native/voice/*` for media
 control and the app's ordinary Hermes chat for work.
@@ -12,7 +12,7 @@ Loopdy is a native Hermes platform for the Loopdy mobile app. It provides authen
 
 Direct-first native clients use stock authenticated `hermes serve` REST and `/api/ws`.
 The plugin's [native HTTP foundation](docs/NATIVE_WORKSPACE_API.md) adds verified
-person/process-profile context and fixed data-only card-template routes without a
+host-grant or provider-person/process-profile context and fixed data-only card-template routes without a
 Loopdy account. Existing forms, attachments and host-granted Files routes are
 reused. [Native Wiki](docs/NATIVE_WIKI.md) uses verified Hermes login and
 principal/profile-scoped connections, without another pairing or device-key
@@ -57,7 +57,7 @@ All notification provider modes support proactive messages even when no chat ses
 
 ## Hermes runtime compatibility
 
-Loopdy 2.13.0 supports the Hermes 0.21.1 baseline as well as 0.21.2. New
+Loopdy 2.13.1 supports the Hermes 0.21.1 baseline as well as 0.21.2. New
 optional features use the runtime's published capabilities, rather than making
 the entire plugin require the newest Hermes release. The manifest lists baseline
 hooks; room-member activity is registered only when Hermes advertises

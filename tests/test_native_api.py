@@ -57,6 +57,22 @@ class FixtureProvider(DashboardAuthProvider):
 
 
 class NativeAPITests(unittest.TestCase):
+    def test_dashboard_mode_uses_hermes_token_middleware_without_inventing_a_user(self):
+        from hermes_cli import web_server
+        app = FastAPI()
+        app.state.auth_required = False
+        app.middleware("http")(web_server.auth_middleware)
+        app.include_router(native_api.router, prefix="/api/plugins/loopdy")
+        with patch.object(web_server, "_SESSION_TOKEN", "dashboard-fixture-token"), TestClient(app) as client:
+            self.assertEqual(client.get(PREFIX + "/context").status_code, 401)
+            self.assertEqual(client.get(PREFIX + "/context", headers={"X-Hermes-Session-Token": "wrong"}).status_code, 401)
+            response = client.get(PREFIX + "/context", headers={"X-Hermes-Session-Token": "dashboard-fixture-token"})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertIsNone(response.json()["principal"])
+            self.assertIn("native-voice-v1", response.json()["features"])
+            self.assertNotIn("native-wiki-v1", response.json()["features"])
+            self.assertNotIn("dashboard-fixture-token", response.text)
+
     def test_native_voice_status_uses_verified_hermes_identity_without_link(self):
         payload = {"agentId": "default", "sessionId": "stored-fixture", "provider": "codex_subscription"}
         path = PREFIX + "/voice/status"
@@ -159,8 +175,9 @@ class NativeAPITests(unittest.TestCase):
             "Authorization": "Bearer fixture-alice",
             "X-Hermes-Session-Token": "legacy", "X-Actor-ID": "alice",
         })
-        self.assertEqual(result.status_code, 401)
-        self.assertEqual(result.json()["error"]["code"], "native_identity_required")
+        self.assertEqual(result.status_code, 200)
+        self.assertIsNone(result.json()["principal"])
+        self.assertNotIn("alice", result.text)
 
     def test_process_profile_ignores_request_override_and_null_is_unproven(self):
         from hermes_constants import set_hermes_home_override, reset_hermes_home_override
@@ -329,7 +346,10 @@ assert client.get(PREFIX + "/context", headers=headers).status_code == 404
 app.state.auth_required = False
 legacy = {"X-Hermes-Session-Token":os.environ["HERMES_DASHBOARD_SESSION_TOKEN"]}
 assert client.get("/api/plugins/loopdy/capabilities", headers=legacy).status_code == 200
-assert client.get(PREFIX + "/context", headers=legacy).status_code == 401
+assert client.get(PREFIX + "/context").status_code == 401
+shared = client.get(PREFIX + "/context", headers=legacy)
+assert shared.status_code == 200 and shared.json()["principal"] is None
+assert "native-voice-v1" in shared.json()["features"]
 print("native stock mount, verified bearer/cookie, revocation, disabled gate, legacy isolation passed")
 '''
         with tempfile.TemporaryDirectory(prefix="loopdy-native-stock-", dir=Path(tempfile.gettempdir()).resolve()) as directory:

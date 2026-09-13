@@ -36,8 +36,8 @@ def _identity_text(value: object, maximum: int) -> str:
 
 @dataclass(frozen=True)
 class NativeContext:
-    provider: str
-    user_id: str
+    provider: str | None
+    user_id: str | None
     display_name: str | None
     serving_profile_id: str | None
     features: tuple[str, ...]
@@ -53,7 +53,7 @@ class NativeContext:
                 "provider": self.provider,
                 "userId": self.user_id,
                 "displayName": self.display_name,
-            },
+            } if self.provider is not None else None,
             "features": list(self.features),
         }
 
@@ -71,18 +71,27 @@ def native_context(request: Request) -> NativeContext:
         raise NativeAPIError(401, "native_identity_required",
                              "A verified native interactive session is required.") from None
     session = getattr(request.state, "session", None)
-    if not isinstance(session, Session):
-        raise NativeAPIError(401, "native_identity_required",
-                             "A verified native interactive session is required.")
-    try:
-        provider = _identity_text(session.provider, 128)
-        user_id = _identity_text(session.user_id, 512)
-        display_name = None if session.display_name in ("", None) else _identity_text(session.display_name, 200)
-        if type(session.expires_at) is not int or session.expires_at <= time.time():
-            raise ValueError("Expired identity")
-    except (ValueError, UnicodeError):
-        raise NativeAPIError(401, "native_identity_invalid",
-                             "The native interactive identity is invalid or expired.") from None
+    # Hermes authenticates EVERY mounted /api/plugins/* request before invoking
+    # this router, either by dashboard session token or its provider middleware.
+    # A dashboard-wide grant has no person identity; do not fabricate a Session.
+    dashboard_mode = (getattr(request.app.state, "auth_required", None) is False
+                      and not getattr(request.state, "token_authenticated", False)
+                      and request.url.path.startswith("/api/plugins/loopdy/native/"))
+    if dashboard_mode and session is None:
+        provider = user_id = display_name = None
+    else:
+        if not isinstance(session, Session):
+            raise NativeAPIError(401, "native_identity_required",
+                                 "A verified Hermes session is required.")
+        try:
+            provider = _identity_text(session.provider, 128)
+            user_id = _identity_text(session.user_id, 512)
+            display_name = None if session.display_name in ("", None) else _identity_text(session.display_name, 200)
+            if type(session.expires_at) is not int or session.expires_at <= time.time():
+                raise ValueError("Expired identity")
+        except (ValueError, UnicodeError):
+            raise NativeAPIError(401, "native_identity_invalid",
+                                 "The Hermes identity is invalid or expired.") from None
 
     profile = None
     features = ["native-context-v1"]
@@ -114,7 +123,7 @@ def native_context(request: Request) -> NativeContext:
     if activity_hub().available:
         features.append(CAPABILITY)
     from .wiki_contract import available_wiki_operations
-    if "native-card-templates-v1" in features and available_wiki_operations():
+    if provider is not None and "native-card-templates-v1" in features and available_wiki_operations():
         features.extend(("native-wiki-v1", "native-wiki-disconnect-v1"))
     from .native_project_git import CAPABILITY as project_git_capability, supported as project_git_supported
     if project_git_supported():

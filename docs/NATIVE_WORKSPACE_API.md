@@ -21,22 +21,26 @@ ingress remain separate proof-gated capabilities.
   pluginVersion: string,
   runtimeId: string,
   servingProfileId: string|null,
-  principal: {provider: string, userId: string, displayName: string|null},
+  principal: {provider: string, userId: string, displayName: string|null}|null,
   features: string[]
 }
 ```
 
-The route requires a real verified Hermes `dashboard_auth.base.Session` from
-the native bearer/cookie middleware, including on a loopback host. A legacy
-dashboard token, service principal, body actor, or display/device header cannot
-substitute. Only provider (128 UTF-8 bytes), user ID (512) and optional display
-name (200) are copied. Tokens, email, org metadata and the Session object are
-never returned or logged. Display names are presentation, not authorization.
+Routes are mounted behind Hermes' own authentication middleware. With provider
+login enabled, a real verified `dashboard_auth.base.Session` is required, and
+its provider/user coordinates must match the app's verified account. Without
+provider login, Hermes' existing dashboard session-token middleware grants the
+host-wide session; `principal` is null and the app uses a separate dashboard
+scope. The plugin does not fabricate a user or accept credentials itself.
+Missing/wrong dashboard tokens are still rejected by Hermes before dispatch.
+No change to host authentication, URL or listening port is required.
 
-The app must match provider/user ID to `/api/auth/me` at the selected endpoint.
-Its auth/connection generations are local stale-callback fences, not server
-credentials. Native workspace access does not imply a per-profile principal ACL
-or any phone permission.
+Only provider (128 UTF-8 bytes), user ID (512) and optional display name (200)
+are copied. Credentials and Session objects are never returned or logged.
+Person-scoped Wiki routes are not advertised for the dashboard-wide grant.
+Other native features use their existing context and operation preconditions.
+The app's local auth/connection generations reject stale callbacks. Native
+workspace access does not create a per-profile ACL or phone permission.
 
 `runtimeId` identifies this loaded native plugin HTTP module lifetime, not
 installed source, release freshness, Link identity, or a device. Process profile

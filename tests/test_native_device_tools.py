@@ -492,6 +492,48 @@ class MiddlewareTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(value, str)
         self.assertEqual(json.loads(value)["status"], "completed")
 
+    def test_official_execution_middleware_forwards_unrelated_tools_once(self) -> None:
+        from hermes_cli import middleware
+
+        callbacks: list = []
+
+        class Context:
+            profile_name = "default"
+
+            def register_middleware(self, kind, callback):
+                callbacks.append((kind, callback))
+
+        self.assertTrue(register_middleware(Context(), hub=SimpleNamespace()))
+        callback = callbacks[-1][1]
+        manager = SimpleNamespace(_middleware={"tool_execution": [callback]})
+        calls: list = []
+
+        def downstream(payload):
+            calls.append(payload)
+            return {"downstream": payload}
+
+        with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
+            value = middleware.run_tool_execution_middleware(
+                "weather", {"location": "Chicago"}, downstream,
+                session_id="stored-session", turn_id="turn-unrelated", tool_call_id="call-unrelated",
+            )
+        self.assertEqual(value, {"downstream": {"location": "Chicago"}})
+        self.assertEqual(calls, [{"location": "Chicago"}])
+
+        calls.clear()
+
+        def failing_downstream(payload):
+            calls.append(payload)
+            raise RuntimeError("downstream failure")
+
+        with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
+            with self.assertRaisesRegex(RuntimeError, "downstream failure"):
+                middleware.run_tool_execution_middleware(
+                    "weather", {"location": "Chicago"}, failing_downstream,
+                    session_id="stored-session", turn_id="turn-error", tool_call_id="call-error",
+                )
+        self.assertEqual(calls, [{"location": "Chicago"}])
+
     def test_native_execution_bridge_failure_does_not_fall_through(self) -> None:
         callbacks: list = []
 

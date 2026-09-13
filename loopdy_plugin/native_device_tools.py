@@ -564,7 +564,14 @@ def register_middleware(
     def execute(**kwargs: Any) -> str | None:
         tool_name = kwargs.get("tool_name")
         if tool_name not in _TOOL_NAMES:
-            return None
+            # Execution middleware is a chain.  Unrelated tools belong to the
+            # host's downstream executor; returning None would be interpreted
+            # as a successful middleware result and leave the agent with no
+            # tool output.  Keep the direct-probe fallback when no chain hook
+            # was supplied, but never swallow an official downstream result or
+            # exception.
+            next_call = kwargs.get("next_call")
+            return next_call() if callable(next_call) else None
         session_id = kwargs.get("session_id", "")
         # Native is authoritative whenever a phone lease is selected.  A
         # missing lease may use the old Link bridge on compatible Hermes

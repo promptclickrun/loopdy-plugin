@@ -1,5 +1,13 @@
 # Loopdy protocol
 
+**Current runtime: native Hermes chat, optional cloud delivery only.** The
+production platform adapter does not construct a Link chat client or start its
+paired Direct listener, even when old cloud credentials remain configured.
+Native APIs authenticate through Hermes. Legacy Link protocol details below are
+retained for compatibility tests and existing data; they are not a production
+chat transport. Native voice uses `/api/plugins/loopdy/native/voice/*` for media
+control and the app's ordinary Hermes chat for work.
+
 ## Native HTTP foundation and negotiated group results
 
 The separate stock-serve native HTTP context and template contracts, exact
@@ -13,8 +21,8 @@ No second pairing or authorization ceremony is required.
 
 Native workspace requests use the saved Hermes endpoint and its native
 authentication over stock REST or `/api/ws`. Link/account AEAD frames below are
-a separate paired transport, not the native HTTP auth protocol. The optional
-paired Direct listener still requires account lifecycle leases; direct APNs is
+a separate paired transport, not the native HTTP auth protocol. The retired
+paired Direct listener required account lifecycle leases; direct APNs is
 only a notification provider. Neither substitutes for native Hermes login.
 
 Native prompt attachments are **files-only**. Prompt image submission is
@@ -441,6 +449,23 @@ response is missing, malformed, or has a route-incompatible status.
 Switching providers requires a compatible device token. The plugin never falls back between providers.
 
 ## Hermes app API
+
+### Negotiated hosted-room workspace results
+
+The `groups-results-v1` workspace feature permits an optional
+`groupsResultVersion: 1` on a fixed hosted-room workspace request. This is an
+authenticated transport-envelope field, never an argument to Hermes'
+`groups.*` dispatcher. Only the corresponding opted-in result echoes it.
+Unknown values and unrelated operations reject it before dispatch. Clients
+must verify the echo against the exact pending request and current owner.
+
+Native group results have operation-specific payload and full-envelope bounds
+within the existing encrypted-frame ceiling. Older, unnegotiated requests keep
+their original envelope and limits. Oversized results fail explicitly; immutable
+event text is not clipped. A groups.log result validates every returned event,
+room coordinate, actor, authority, contiguous sequence and cursor before the
+mandatory `authority.gateway_id` field is admitted. That single schema-path
+allowance does not weaken generic workspace credential/key screening.
 
 Hermes mounts this router under `/api/plugins/loopdy/`. It inherits the dashboard's authentication
 policy. Pairing belongs to the separate Loopdy Link service, so the Hermes plugin API deliberately

@@ -1,5 +1,13 @@
 # Loopdy plugin security
 
+**Current runtime: native Hermes chat, optional cloud delivery only.** The
+production platform adapter does not construct a Link chat client or start its
+paired Direct listener, even when old cloud credentials remain configured.
+Native APIs authenticate through Hermes. Legacy Link protocol details below are
+retained for compatibility tests and existing data; they are not a production
+chat transport. Native voice uses `/api/plugins/loopdy/native/voice/*` for media
+control and the app's ordinary Hermes chat for work.
+
 ## Trust boundaries
 
 - Hermes is authoritative for tool policy, approval scope, sessions, tasks, and detailed event records.
@@ -129,6 +137,12 @@ The optional Loopdy platform approval transport below is not required for stock
 native workspace approval operations, which retain Hermes' own offered scopes
 and request binding.
 
+Hosted-room log serialization validates the exact `groups.log` authority path
+before permitting its public gateway identity coordinate. Other operations,
+unknown paths and secret-bearing keys retain generic workspace rejection.
+Negotiated groups result sizing is operation-scoped and authenticated; it does
+not raise general request limits or allow arbitrary RPC methods.
+
 - Plugin installation does not activate the approval transport.
 - The operator must explicitly configure `security.approval.transport: loopdy`.
 - `transport_fallback: deny` is recommended.
@@ -162,6 +176,6 @@ from legacy Link devices and uses the same registry/lock. Existing Link roots
 are not adopted or migrated; exact overlap fails explicitly. See
 [Native Wiki](docs/NATIVE_WIKI.md) for storage compatibility and revocation limits.
 
-On paired Link, explicit authenticated `wiki.connect` selects a safe folder for durable paired-account access without separate host approval or a Wiki device allowlist. It creates an account-scoped file grant or converts an existing exact same-authority/profile grant to account scope, enabling writes only for ordinary file sources on capable hosts. Conversion rotates the generation once; roots, reads and resolve never upgrade access. It accepts no caller-selected account identity, authority, grant ID or writable flag. Cross-authority/profile and non-exact overlapping registrations remain rejected. Individual uploads retain immutable initiating-connection ownership so another device cannot resume a stale write. Host revocation removes the connection, but is not an account ban: a still-authenticated account may explicitly select that folder again.
+Explicit authenticated Link `wiki.connect` selects a safe folder for durable paired-account access. It creates an account-scoped connection or converts an exact same-authority/profile grant to account scope, enabling writes only for ordinary file sources on capable hosts. Conversion rotates the generation once; generated, mirrored and exported sources remain read-only. No caller-selected authority, account identity, grant ID or writable flag is accepted. Cross-authority/profile and non-exact overlapping registrations remain rejected. Individual save uploads retain their verified initiating-device ownership; another device cannot adopt an in-flight upload. Host revocation removes the connection, not the paired account's ability to explicitly connect again. Roots, reads, resolve and directory suggestions never upgrade access.
 
-These paired-Link registrations reject traversal, symlink ancestors, system/credential/control directories, the host home itself, Wiki state and enclosing folders. Ordinary data folders inside a custom, non-credential-named Hermes home (for example `/opt/data/Alfie Brain Wiki`) may be selected through authenticated account connect, but hidden and host-control subtrees remain excluded. The standard `~/.hermes` tree and other credential/control-named paths remain ungrantable. Existing Link grants require the same pairing authority/profile and exact pinned directory identity; changed access rotates the generation so old revisions fail closed. Hosts without descriptor-relative traversal omit Wiki operations. Cold initialization uses no-follow descriptors, creates state privately, and never chmods foreign directories. Link root metadata is encrypted account content; selected references disclose their requested source path and text, not relay-readable metadata. Native HTTP shares the safe traversal rules but uses the distinct principal authority described above.
+Connection rejects traversal, symlink ancestors, system/credential/control directories, the host home itself, Wiki state and enclosing folders. Ordinary data folders inside a custom non-credential-named Hermes home may be explicitly selected; hidden/control subtrees and the standard `~/.hermes` tree remain excluded. Hosts without secure descriptor-relative traversal omit Wiki operations. Cold state initialization uses no-follow descriptors, creates state privately and never chmods foreign directories. Absolute root metadata is encrypted account content on Link; native HTTP uses the separately authenticated principal contract above. References disclose only the explicitly selected source path/text, not relay-readable metadata.

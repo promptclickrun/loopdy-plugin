@@ -1,6 +1,14 @@
 # Loopdy for Hermes
 
-Loopdy is a native Hermes platform for the Loopdy mobile app. It provides encrypted Loopdy Link chat, verified device/person context, proactive notifications, lifecycle events, approval transport, attachments, and Generative UI. Hermes remains authoritative for agents, sessions, scheduled tasks, policy, event details, and transcripts.
+**Current runtime: native Hermes chat, optional cloud delivery only.** The
+production platform adapter does not construct a Link chat client or start its
+paired Direct listener, even when old cloud credentials remain configured.
+Native APIs authenticate through Hermes. Legacy Link protocol details below are
+retained for compatibility tests and existing data; they are not a production
+chat transport. Native voice uses `/api/plugins/loopdy/native/voice/*` for media
+control and the app's ordinary Hermes chat for work.
+
+Loopdy is a native Hermes platform for the Loopdy mobile app. It provides authenticated native integrations, optional notifications, lifecycle events, media control, and Generative UI. Hermes remains authoritative for agents, sessions, scheduled tasks, policy, event details, and transcripts.
 
 Direct-first native clients use stock authenticated `hermes serve` REST and `/api/ws`.
 The plugin's [native HTTP foundation](docs/NATIVE_WORKSPACE_API.md) adds verified
@@ -27,9 +35,9 @@ including proven hidden canonical Bot Chat. It reuses content-derived tokens
 and bounded side-specific diffs; incomplete status and unsupported conflict
 diffs fail explicitly. No Files grant or Git mutation is created.
 
-Loopdy Link remains the paired account transport. The Hermes host opens one outbound WebSocket to `https://link.loopdy.app`; the app and host encrypt chat frames with the account key before they reach the service. Pairing is proof-of-possession based and gives each host its own revocable device identity. The cloud service cannot read chat plaintext.
-
-The same paired Loopdy Link connection carries a fixed, versioned set of encrypted workspace operations for agents, Hermes Projects, sessions, scheduled tasks, per-agent defaults, approvals, events, and attachments. It is not an arbitrary HTTP proxy: every operation is explicitly allowlisted, bounded, validated, and handled through Hermes-owned Project, profile, session, cron, policy, and plugin surfaces. Agent-default reads use Hermes' native profile-scoped `config.get` and `model.options` methods, with compatibility fallback for older Hermes releases. Project creation registers one existing remote folder, archive removes only the Project registration from active catalogs, and folder suggestions return bounded directory coordinates without file contents. Link-only use does not require a separate Hermes endpoint or native token after pairing. Independently saved native hosts do retain their own endpoint and native credentials.
+Native workspace operations use Hermes REST and `/api/ws`. The host does not
+open an outbound cloud WebSocket for chat or depend on a cloud device catalog.
+Cloud notification enrollment is a separate opt-in operation.
 
 Scheduled-task output choices come from Hermes' own cron delivery-target catalog. Loopdy accepts enabled catalog targets or a validated canonical `platform:chat_id[:thread]` value and sends that value through the official cron `deliver` field.
 
@@ -49,7 +57,7 @@ All notification provider modes support proactive messages even when no chat ses
 
 ## Hermes runtime compatibility
 
-Loopdy 2.12.2 supports the Hermes 0.21.1 baseline as well as 0.21.2. New
+Loopdy 2.13.0 supports the Hermes 0.21.1 baseline as well as 0.21.2. New
 optional features use the runtime's published capabilities, rather than making
 the entire plugin require the newest Hermes release. The manifest lists baseline
 hooks; room-member activity is registered only when Hermes advertises

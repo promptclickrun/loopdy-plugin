@@ -60,6 +60,12 @@ class _NativeRoute(APIRoute):
 router = APIRouter(prefix="/native", route_class=_NativeRoute)
 
 
+@router.post("/voice/{operation}")
+async def voice(operation: str, request: Request) -> Response:
+    from .native_voice import request as voice_request
+    return await voice_request(operation, request)
+
+
 class _Body(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     agentId: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")

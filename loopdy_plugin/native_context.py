@@ -109,7 +109,7 @@ def native_context(request: Request) -> NativeContext:
             profile_exists, get_process_hermes_home,
             set_hermes_home_override, reset_hermes_home_override,
         )):
-            features.append("native-card-templates-v1")
+            features.extend(("native-card-templates-v1", "native-voice-v1"))
     from .room_activity import CAPABILITY, activity_hub
     if activity_hub().available:
         features.append(CAPABILITY)

@@ -449,45 +449,11 @@ class LoopdyAdapter(BasePlatformAdapter):
         self.link_configuration_error = ""
         self.marketplace_configuration_error = ""
         marketplace_client = None
-        if self.link_client is None:
-            try:
-                runtime_config = load_runtime_config()
-            except (TypeError, ValueError) as exc:
-                runtime_config = None
-                self.link_configuration_error = str(exc)[:160]
-            if runtime_config is not None:
-                from .marketplace import (
-                    CARD_TEMPLATE_CAPABILITY,
-                    MARKETPLACE_SKILL_CAPABILITY,
-                    build_marketplace_gateway_client,
-                )
-
-                capabilities = [
-                    CARD_TEMPLATE_CAPABILITY,
-                    DEVICE_TOOL_CAPABILITY,
-                    DIRECTED_FRAMES_CAPABILITY,
-                    DIRECT_ENROLLMENT_CAPABILITY,
-                    STATE_BACKED_PRESENTATION_CAPABILITY,
-                ]
-                try:
-                    marketplace_client = build_marketplace_gateway_client(runtime_config)
-                except Exception as exc:
-                    self.marketplace_configuration_error = str(exc)[:160]
-                if marketplace_client is not None:
-                    capabilities.append(MARKETPLACE_SKILL_CAPABILITY)
-                self.link_client = LoopdyLinkClient(
-                    runtime_config,
-                    state=link_state,
-                    attachment_root=(
-                        get_hermes_home()
-                        / "plugin-data"
-                        / "loopdy"
-                        / "link-inbound"
-                    ),
-                    capabilities=capabilities,
-                )
-                self.device_tool_bridge.bind_link_client(self.link_client)
-        elif getattr(self.link_client, "config", None) is not None:
+        # Native Hermes owns production chat. Saved Link configuration is retained
+        # for optional notification enrollment, never used to construct a chat
+        # socket, account catalog, cloud outbox, or paired Direct listener.
+        # An explicitly injected legacy client remains usable by protocol tests.
+        if self.link_client is not None and getattr(self.link_client, "config", None) is not None:
             self.device_tool_bridge.bind_link_client(self.link_client)
             from .marketplace import build_marketplace_gateway_client
 
@@ -1241,6 +1207,9 @@ class LoopdyAdapter(BasePlatformAdapter):
             except Exception:
                 # Update status can fail closed without disabling ordinary Link.
                 pass
+        if self.link_client is None:
+            self._mark_connected()
+            return True
         health = self.service.health()
         has_direct_owner = self.direct_runtime is not None or (self._direct_start_task and not self._direct_start_task.done())
         if has_direct_owner and not is_reconnect:

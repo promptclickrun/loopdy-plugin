@@ -68,6 +68,11 @@ real runtime discovery and the supported installer in disposable profiles. The
 app's native workspace protocol has its own host capability requirements;
 plugin compatibility does not imply every newer Hermes API exists on an older host.
 
+The plugin also uses the current public module locations for configuration, model
+options, skills, MCP, and scheduled-task delivery. These locations exist on both
+supported runtimes. Compatibility tests exercise Doctor with the legacy import
+removal policy enabled; no deprecated-import override is required.
+
 ## Host context compatibility
 
 Ordinary Link chat does not require the optional Hermes `ToolExecutionContext`

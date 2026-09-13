@@ -21,9 +21,12 @@ class RuntimeCompatibilityTests(unittest.TestCase):
             result = subprocess.run(
                 [sys.executable, "-c", """
 import json, sys
+from unittest.mock import patch
 from hermes_cli.plugin_dev import doctor_plugin
 from hermes_cli.plugins import VALID_HOOKS
-report = doctor_plugin(sys.argv[1])
+# Exercise the runtime's actual post-migration loader, not a scanner bypass.
+with patch("hermes_cli.plugin_compat.removal_in_effect", return_value=True):
+    report = doctor_plugin(sys.argv[1])
 print(json.dumps({"ok": report.ok, "report": report.format_text(),
     "hooks": report.registered_hooks, "tools": report.registered_tools,
     "supports_room_activity": "on_room_member_activity" in VALID_HOOKS}))

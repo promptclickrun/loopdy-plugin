@@ -66,6 +66,12 @@ async def voice(operation: str, request: Request) -> Response:
     return await voice_request(operation, request)
 
 
+@router.post("/device-tools/{operation}")
+async def device_tools(operation: str, request: Request) -> Response:
+    from .native_device_tools import request as device_tools_request
+    return await device_tools_request(operation, request)
+
+
 class _Body(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     agentId: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")

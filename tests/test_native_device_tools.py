@@ -1,0 +1,529 @@
+"""Focused tests for the native iPhone device-tool channel."""
+
+from __future__ import annotations
+
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import json
+import sys
+import threading
+import unittest
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from loopdy_plugin.link_contracts import device_tool_result
+from loopdy_plugin.native_device_tools import (
+    NativeDeviceToolError,
+    NativeDeviceToolHub,
+    _Scope,
+    _Connect,
+    _live_profile_matches,
+    available,
+    register_middleware,
+)
+
+
+@dataclass(frozen=True)
+class Owner:
+    provider: str = "test"
+    user_id: str = "user-1"
+    serving_profile_id: str = "default"
+    runtime_id: str = "runtime-1"
+
+
+class Clock:
+    def __init__(self, value: float = 1_700_000_000) -> None:
+        self.value = value
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+
+def channel_fields(*, channel_id: str | None = None, device_id: str | None = None,
+                   session_id: str = "stored-session") -> dict:
+    return {
+        "channelId": channel_id or str(uuid.uuid4()),
+        "deviceId": device_id or str(uuid.uuid4()),
+        "hostId": "local-host",
+        "authorizationEpoch": 1,
+        "agentId": "default",
+        "sessionId": session_id,
+        "enabled": ["calendar", "reminders", "health"],
+    }
+
+
+class NativeDeviceToolHubTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.clock = Clock()
+        self.owner = Owner()
+        self.hub = NativeDeviceToolHub(
+            clock=self.clock,
+            profile_session_validator=lambda profile, session: profile == "default" and session in {
+                "stored-session", "runtime-session"
+            },
+        )
+
+    async def test_connect_poll_result_and_close_are_owner_bound(self) -> None:
+        fields = channel_fields()
+        self.assertEqual(
+            self.hub.connect(self.owner, fields),
+            {"channelId": fields["channelId"], "connected": True},
+        )
+        task = asyncio.create_task(self.hub.execute(
+            profile="default", session_id="stored-session", turn_id="turn-1",
+            tool_call_id="call-1", operation="calendar.list", arguments={
+                "start": "2026-01-01T00:00:00Z", "end": "2026-01-01T01:00:00Z", "timeZone": "UTC",
+            },
+        ))
+        await asyncio.sleep(0)
+        feed = self.hub.poll(self.owner, fields, after=0)
+        self.assertEqual(feed["next"], 1)
+        request = feed["requests"][0]["request"]
+        self.assertEqual(request["operation"], "calendar.list")
+        self.assertEqual(request["sessionId"], "stored-session")
+        self.assertEqual(request["turnId"], "turn-1")
+        result = device_tool_result(
+            request=request, status="completed", payload={"items": []},
+            sent_at=self.clock.value,
+        )
+        self.assertEqual(self.hub.accept_result(self.owner, fields, result), {"accepted": True})
+        self.assertEqual((await task)["payload"], {"items": []})
+        with self.assertRaises(NativeDeviceToolError) as replay:
+            self.hub.accept_result(self.owner, fields, result)
+        self.assertEqual(replay.exception.code, "result_replay")
+        self.assertEqual(self.hub.close(self.owner, fields), {"closed": True})
+
+    async def test_forged_coordinates_do_not_complete_pending_request(self) -> None:
+        fields = channel_fields()
+        self.hub.connect(self.owner, fields)
+        task = asyncio.create_task(self.hub.execute(
+            profile="default", session_id="stored-session", turn_id="turn-2",
+            tool_call_id="call-2", operation="reminders.list", arguments={},
+        ))
+        await asyncio.sleep(0)
+        request = self.hub.poll(self.owner, fields, after=0)["requests"][0]["request"]
+        forged = device_tool_result(
+            request=request, status="completed", payload={"items": []}, sent_at=self.clock.value,
+        )
+        forged["turnId"] = "other-turn"
+        with self.assertRaises(NativeDeviceToolError) as error:
+            self.hub.accept_result(self.owner, fields, forged)
+        self.assertEqual(error.exception.code, "result_coordinates_mismatch")
+        self.assertFalse(task.done())
+        self.hub.close(self.owner, fields)
+        self.assertEqual((await task)["code"], "phone_unavailable")
+
+    async def test_disabled_scope_and_expiry_are_truthful(self) -> None:
+        fields = channel_fields()
+        fields["enabled"] = ["calendar"]
+        self.hub.connect(self.owner, fields)
+        denied = await self.hub.execute(
+            profile="default", session_id="stored-session", turn_id="turn-3",
+            tool_call_id="call-3", operation="health.read", arguments={"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T01:00:00Z", "timeZone": "UTC"},
+        )
+        self.assertEqual(denied["code"], "authorization_required")
+        self.clock.advance(31)
+        expired = await self.hub.execute(
+            profile="default", session_id="stored-session", turn_id="turn-4",
+            tool_call_id="call-4", operation="calendar.list", arguments={
+                "start": "2026-01-01T00:00:00Z", "end": "2026-01-01T01:00:00Z", "timeZone": "UTC",
+            },
+        )
+        self.assertEqual(expired["code"], "phone_unavailable")
+
+    async def test_connect_allows_zero_optional_grants(self) -> None:
+        fields = channel_fields()
+        fields["enabled"] = []
+        self.assertEqual(_Connect(**fields).enabled, [])
+        self.assertEqual(
+            self.hub.connect(self.owner, fields),
+            {"channelId": fields["channelId"], "connected": True},
+        )
+        denied = await self.hub.execute(
+            profile="default", session_id="stored-session", turn_id="turn-no-grants",
+            tool_call_id="call-no-grants", operation="calendar.list", arguments={
+                "start": "2026-01-01T00:00:00Z", "end": "2026-01-01T01:00:00Z", "timeZone": "UTC",
+            },
+        )
+        self.assertEqual(denied["code"], "authorization_required")
+
+    async def test_duplicate_call_identity_coalesces_and_conflicting_args_do_not_queue(self) -> None:
+        fields = channel_fields()
+        self.hub.connect(self.owner, fields)
+        arguments = {
+            "start": "2026-01-01T00:00:00Z", "end": "2026-01-01T01:00:00Z", "timeZone": "UTC",
+        }
+        first = asyncio.create_task(self.hub.execute(
+            profile="default", session_id="stored-session", turn_id="turn-5",
+            tool_call_id="call-5", operation="calendar.list", arguments=arguments,
+        ))
+        await asyncio.sleep(0)
+        conflicting = await self.hub.execute(
+            profile="default", session_id="stored-session", turn_id="turn-5",
+            tool_call_id="call-5", operation="calendar.list", arguments={**arguments, "limit": 2},
+        )
+        self.assertEqual(conflicting["code"], "request_conflict")
+        self.assertEqual(self.hub.poll(self.owner, fields, after=0)["next"], 1)
+        request = self.hub.poll(self.owner, fields, after=0)["requests"][0]["request"]
+        self.hub.accept_result(self.owner, fields, device_tool_result(
+            request=request, status="completed", payload={"items": []}, sent_at=self.clock.value,
+        ))
+        self.assertEqual((await first)["status"], "completed")
+
+    async def test_completed_request_tombstones_retain_the_newest_call(self) -> None:
+        fields = channel_fields()
+        self.hub.connect(self.owner, fields)
+        request_ids: list[str] = []
+        for index in range(300):
+            task = asyncio.create_task(self.hub.execute(
+                profile="default", session_id="stored-session", turn_id=f"turn-{index}",
+                tool_call_id=f"call-{index}", operation="reminders.list", arguments={},
+            ))
+            await asyncio.sleep(0)
+            request = next(iter(self.hub.channels[fields["channelId"]].pending.values())).request
+            request_ids.append(request["requestId"])
+            self.hub.accept_result(self.owner, fields, device_tool_result(
+                request=request, status="completed", payload={"items": []}, sent_at=self.clock.value,
+            ))
+            self.assertEqual((await task)["status"], "completed")
+        self.assertTrue(set(request_ids[-256:]).issubset(
+            self.hub.channels[fields["channelId"]].completed
+        ))
+
+    def test_multiple_phones_for_one_session_are_ambiguous(self) -> None:
+        first = channel_fields()
+        second = channel_fields()
+        second["sessionId"] = first["sessionId"]
+        self.hub.connect(self.owner, first)
+        with self.assertRaises(NativeDeviceToolError) as error:
+            self.hub.connect(self.owner, second)
+        self.assertEqual(error.exception.code, "channel_ambiguous")
+
+    def test_channel_owner_is_fenced_for_poll_result_and_close(self) -> None:
+        fields = channel_fields()
+        self.hub.connect(self.owner, fields)
+        other = Owner(user_id="other-user")
+        for operation in (
+            lambda: self.hub.poll(other, {"channelId": fields["channelId"], "after": 0}),
+            lambda: self.hub.close(other, {"channelId": fields["channelId"]}),
+        ):
+            with self.subTest(operation=operation):
+                with self.assertRaises(NativeDeviceToolError) as error:
+                    operation()
+                self.assertEqual(error.exception.code, "channel_owner_changed")
+
+    async def test_close_from_thread_without_running_loop_releases_waiter(self) -> None:
+        fields = channel_fields()
+        self.hub.connect(self.owner, fields)
+        task = asyncio.create_task(self.hub.execute(
+            profile="default", session_id="stored-session", turn_id="turn-thread",
+            tool_call_id="call-thread", operation="reminders.list", arguments={},
+        ))
+        await asyncio.sleep(0)
+
+        closer = threading.Thread(target=lambda: self.hub.close(self.owner, fields))
+        closer.start()
+        closer.join()
+        self.assertFalse(task.cancelled())
+        self.assertEqual((await task)["code"], "phone_unavailable")
+
+    def test_expired_channels_are_purged_before_capacity_and_without_mutating_iteration(self) -> None:
+        clock = Clock()
+        hub = NativeDeviceToolHub(clock=clock, profile_session_validator=lambda _profile, _session: True)
+        for index in range(64):
+            hub.connect(self.owner, channel_fields(session_id=f"session-{index}"))
+        self.assertEqual(len(hub.channels), 64)
+        clock.advance(31)
+        replacement = channel_fields(session_id="replacement-session")
+        self.assertEqual(hub.connect(self.owner, replacement), {
+            "channelId": replacement["channelId"], "connected": True,
+        })
+        self.assertEqual(len(hub.channels), 1)
+
+    def test_live_profile_matching_requires_the_requested_profile(self) -> None:
+        with patch("hermes_constants.get_process_hermes_home", return_value=Path("/profiles/default")), \
+             patch("hermes_constants.profile_name_for_home", side_effect=lambda home: {
+                 Path("/profiles/default"): "default",
+                 Path("/profiles/other"): "other",
+             }[home]):
+            self.assertTrue(_live_profile_matches({}, "default"))
+            self.assertFalse(_live_profile_matches({"profile_home": "/profiles/other"}, "default"))
+
+    def test_runtime_and_stored_ids_use_hermes_live_session_map(self) -> None:
+        from loopdy_plugin import native_device_tools
+
+        with patch.object(native_device_tools, "_live_sessions_snapshot", return_value={
+            "runtime-session": {"session_key": "stored-session"},
+        }):
+            self.assertTrue(native_device_tools._same_live_session("runtime-session", "stored-session"))
+            self.assertFalse(native_device_tools._same_live_session("runtime-session", "other-session"))
+
+    def test_connect_scope_identifiers_are_full_matches(self) -> None:
+        valid = channel_fields()
+        _Scope(channelId=valid["channelId"])
+        for suffix in ("x", "\n"):
+            with self.assertRaises(ValueError):
+                _Scope(channelId=valid["channelId"] + suffix)
+
+
+class MiddlewareTests(unittest.IsolatedAsyncioTestCase):
+    def test_registration_requires_official_middleware_and_tracks_lifecycle(self) -> None:
+        callbacks = []
+        unload = []
+
+        class Context:
+            profile_name = "default"
+
+            def register_middleware(self, kind, callback):
+                callbacks.append((kind, callback))
+
+            def on_unload(self, callback):
+                unload.append(callback)
+
+        self.assertTrue(register_middleware(Context(), hub=NativeDeviceToolHub(
+            profile_session_validator=lambda profile, session: True,
+        )))
+        self.assertTrue(available())
+        unload[0]()
+        self.assertFalse(available())
+        self.assertEqual(callbacks[0][0], "tool_execution")
+
+    def test_registration_unload_retires_native_channels(self) -> None:
+        callbacks = []
+        unload = []
+
+        class Context:
+            profile_name = "default"
+
+            def register_middleware(self, kind, callback):
+                callbacks.append((kind, callback))
+
+            def on_unload(self, callback):
+                unload.append(callback)
+
+        hub = NativeDeviceToolHub(profile_session_validator=lambda _profile, _session: True)
+        fields = channel_fields()
+        owner = Owner()
+        hub.connect(owner, fields)
+        self.assertTrue(register_middleware(Context(), hub=hub))
+        unload[0]()
+        self.assertFalse(available())
+        with self.assertRaises(NativeDeviceToolError) as error:
+            hub.poll(owner, {"channelId": fields["channelId"], "after": 0})
+        self.assertEqual(error.exception.code, "phone_unavailable")
+
+    async def test_middleware_uses_official_ids_and_does_not_accept_model_identity(self) -> None:
+        clock = Clock()
+        hub = NativeDeviceToolHub(
+            clock=clock, profile_session_validator=lambda profile, session: True,
+        )
+        owner = Owner()
+        fields = channel_fields()
+        hub.connect(owner, fields)
+        callbacks: list = []
+
+        class Context:
+            profile_name = "default"
+
+            def register_middleware(self, kind, callback):
+                callbacks.append((kind, callback))
+
+        self.assertTrue(register_middleware(Context(), hub=hub))
+        self.assertEqual(callbacks[0][0], "tool_execution")
+        callback = callbacks[0][1]
+        with patch.dict(sys.modules, {
+            "model_tools": SimpleNamespace(_run_async=lambda coroutine: asyncio.run(coroutine)),
+        }):
+            task = asyncio.create_task(asyncio.to_thread(callback,
+                tool_name="iphone_calendar",
+                args={"operation": "list", "sessionId": "forged", "deviceId": "forged",
+                      "start": "2026-01-01T00:00:00Z", "end": "2026-01-01T01:00:00Z", "timeZone": "UTC"},
+                original_args={},
+                session_id="stored-session",
+                turn_id="official-turn",
+                tool_call_id="official-call",
+                next_call=lambda: self.fail("native channel must terminate the chain"),
+            ))
+            await asyncio.sleep(0)
+            request = hub.poll(owner, fields, after=0)["requests"][0]["request"]
+            self.assertEqual(request["sessionId"], "stored-session")
+            self.assertEqual(request["turnId"], "official-turn")
+            self.assertEqual(request["operation"], "calendar.list")
+            result = device_tool_result(request=request, status="completed", payload={"items": []}, sent_at=clock.value)
+            hub.accept_result(owner, fields, result)
+            self.assertEqual(json.loads(await task)["payload"], {"items": []})
+
+    async def test_middleware_falls_through_to_legacy_link_only_without_native_lease(self) -> None:
+        callbacks: list = []
+
+        class Context:
+            profile_name = "default"
+
+            def register_middleware(self, kind, callback):
+                callbacks.append((kind, callback))
+
+        hub = NativeDeviceToolHub(profile_session_validator=lambda _profile, _session: True)
+        self.assertTrue(register_middleware(Context(), hub=hub, fallback_to_link=True))
+        captured: list = []
+
+        def downstream(payload=None):
+            effective = {"operation": "list"} if payload is None else payload
+            captured.append(effective)
+            return {"legacy": effective}
+        result = callbacks[0][1](
+            tool_name="iphone_calendar",
+            args={"operation": "list"},
+            original_args={"operation": "list"},
+            session_id="no-native-lease",
+            turn_id="turn-legacy",
+            tool_call_id="call-legacy",
+            next_call=downstream,
+        )
+        self.assertEqual(result, {"legacy": {"operation": "list"}})
+        self.assertEqual(captured, [{"operation": "list"}])
+
+    async def test_coalesced_waiter_cancellation_does_not_cancel_shared_request(self) -> None:
+        clock = Clock()
+        hub = NativeDeviceToolHub(
+            clock=clock,
+            profile_session_validator=lambda profile, session: profile == "default" and session == "stored-session",
+        )
+        owner = Owner()
+        fields = channel_fields()
+        hub.connect(owner, fields)
+        kwargs = dict(
+            profile="default", session_id="stored-session", turn_id="turn-shared",
+            tool_call_id="call-shared", operation="calendar.list", arguments={
+                "start": "2026-01-01T00:00:00Z", "end": "2026-01-01T01:00:00Z", "timeZone": "UTC",
+            },
+        )
+        first = asyncio.create_task(hub.execute(**kwargs))
+        await asyncio.sleep(0)
+        second = asyncio.create_task(hub.execute(**kwargs))
+        await asyncio.sleep(0)
+        second.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await second
+        request = hub.poll(owner, fields, after=0)["requests"][0]["request"]
+        hub.accept_result(owner, fields, device_tool_result(
+            request=request, status="completed", payload={"items": []}, sent_at=clock.value,
+        ))
+        self.assertEqual((await first)["status"], "completed")
+
+    async def test_duplicate_call_coalesces_across_two_worker_event_loops(self) -> None:
+        clock = Clock()
+        hub = NativeDeviceToolHub(
+            clock=clock,
+            profile_session_validator=lambda profile, session: profile == "default" and session == "stored-session",
+        )
+        owner = Owner()
+        fields = channel_fields()
+        hub.connect(owner, fields)
+        kwargs = dict(
+            profile="default", session_id="stored-session", turn_id="turn-cross-loop",
+            tool_call_id="call-cross-loop", operation="calendar.list", arguments={
+                "start": "2026-01-01T00:00:00Z", "end": "2026-01-01T01:00:00Z", "timeZone": "UTC",
+            },
+        )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(lambda: asyncio.run(hub.execute(**kwargs)))
+            deadline = asyncio.get_running_loop().time() + 1.0
+            while not hub.channels[fields["channelId"]].pending and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.005)
+            self.assertTrue(hub.channels[fields["channelId"]].pending)
+            second = pool.submit(lambda: asyncio.run(hub.execute(**kwargs)))
+            while (
+                next(iter(hub.channels[fields["channelId"]].pending.values())).waiters < 2
+                and asyncio.get_running_loop().time() < deadline
+            ):
+                await asyncio.sleep(0.005)
+            try:
+                self.assertEqual(next(iter(hub.channels[fields["channelId"]].pending.values())).waiters, 2)
+                request = next(iter(hub.channels[fields["channelId"]].pending.values())).request
+                hub.accept_result(owner, fields, device_tool_result(
+                    request=request, status="completed", payload={"items": []}, sent_at=clock.value,
+                ))
+                self.assertEqual(first.result(timeout=2)["status"], "completed")
+                self.assertEqual(second.result(timeout=2)["status"], "completed")
+            finally:
+                if not first.done() or not second.done():
+                    hub.close(owner, fields)
+
+    def test_official_execution_middleware_consumes_native_async_work_before_returning(self) -> None:
+        from hermes_cli import middleware
+
+        callbacks: list = []
+
+        class Context:
+            profile_name = "default"
+
+            def register_middleware(self, kind, callback):
+                callbacks.append((kind, callback))
+
+        class Hub:
+            def native_channel_count(self, profile, session_id):
+                return 1
+
+            async def execute(self, **kwargs):
+                return {
+                    "version": 1,
+                    "type": "device.tool.result",
+                    "status": "completed",
+                    "payload": {"items": []},
+                }
+
+        self.assertTrue(register_middleware(Context(), hub=Hub()))
+        callback = callbacks[-1][1]
+        manager = SimpleNamespace(_middleware={"tool_execution": [callback]})
+        with patch.dict(sys.modules, {
+            "model_tools": SimpleNamespace(_run_async=lambda coroutine: asyncio.run(coroutine)),
+        }), patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
+            value = middleware.run_tool_execution_middleware(
+                "iphone_calendar", {"operation": "list"}, lambda _args: "downstream",
+                session_id="stored-session", turn_id="turn-official", tool_call_id="call-official",
+            )
+        self.assertIsInstance(value, str)
+        self.assertEqual(json.loads(value)["status"], "completed")
+
+    def test_native_execution_bridge_failure_does_not_fall_through(self) -> None:
+        callbacks: list = []
+
+        class Context:
+            profile_name = "default"
+
+            def register_middleware(self, kind, callback):
+                callbacks.append((kind, callback))
+
+        class Hub:
+            def native_channel_count(self, profile, session_id):
+                return 1
+
+            async def execute(self, **kwargs):
+                return {"status": "completed"}
+
+        self.assertTrue(register_middleware(Context(), hub=Hub()))
+
+        def broken_run_async(coroutine):
+            coroutine.close()
+            raise RuntimeError("bridge stopped")
+
+        with patch.dict(sys.modules, {
+            "model_tools": SimpleNamespace(_run_async=broken_run_async),
+        }):
+            value = callbacks[0][1](
+                tool_name="iphone_calendar", args={"operation": "list"},
+                session_id="stored-session", turn_id="turn-bridge", tool_call_id="call-bridge",
+                next_call=lambda _args=None: self.fail("active native lease must not fall through"),
+            )
+        self.assertEqual(json.loads(value)["code"], "phone_unavailable")
+
+
+if __name__ == "__main__":
+    unittest.main()

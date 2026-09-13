@@ -16,8 +16,8 @@ host-grant or provider-person/process-profile context and fixed data-only card-t
 Loopdy account. Existing forms, attachments and host-granted Files routes are
 reused. [Native Wiki](docs/NATIVE_WIKI.md) uses verified Hermes login and
 principal/profile-scoped connections, without another pairing or device-key
-ceremony. Phone tools and personalized hosted-group context still have separate
-unresolved provenance gates; this is not complete native parity.
+ceremony. Native iPhone tools use a foreground device channel on the same Hermes dashboard
+connection. Personalized hosted-group context retains its separate provenance gates.
 Supported current-main hosts can also expose opt-in, view-scoped
 [room tool observations](docs/NATIVE_ROOM_ACTIVITY.md), with explicit loss/reset
 semantics rather than durable replay or inferred tool success.
@@ -57,7 +57,7 @@ All notification provider modes support proactive messages even when no chat ses
 
 ## Hermes runtime compatibility
 
-Loopdy 2.13.1 supports the Hermes 0.21.1 baseline as well as 0.21.2. New
+Loopdy 2.14.0 supports the Hermes 0.21.1 baseline as well as 0.21.2. New
 optional features use the runtime's published capabilities, rather than making
 the entire plugin require the newest Hermes release. The manifest lists baseline
 hooks; room-member activity is registered only when Hermes advertises
@@ -86,10 +86,27 @@ removal policy enabled; no deprecated-import override is required.
 Ordinary Link chat does not require the optional Hermes `ToolExecutionContext`
 extension. The adapter adds the runtime-only context argument only when the host
 exports its context type and `MessageEvent` accepts that field. Hosts without
-both parts keep normal chat, attachment and busy-input routing; the iPhone tool
-registrations remain unavailable rather than falling back to unverified metadata.
-Do not patch Hermes core to enable those tools. Installation and gateway restart
-are separate steps when applying this compatibility fix.
+both parts keep normal chat, attachment and busy-input routing. Native iPhone
+Health, Calendar, and Reminders tools use Hermes' public `tool_execution`
+middleware when available, with the actual session, turn, and tool-call IDs.
+The plugin advertises `native-device-tools-v1` only when that integration is
+registered. It does not reconstruct tool authority from model arguments or
+require a Hermes core patch.
+
+## Live Voice and iPhone access setup
+
+Codex Live Voice needs the Loopdy plugin and a Codex subscription signed in on
+the Hermes host. The iOS Voice settings page checks the selected host and offers
+to install or enable the plugin. Delegated work uses the ordinary native Hermes
+chat connection; notifications are optional.
+
+Device access settings offer the same plugin setup for Health, Calendar, and
+Reminders. Plugin installation grants no iOS permissions. The user separately
+chooses which data and operations to allow on this iPhone for the selected host.
+Keep Loopdy in the foreground while an agent uses the phone. Closing the chat,
+changing hosts or permissions, locking the device, or moving to the background
+retires its device channel. An expired or uncertain phone request is not replayed.
+No cloud account, relay, or notification enrollment is required for this channel.
 
 ## Release 2.11.2 iPhone tool delivery
 

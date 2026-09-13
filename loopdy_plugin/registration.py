@@ -198,8 +198,20 @@ def register(
             gateway_client=selected_gateway_client,
         ),
     )
-    if _device_tools_supported():
-        register_device_tools(ctx, bridge=device_tool_bridge)
+    # Hermes 0.21.2 removed the optional ToolExecutionContext carried by
+    # MessageEvent. When the public execution-middleware surface is present,
+    # Loopdy's native phone channel owns the tool call and receives Hermes'
+    # authentic hook IDs. Older hosts retain their verified Link path, and a
+    # native middleware callback falls through to that path when no native
+    # phone lease is active.
+    legacy_device_tools = _device_tools_supported()
+    from .native_device_tools import register_middleware as register_native_device_tools
+    native_device_tools = register_native_device_tools(ctx, fallback_to_link=legacy_device_tools)
+    if legacy_device_tools or native_device_tools:
+        register_device_tools(
+            ctx,
+            bridge=device_tool_bridge if legacy_device_tools else None,
+        )
     register_marketplace_publish_skill(ctx)
 
     ctx.register_platform(

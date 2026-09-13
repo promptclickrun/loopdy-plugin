@@ -119,6 +119,12 @@ def native_context(request: Request) -> NativeContext:
             set_hermes_home_override, reset_hermes_home_override,
         )):
             features.extend(("native-card-templates-v1", "native-voice-v1"))
+    try:
+        from .native_device_tools import CAPABILITY as device_tools_capability, available as device_tools_available
+        if device_tools_available():
+            features.append(device_tools_capability)
+    except ImportError:
+        pass
     from .room_activity import CAPABILITY, activity_hub
     if activity_hub().available:
         features.append(CAPABILITY)

@@ -542,8 +542,12 @@ def register_middleware(
     Hermes invokes execution middleware from synchronous tool dispatch.  The
     callback therefore resolves the native hub coroutine through Hermes'
     supported ``model_tools._run_async`` bridge before returning a JSON tool
-    result.  On hosts that still expose the old Link context, an absent native
-    lease falls through exactly once to the downstream Link handler.
+    result.  An absent native lease remains a truthful phone-unavailable
+    result; the legacy Link bridge is registered separately when supported.
+
+    ``fallback_to_link`` is retained for compatibility with older callers, but
+    is intentionally ignored because native phone calls must never cross into
+    a different transport when their lease is absent.
 
     Hermes capability probes may expose middleware registration without the
     host-owned ``on_unload`` lifecycle.  Those probes can inspect the callback,
@@ -573,13 +577,6 @@ def register_middleware(
             next_call = kwargs.get("next_call")
             return next_call() if callable(next_call) else None
         session_id = kwargs.get("session_id", "")
-        # Native is authoritative whenever a phone lease is selected.  A
-        # missing lease may use the old Link bridge on compatible Hermes
-        # versions; ambiguity and native authorization failures never reroute.
-        if selected_hub.native_channel_count(profile, session_id) == 0 and fallback_to_link:
-            next_call = kwargs.get("next_call")
-            if callable(next_call):
-                return next_call()
         try:
             operation, arguments = _operation_for_tool(tool_name, kwargs.get("args"))
             import model_tools

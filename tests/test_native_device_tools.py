@@ -362,7 +362,7 @@ class MiddlewareTests(unittest.IsolatedAsyncioTestCase):
             hub.accept_result(owner, fields, result)
             self.assertEqual(json.loads(await task)["payload"], {"items": []})
 
-    async def test_middleware_falls_through_to_legacy_link_only_without_native_lease(self) -> None:
+    async def test_middleware_fails_closed_without_native_lease_even_with_legacy_support(self) -> None:
         callbacks: list = []
 
         class Context:
@@ -376,20 +376,23 @@ class MiddlewareTests(unittest.IsolatedAsyncioTestCase):
         captured: list = []
 
         def downstream(payload=None):
-            effective = {"operation": "list"} if payload is None else payload
-            captured.append(effective)
-            return {"legacy": effective}
-        result = callbacks[0][1](
-            tool_name="iphone_calendar",
-            args={"operation": "list"},
-            original_args={"operation": "list"},
-            session_id="no-native-lease",
-            turn_id="turn-legacy",
-            tool_call_id="call-legacy",
-            next_call=downstream,
-        )
-        self.assertEqual(result, {"legacy": {"operation": "list"}})
-        self.assertEqual(captured, [{"operation": "list"}])
+            captured.append(payload)
+            return {"legacy": payload}
+        with patch.dict(sys.modules, {
+            "model_tools": SimpleNamespace(_run_async=lambda coroutine: asyncio.run(coroutine)),
+        }):
+            result = await asyncio.to_thread(callbacks[0][1],
+                tool_name="iphone_calendar",
+                args={"operation": "list"},
+                original_args={"operation": "list"},
+                session_id="no-native-lease",
+                turn_id="turn-legacy",
+                tool_call_id="call-legacy",
+                next_call=downstream,
+            )
+        self.assertIsInstance(result, str)
+        self.assertEqual(json.loads(result)["code"], "phone_unavailable")
+        self.assertEqual(captured, [])
 
     async def test_coalesced_waiter_cancellation_does_not_cancel_shared_request(self) -> None:
         clock = Clock()

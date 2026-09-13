@@ -77,6 +77,35 @@ class LiveVoiceTransportTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LiveVoiceProviderTests(unittest.TestCase):
+    def test_subscription_instructions_cover_delegation_and_continued_turns(self):
+        from loopdy_plugin.live_voice_provider import CodexLiveProvider, DEFAULT_INSTRUCTIONS
+
+        provider = CodexLiveProvider(auth=_Auth())
+        payload = provider._create_payload(
+            "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
+            DEFAULT_INSTRUCTIONS,
+            "cove",
+            (),
+        )
+        instructions = payload["session"]["instructions"].lower()
+        for phrase in (
+            "current information",
+            "calendar",
+            "reminders",
+            "health questions",
+            "delegate before answering",
+            "do not guess",
+            "keep listening for later utterances",
+            "queued for the next free speaking moment",
+            "does not end the call",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, instructions)
+        for phrase in ("greetings", "small talk", "brief clarification", "repeating a verified result"):
+            with self.subTest(non_delegated=phrase):
+                self.assertIn(phrase, instructions)
+        self.assertEqual(payload["session"]["delegation"], {"type": "client", "ack_filler": False})
+
     def test_subscription_delegation_preserves_opaque_identity_and_task(self):
         from loopdy_plugin.live_voice_provider import CodexLiveProvider
         event = CodexLiveProvider.decode_event({

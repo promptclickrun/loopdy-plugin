@@ -24,7 +24,10 @@ class HomeWorkCompletionTests(unittest.TestCase):
         from loopdy_plugin.activity_bridge import LinkActivityBroker
         from loopdy_plugin.registration import register
         from loopdy_plugin.store import LoopdyStore
-        from tests.test_registration import _Context, _Service
+        if __package__:
+            from .test_registration import _Context, _Service
+        else:
+            from test_registration import _Context, _Service
 
         with tempfile.TemporaryDirectory() as directory:
             store = LoopdyStore(Path(directory) / "events.sqlite3")
@@ -69,7 +72,10 @@ class HomeWorkCompletionTests(unittest.TestCase):
         from loopdy_plugin.activity_bridge import LinkActivityBroker
         from loopdy_plugin.registration import register
         from loopdy_plugin.store import LoopdyStore
-        from tests.test_registration import _Context, _Service
+        if __package__:
+            from .test_registration import _Context, _Service
+        else:
+            from test_registration import _Context, _Service
 
         with tempfile.TemporaryDirectory() as directory:
             service, context = _Service(), _Context()

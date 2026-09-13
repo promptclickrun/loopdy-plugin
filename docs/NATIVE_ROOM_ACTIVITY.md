@@ -3,7 +3,12 @@
 This optional adapter consumes the public current-main Hermes
 `on_room_member_activity` observer. It uses no private session/task dictionaries,
 hidden-session subscriptions, new WebSocket, scheduler or model execution loop.
-It is unavailable on released Hermes versions without the hook.
+Installing this plugin revision requires a Hermes host whose public
+`VALID_HOOKS` includes `on_room_member_activity`. Hermes Plugin Doctor validates
+the declared hook and rejects older hosts, even though runtime registration is
+conditional. Upgrade such a host through its normal Hermes update workflow
+before installing this revision. The runtime guard below does not establish
+installation compatibility with hosts that lack the hook.
 
 The enabled plugin registers only when the hook appears in public `VALID_HOOKS`;
 `register_hook` accepting a name alone does not prove support. Unload retires the

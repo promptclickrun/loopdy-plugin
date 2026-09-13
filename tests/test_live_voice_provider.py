@@ -97,9 +97,9 @@ class LiveVoiceProviderTests(unittest.TestCase):
 
     def test_results_use_speakable_quicksilver_channel(self):
         from loopdy_plugin.live_voice_provider import CodexLiveProvider
-        frames = CodexLiveProvider.result_frames("delegation_fixture_a", "Finished: " + "🧑🏾‍💻" * 150)
+        frames = CodexLiveProvider.result_frames("delegation_fixture_a", "Finished: " + "🧑🏾\u200d💻" * 150)
         self.assertGreater(len(frames), 1)
-        self.assertEqual("".join(x["content"][0]["text"] for x in frames), "Finished: " + "🧑🏾‍💻" * 150)
+        self.assertEqual("".join(x["content"][0]["text"] for x in frames), "Finished: " + "🧑🏾\u200d💻" * 150)
         for frame in frames:
             self.assertEqual(frame["type"], "delegation.context.append")
             self.assertEqual(frame["delegation_item_id"], "delegation_fixture_a")

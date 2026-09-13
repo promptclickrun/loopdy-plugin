@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import uuid
 from unittest.mock import patch
 
 from loopdy_plugin import native_context, native_wiki_api
@@ -70,7 +71,7 @@ class NativeWikiTests(unittest.TestCase):
                          "data": base64.b64encode(content[:65536]).decode()})
         self.assertEqual(first.json()["nextOffset"], 65536)
         self.fixture.provider.tokens["another-device"] = replace(self.fixture.provider.alice,
-                                                                  access_token="different-device-token")
+                                                                  access_token=uuid.uuid4().hex)
         self.assertEqual(self.call("roots", token="another-device").json(), {"roots": [root]})
         status = self.call("save/status", {"operationId": "native-save"}, token="another-device")
         self.assertEqual(status.json()["nextOffset"], 65536)
@@ -142,7 +143,7 @@ class NativeWikiTests(unittest.TestCase):
         self.assertEqual(self.call("save/begin", new).status_code, 200)
         self.assertEqual(self.call("save/commit", {"operationId": "create-page"}).json()["status"], "committed")
         self.assertEqual((self.root / "new.md").read_bytes(), b"")
-        for path in ("../index.md", "/etc/passwd", ".env"):
+        for path in ("../index.md", str(self.root / "index.md"), ".env"):
             self.assertGreaterEqual(self.read(path=path).status_code, 400)
         (self.root / "alias.md").symlink_to(self.root / "index.md")
         self.assertGreaterEqual(self.read(path="alias.md").status_code, 400)

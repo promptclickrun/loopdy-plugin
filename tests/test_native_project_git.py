@@ -144,7 +144,7 @@ class NativeProjectGitTests(unittest.TestCase):
         self.assertEqual(result.status_code, 422)
         self.assertEqual(result.json()["error"]["code"], "sensitive_data_blocked")
         (self.root / "file.txt").write_text("safe\n")
-        for path in ("../escape", "/etc/passwd", ".git/config"):
+        for path in ("../escape", str(self.root / "file.txt"), ".git/config"):
             self.assertGreaterEqual(self.diff(self.status()["statusToken"], path=path).status_code, 400)
         (self.root / ".env").write_text("not-a-secret\n")
         result = self.call("status")

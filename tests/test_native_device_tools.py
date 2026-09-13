@@ -14,7 +14,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from starlette.datastructures import Headers, QueryParams
+
 from loopdy_plugin.link_contracts import device_tool_result
+from loopdy_plugin.native_context import NativeContext
 from loopdy_plugin.native_device_tools import (
     NativeDeviceToolError,
     NativeDeviceToolHub,
@@ -620,6 +623,7 @@ class LoaderNamespaceTests(unittest.TestCase):
 
         scoped_name = "hermes_plugins.loopdy.loopdy_plugin.native_device_tools"
         marker = object()
+        captured: dict[str, object] = {}
 
         class ScopedModule:
             __name__ = scoped_name
@@ -628,7 +632,8 @@ class LoaderNamespaceTests(unittest.TestCase):
             _registered_profile = "default"
 
             @staticmethod
-            async def request(operation, request):
+            async def request(operation, request, **kwargs):
+                captured.update(kwargs)
                 return marker
 
         owner = SimpleNamespace(serving_profile_id="default")
@@ -636,6 +641,100 @@ class LoaderNamespaceTests(unittest.TestCase):
              patch.object(native_api, "native_context", return_value=owner):
             value = asyncio.run(native_api.device_tools("poll", object()))
         self.assertIs(value, marker)
+        self.assertIs(captured["owner"], owner)
+        self.assertIs(captured["auth_module"], native_api)
+
+    def test_scoped_request_reuses_bare_auth_context_for_real_channel_lifecycle(self) -> None:
+        """The mounted dashboard route and Hermes middleware have distinct module IDs."""
+        import importlib
+        import importlib.util
+        import types
+
+        from loopdy_plugin import native_api, native_context
+
+        root = Path(__file__).resolve().parents[1] / "loopdy_plugin"
+        namespace = f"hermes_plugins.loopdy_test_{uuid.uuid4().hex}"
+        package = namespace + ".loopdy_plugin"
+        module_name = package + ".native_device_tools"
+        created_namespace = False
+        if "hermes_plugins" not in sys.modules:
+            parent_module = types.ModuleType("hermes_plugins")
+            parent_module.__path__ = []
+            parent_module.__package__ = "hermes_plugins"
+            sys.modules["hermes_plugins"] = parent_module
+            created_namespace = True
+        scoped_parent = types.ModuleType(namespace)
+        scoped_parent.__path__ = []
+        scoped_parent.__package__ = namespace
+        scoped_package = types.ModuleType(package)
+        scoped_package.__path__ = [str(root)]
+        scoped_package.__package__ = package
+        sys.modules[namespace] = scoped_parent
+        sys.modules[package] = scoped_package
+        try:
+            spec = importlib.util.spec_from_file_location(
+                module_name, root / "native_device_tools.py")
+            self.assertIsNotNone(spec)
+            self.assertIsNotNone(spec.loader)
+            scoped_module = importlib.util.module_from_spec(spec)
+            scoped_module.__package__ = package
+            sys.modules[module_name] = scoped_module
+            spec.loader.exec_module(scoped_module)
+            scoped_context = importlib.import_module(package + ".native_context")
+            self.assertNotEqual(native_context.RUNTIME_ID, scoped_context.RUNTIME_ID)
+
+            owner = NativeContext(
+                None, None, None, "default", (scoped_module.CAPABILITY,),
+                native_context.RUNTIME_ID,
+            )
+
+            class Request:
+                def __init__(self, payload: dict, etag: str) -> None:
+                    self.query_params = QueryParams()
+                    self.headers = Headers({
+                        "content-type": "application/json",
+                        "if-match": etag,
+                        "x-loopdy-request-id": str(uuid.uuid4()),
+                    })
+                    self.payload = payload
+
+                async def stream(self):
+                    yield json.dumps(self.payload, separators=(",", ":")).encode("utf-8")
+
+            fields = channel_fields(session_id="stored-session")
+            scoped_module._HUB = scoped_module.NativeDeviceToolHub(
+                profile_session_validator=lambda _profile, _session: True,
+            )
+            with patch.object(scoped_module, "available", return_value=True), \
+                 patch.object(native_api, "native_context", return_value=owner):
+                connected = asyncio.run(scoped_module.request(
+                    "connect", Request(fields, owner.etag), owner=owner, auth_module=native_api))
+                self.assertEqual(json.loads(connected.body), {
+                    "channelId": fields["channelId"], "connected": True,
+                })
+
+                polled = asyncio.run(scoped_module.request(
+                    "poll", Request({"channelId": fields["channelId"], "after": 0}, owner.etag),
+                    owner=owner, auth_module=native_api))
+                self.assertEqual(json.loads(polled.body), {
+                    "channelId": fields["channelId"], "next": 0, "requests": [],
+                })
+
+                stale_owner = NativeContext(
+                    None, None, None, "default", (scoped_module.CAPABILITY,),
+                    scoped_context.RUNTIME_ID,
+                )
+                with self.assertRaises(native_api.NativeAPIError) as error:
+                    asyncio.run(scoped_module.request(
+                        "poll", Request({"channelId": fields["channelId"], "after": 0}, stale_owner.etag),
+                        owner=owner, auth_module=native_api))
+                self.assertEqual(error.exception.code, "context_changed")
+        finally:
+            for name in tuple(sys.modules):
+                if name == namespace or name.startswith(namespace + "."):
+                    sys.modules.pop(name, None)
+            if created_namespace:
+                sys.modules.pop("hermes_plugins", None)
 
 
 if __name__ == "__main__":

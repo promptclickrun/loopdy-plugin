@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sys
 from typing import Any, TypeVar
 
 from fastapi import APIRouter, Request
@@ -76,7 +77,13 @@ async def device_tools(operation: str, request: Request) -> Response:
     owner = native_context(request)
     implementation = native_device_tools._implementation_for_profile(owner.serving_profile_id)
     if implementation is not None and implementation is not native_device_tools:
-        return await implementation.request(operation, request)
+        # The dashboard router is mounted from the bare plugin package while
+        # Hermes middleware owns a profile-scoped package.  Reuse the bare
+        # request's authenticated context and ETag for the scoped hub; asking
+        # the scoped package to resolve context again would create a different
+        # module runtime ID and reject every phone request as context_changed.
+        return await implementation.request(
+            operation, request, owner=owner, auth_module=sys.modules[__name__])
     return await native_device_tools.request(operation, request)
 
 

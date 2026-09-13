@@ -2,7 +2,7 @@ manifest_version: 1
 name: loopdy
 label: Loopdy
 kind: platform
-version: "2.14.3"
+version: "2.14.4"
 license: Apache-2.0
 description: >
   Native authenticated Hermes workspace controls, media voice, approvals, and

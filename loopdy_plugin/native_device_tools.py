@@ -719,10 +719,29 @@ class _Result(_Scope):
     result: dict[str, Any]
 
 
-async def request(operation: str, request: Any) -> Any:
-    """Serve one native device-tool operation through the shared native auth gate."""
-    from .native_api import _body, _precondition, _response
-    from .native_context import NativeAPIError, native_context
+async def request(
+    operation: str,
+    request: Any,
+    *,
+    owner: Any | None = None,
+    auth_module: Any | None = None,
+) -> Any:
+    """Serve one native device-tool operation through the shared native auth gate.
+
+    The dashboard API can dispatch into a profile-scoped copy of this module.
+    In that case it passes the already authenticated bare-router owner and its
+    request helpers so the scoped hub does not manufacture a second runtime
+    identity or ETag for the same HTTP request.
+    """
+    if auth_module is None:
+        from .native_api import _body, _precondition, _response
+        from .native_context import NativeAPIError, native_context
+    else:
+        _body = auth_module._body
+        _precondition = auth_module._precondition
+        _response = auth_module._response
+        NativeAPIError = auth_module.NativeAPIError
+        native_context = auth_module.native_context
 
     models: dict[str, type[BaseModel]] = {
         "connect": _Connect,
@@ -732,7 +751,8 @@ async def request(operation: str, request: Any) -> Any:
     }
     if operation not in models:
         raise NativeAPIError(404, "unknown_device_tool_operation", "The device-tool operation is unknown.")
-    owner = native_context(request)
+    if owner is None:
+        owner = native_context(request)
     request_id = _precondition(request, owner)
     if CAPABILITY not in owner.features or not available():
         raise NativeAPIError(503, "device_tools_unavailable", "Native device tools are unavailable.")

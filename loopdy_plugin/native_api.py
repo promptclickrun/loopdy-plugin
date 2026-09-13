@@ -68,8 +68,16 @@ async def voice(operation: str, request: Request) -> Response:
 
 @router.post("/device-tools/{operation}")
 async def device_tools(operation: str, request: Request) -> Response:
-    from .native_device_tools import request as device_tools_request
-    return await device_tools_request(operation, request)
+    from . import native_device_tools
+    # The dashboard API is imported under ``loopdy_plugin`` while Hermes loads
+    # the plugin under its profile-safe ``hermes_plugins.<slug>`` namespace.
+    # Dispatch into the loader-owned module so HTTP and middleware share one
+    # hub, and keep the profile boundary explicit for multiplexed dashboards.
+    owner = native_context(request)
+    implementation = native_device_tools._implementation_for_profile(owner.serving_profile_id)
+    if implementation is not None and implementation is not native_device_tools:
+        return await implementation.request(operation, request)
+    return await native_device_tools.request(operation, request)
 
 
 class _Body(BaseModel):

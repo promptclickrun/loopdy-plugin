@@ -601,7 +601,7 @@ def register_middleware(
         return False
     on_unload = getattr(ctx, "on_unload", None)
     if callable(on_unload):
-        _set_registered(True)
+        _set_registered(True, profile)
 
         def unload() -> None:
             retire = getattr(selected_hub, "close_all", None)
@@ -609,7 +609,7 @@ def register_middleware(
                 if callable(retire):
                     retire()
             finally:
-                _set_registered(False)
+                _set_registered(False, profile)
 
         on_unload(unload)
     # A host without lifecycle cleanup is deliberately unsupported for native
@@ -620,16 +620,67 @@ def register_middleware(
 
 _HUB = NativeDeviceToolHub()
 _registered = False
+_registered_profile: str | None = None
+_MODULE_ORIGIN = Path(__file__).resolve()
 
 
-def _set_registered(value: bool) -> None:
-    global _registered
+def _set_registered(value: bool, profile: str | None = None) -> None:
+    global _registered, _registered_profile
     _registered = bool(value)
+    _registered_profile = profile if _registered else None
 
 
-def available() -> bool:
-    """Whether registration installed a working native middleware path."""
-    return _registered
+def _implementation_for_profile(profile: str | None) -> Any | None:
+    """Find the middleware module owned by the active Hermes plugin loader.
+
+    Hermes intentionally imports directory plugins under a profile-safe
+    ``hermes_plugins.<slug>`` namespace.  Dashboard API modules are mounted
+    from disk and import the same package under its bare name.  Keep the
+    dashboard side pointed at the loader-owned implementation so its requests
+    use the middleware's hub, while matching the serving profile to prevent a
+    multiplexed process from crossing profile state.  Multiple matching
+    generations are treated as unavailable until Hermes retires the stale one.
+    """
+    if not isinstance(profile, str) or not profile:
+        return None
+    current = sys.modules.get(__name__)
+    candidates: list[Any] = []
+    if (
+        current is not None
+        and _registered
+        and _registered_profile == profile
+    ):
+        candidates.append(current)
+    for name, module in tuple(sys.modules.items()):
+        if module is current or not name.endswith(".native_device_tools"):
+            continue
+        try:
+            origin = Path(getattr(module, "__file__", "")).resolve()
+        except (OSError, RuntimeError, TypeError, ValueError):
+            continue
+        if origin != _MODULE_ORIGIN:
+            continue
+        if getattr(module, "_registered", False) is not True:
+            continue
+        if getattr(module, "_registered_profile", None) != profile:
+            continue
+        candidates.append(module)
+    # A forced reload can briefly leave two registered generations in one
+    # process.  Refuse to route by import order until the host's lifecycle has
+    # retired one of them.
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def available(profile: str | None = None) -> bool:
+    """Whether registration installed a working native middleware path.
+
+    With a profile, resolve the loader-owned namespace used by the current
+    dashboard process.  The no-argument form remains a local registration
+    probe for compatibility with focused tests and host feature probes.
+    """
+    if profile is None:
+        return _registered
+    return _implementation_for_profile(profile) is not None
 
 
 class _Scope(BaseModel):

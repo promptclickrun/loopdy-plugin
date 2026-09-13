@@ -525,5 +525,76 @@ class MiddlewareTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(value)["code"], "phone_unavailable")
 
 
+class LoaderNamespaceTests(unittest.TestCase):
+    def test_dashboard_module_resolves_loader_scoped_registration_by_profile(self) -> None:
+        """The dashboard API and Hermes loader import the package under different names."""
+        from loopdy_plugin import native_device_tools as dashboard_module
+
+        scoped_name = "hermes_plugins.loopdy.loopdy_plugin.native_device_tools"
+        scoped_module = SimpleNamespace(
+            __name__=scoped_name,
+            __file__=dashboard_module.__file__,
+            _registered=True,
+            _registered_profile="default",
+        )
+        with patch.dict(sys.modules, {scoped_name: scoped_module}):
+            self.assertIs(
+                dashboard_module._implementation_for_profile("default"),
+                scoped_module,
+            )
+            self.assertTrue(dashboard_module.available("default"))
+
+    def test_dashboard_module_does_not_cross_profile_registration(self) -> None:
+        from loopdy_plugin import native_device_tools as dashboard_module
+
+        scoped_name = "hermes_plugins.loopdy.loopdy_plugin.native_device_tools"
+        scoped_module = SimpleNamespace(
+            __name__=scoped_name,
+            __file__=dashboard_module.__file__,
+            _registered=True,
+            _registered_profile="research",
+        )
+        with patch.dict(sys.modules, {scoped_name: scoped_module}):
+            self.assertIsNone(dashboard_module._implementation_for_profile("default"))
+            self.assertFalse(dashboard_module.available("default"))
+
+    def test_dashboard_module_rejects_ambiguous_registered_generations(self) -> None:
+        from loopdy_plugin import native_device_tools as dashboard_module
+
+        modules = {
+            f"hermes_plugins.loopdy.generation_{index}.native_device_tools": SimpleNamespace(
+                __file__=dashboard_module.__file__,
+                _registered=True,
+                _registered_profile="default",
+            )
+            for index in (1, 2)
+        }
+        with patch.dict(sys.modules, modules):
+            self.assertIsNone(dashboard_module._implementation_for_profile("default"))
+            self.assertFalse(dashboard_module.available("default"))
+
+    def test_dashboard_device_route_calls_loader_owned_module(self) -> None:
+        from loopdy_plugin import native_api, native_device_tools
+
+        scoped_name = "hermes_plugins.loopdy.loopdy_plugin.native_device_tools"
+        marker = object()
+
+        class ScopedModule:
+            __name__ = scoped_name
+            __file__ = native_device_tools.__file__
+            _registered = True
+            _registered_profile = "default"
+
+            @staticmethod
+            async def request(operation, request):
+                return marker
+
+        owner = SimpleNamespace(serving_profile_id="default")
+        with patch.dict(sys.modules, {scoped_name: ScopedModule}), \
+             patch.object(native_api, "native_context", return_value=owner):
+            value = asyncio.run(native_api.device_tools("poll", object()))
+        self.assertIs(value, marker)
+
+
 if __name__ == "__main__":
     unittest.main()

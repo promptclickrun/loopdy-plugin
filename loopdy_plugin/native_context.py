@@ -120,8 +120,11 @@ def native_context(request: Request) -> NativeContext:
         )):
             features.extend(("native-card-templates-v1", "native-voice-v1"))
     try:
-        from .native_device_tools import CAPABILITY as device_tools_capability, available as device_tools_available
-        if device_tools_available():
+        from .native_device_tools import (
+            CAPABILITY as device_tools_capability,
+            available as device_tools_available,
+        )
+        if profile is not None and device_tools_available(profile):
             features.append(device_tools_capability)
     except ImportError:
         pass

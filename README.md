@@ -47,6 +47,27 @@ compatibility, but the app does not offer it for new selection.
 
 All notification provider modes support proactive messages even when no chat session is active.
 
+## Hermes runtime compatibility
+
+Loopdy 2.12.1 supports the Hermes 0.21.1 baseline as well as 0.21.2. New
+optional features use the runtime's published capabilities, rather than making
+the entire plugin require the newest Hermes release. The manifest lists baseline
+hooks; room-member activity is registered only when Hermes advertises
+`on_room_member_activity` in its supported hook registry.
+
+On a runtime without that hook, the native context omits room activity and its
+routes return an explicit unavailable response. Core plugin registration, chat,
+approvals, and card tools remain available. On a runtime with the hook, the full
+room-activity feature remains enabled. Doctor may report that this optional hook
+is registered without a manifest declaration; it still validates the hook name
+and callback against the real runtime. No scanner or Doctor checks are bypassed.
+
+Run `test_runtime_compatibility.py` and `test_plugin_update_installation.py` with
+each supported Hermes checkout, including the oldest supported one. These use
+real runtime discovery and the supported installer in disposable profiles. The
+app's native workspace protocol has its own host capability requirements;
+plugin compatibility does not imply every newer Hermes API exists on an older host.
+
 ## Host context compatibility
 
 Ordinary Link chat does not require the optional Hermes `ToolExecutionContext`
@@ -554,7 +575,8 @@ must not inherit a live profile's paired connection or personalization.
 From this repository's root, run the deterministic offline suite with the Python environment bundled with Hermes:
 
 ```bash
-PYTHONPATH=/path/to/hermes-agent:. \
+HERMES_HOME=/path/to/disposable-profile TMPDIR=/private/tmp \
+PYTHONPATH=/path/to/hermes-agent:"$PWD":"$PWD/tests" \
   /path/to/hermes-agent/venv/bin/python \
   -m unittest discover -s tests -v
 

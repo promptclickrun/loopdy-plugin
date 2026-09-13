@@ -17,6 +17,7 @@ from loopdy_plugin.native_context import NativeAPIError
 from loopdy_plugin.room_activity import RoomActivityHub, RoomScope, register_room_activity
 import test_native_api as native_fixtures
 from test_native_api import ROOT, PREFIX
+from hermes_cli.plugins import VALID_HOOKS
 
 
 SCOPE = RoomScope("room-fixture", "gateway-fixture", 1, (("alice", "default"), ("bob", "research")))
@@ -33,6 +34,7 @@ def event(**updates):
     return value
 
 
+@unittest.skipUnless(room_activity.HOOK in VALID_HOOKS, "Hermes does not provide room activity; unavailable behavior is covered by runtime compatibility tests")
 class RoomActivityTests(unittest.TestCase):
     def setUp(self):
         self.fixture = native_fixtures.NativeAPITests()
@@ -239,6 +241,7 @@ class RoomActivityTests(unittest.TestCase):
         self.assertEqual(hub.poll(stream, owner, SCOPE, 0, 8)["highWater"], 1)
 
 
+@unittest.skipUnless(room_activity.HOOK in VALID_HOOKS, "Hermes does not provide the public room observer")
 class StockRoomActivityTests(unittest.TestCase):
     def test_stock_http_auth_native_room_and_actual_public_emitter(self):
         script = r'''

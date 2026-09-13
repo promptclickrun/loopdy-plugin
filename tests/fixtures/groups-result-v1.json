@@ -1,0 +1,30 @@
+{
+  "capability": "groups-results-v1",
+  "payloadBytes": 2097152,
+  "envelopeBytes": 2101248,
+  "request": {
+    "version": 1,
+    "type": "workspace.request",
+    "requestId": "groups_fixture_request_0001",
+    "operation": "groups.log",
+    "payload": {"room_id": "room-fixture", "since_seq": 0, "limit": 2},
+    "sentAt": 1788000200,
+    "groupsResultVersion": 1
+  },
+  "result": {
+    "version": 1,
+    "type": "workspace.result",
+    "requestId": "groups_fixture_request_0001",
+    "operation": "groups.log",
+    "status": "completed",
+    "payload": {
+      "events": [],
+      "cursor": 0,
+      "latest_seq": 0,
+      "has_more": false,
+      "authority": {"gateway_id": "gateway-fixture", "epoch": 1}
+    },
+    "sentAt": 1788000201,
+    "groupsResultVersion": 1
+  }
+}

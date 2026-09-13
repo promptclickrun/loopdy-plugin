@@ -2,13 +2,40 @@
 
 Loopdy is a native Hermes platform for the Loopdy mobile app. It provides encrypted Loopdy Link chat, verified device/person context, proactive notifications, lifecycle events, approval transport, attachments, and Generative UI. Hermes remains authoritative for agents, sessions, scheduled tasks, policy, event details, and transcripts.
 
-Loopdy Link is the app's reliable chat transport. The Hermes host opens one outbound WebSocket to `https://link.loopdy.app`; the app and host encrypt chat frames with the account key before they reach the service. Pairing is proof-of-possession based and gives each host its own revocable device identity. The cloud service cannot read chat plaintext.
+Direct-first native clients use stock authenticated `hermes serve` REST and `/api/ws`.
+The plugin's [native HTTP foundation](docs/NATIVE_WORKSPACE_API.md) adds verified
+person/process-profile context and fixed data-only card-template routes without a
+Loopdy account. Existing forms, attachments and host-granted Files routes are
+reused. [Native Wiki](docs/NATIVE_WIKI.md) uses verified Hermes login and
+principal/profile-scoped connections, without another pairing or device-key
+ceremony. Phone tools and personalized hosted-group context still have separate
+unresolved provenance gates; this is not complete native parity.
+Supported current-main hosts can also expose opt-in, view-scoped
+[room tool observations](docs/NATIVE_ROOM_ACTIVITY.md), with explicit loss/reset
+semantics rather than durable replay or inferred tool success.
+The older paired **Direct listener** and **direct APNs provider** are different
+features and do not provide this native authentication path.
 
-The same paired Loopdy Link connection carries a fixed, versioned set of encrypted workspace operations for agents, Hermes Projects, sessions, scheduled tasks, per-agent defaults, approvals, events, and attachments. It is not an arbitrary HTTP proxy: every operation is explicitly allowlisted, bounded, validated, and handled through Hermes-owned Project, profile, session, cron, policy, and plugin surfaces. Agent-default reads use Hermes' native profile-scoped `config.get` and `model.options` methods, with compatibility fallback for older Hermes releases. Project creation registers one existing remote folder, archive removes only the Project registration from active catalogs, and folder suggestions return bounded directory coordinates without file contents. The app never needs a Hermes gateway origin or token after pairing.
+Native chat prompt attachments are **files-only**. Native prompt images remain
+unavailable until an official message-bound image surface is verified. Existing
+Wiki image reads and assistant artifact/image downloads do not authorize image
+uploads into native prompts; there is no custom image-upload shim or fallback.
+
+[Native Project Git](docs/NATIVE_PROJECT_GIT.md) provides fixed read-only
+capabilities/status/diff for an exact registered Project and stored session,
+including proven hidden canonical Bot Chat. It reuses content-derived tokens
+and bounded side-specific diffs; incomplete status and unsupported conflict
+diffs fail explicitly. No Files grant or Git mutation is created.
+
+Loopdy Link remains the paired account transport. The Hermes host opens one outbound WebSocket to `https://link.loopdy.app`; the app and host encrypt chat frames with the account key before they reach the service. Pairing is proof-of-possession based and gives each host its own revocable device identity. The cloud service cannot read chat plaintext.
+
+The same paired Loopdy Link connection carries a fixed, versioned set of encrypted workspace operations for agents, Hermes Projects, sessions, scheduled tasks, per-agent defaults, approvals, events, and attachments. It is not an arbitrary HTTP proxy: every operation is explicitly allowlisted, bounded, validated, and handled through Hermes-owned Project, profile, session, cron, policy, and plugin surfaces. Agent-default reads use Hermes' native profile-scoped `config.get` and `model.options` methods, with compatibility fallback for older Hermes releases. Project creation registers one existing remote folder, archive removes only the Project registration from active catalogs, and folder suggestions return bounded directory coordinates without file contents. Link-only use does not require a separate Hermes endpoint or native token after pairing. Independently saved native hosts do retain their own endpoint and native credentials.
 
 Scheduled-task output choices come from Hermes' own cron delivery-target catalog. Loopdy accepts enabled catalog targets or a validated canonical `platform:chat_id[:thread]` value and sends that value through the official cron `deliver` field.
 
-Loopdy exposes two delivery choices:
+For optional push-notification delivery, the plugin exposes two provider choices.
+These are not native chat transport choices, and neither is required for native
+Hermes login or workspace access:
 
 - `relay`, the default: a managed HTTPS relay forwards encrypted alerts to APNs. The relay is an
   authenticated delivery service only; Hermes remains authoritative for sessions, policy, and
@@ -18,7 +45,7 @@ Loopdy exposes two delivery choices:
 The older `managed` Expo provider remains accepted for stored registrations and command-line
 compatibility, but the app does not offer it for new selection.
 
-All modes support proactive messages even when no chat session is active.
+All notification provider modes support proactive messages even when no chat session is active.
 
 ## Host context compatibility
 
@@ -156,7 +183,7 @@ hermes loopdy update --restart
 
 The updater resolves this repository's `main` to an exact commit, checks the recognized existing installation, scans and validates the candidate, backs up the prior plugin, and uses Hermes' pinned installer. Pairing, credentials and configuration remain in place. Added privileged capabilities require a separate attended host approval. Modified or unrecognized installations are refused instead of overwritten.
 
-Without `--restart`, the command reports installation separately from activation. With it, one gateway restart is requested. Status survives that restart; timeouts remain unconfirmed rather than causing another restart. A compatible app exposes **Update Loopdy Plugin** in Settings with an interruption warning and checks the same durable operation until the exact new plugin runtime and authenticated Link response are verified. Closing and reopening the app does not start another update.
+Without `--restart`, the command reports installation separately from activation. With it, one gateway restart is requested. Status survives that restart; timeouts remain unconfirmed rather than causing another restart. A compatible paired-Link app exposes **Update Loopdy Plugin** in Settings with an interruption warning and checks the same durable operation until the exact new plugin runtime and authenticated Link response are verified. This Link updater contract is not a requirement for native HTTP connectivity. Closing and reopening the app does not start another update.
 
 This optional update flow needs macOS launchd or Linux user systemd. Windows and unsupported/shared-installation layouts fail closed. Earlier plugin releases require one host-side installation before the new app control can work.
 
@@ -188,15 +215,29 @@ hermes gateway restart
 
 Hermes' file installer reads Git content, so local plugin changes must be committed first.
 
-The plugin supports Hermes on Linux, macOS, and Windows. It uses Hermes' own
-cross-platform Python dependencies and profile/config writers, stores data under
-the active Hermes home directory, and opens outbound HTTPS/WebSocket connections
-only. Normal chat requires no extra service or inbound port. Optional self-update
+The plugin supports Hermes on Linux, macOS, and Windows, with individual features
+gated by host capabilities. It uses Hermes' own Python dependencies and
+profile/config writers and stores data under the active Hermes home directory.
+Paired Link chat uses outbound HTTPS/WebSocket connections without an inbound
+listener. Native HTTP routes use the operator-configured stock `hermes serve`
+listener and native authentication; they do not start another listener.
+The optional paired Direct listener is separate and still uses account lifecycle
+leases, as described in [Direct streaming](docs/DIRECT_STREAMING_AND_LIVE_VOICE.md).
+Optional self-update
 uses a separate launchd job on macOS or a user systemd unit on Linux so it can
 survive gateway restart; self-update is unavailable on unsupported hosts.
 Long-running process management remains the responsibility of the normal Hermes installation.
 
-Create or sign in to the minimal passkey-backed Loopdy account in the app. Then start host pairing:
+For native use, connect to the selected stock Hermes endpoint and authenticate
+with that host's native login. No Loopdy account or Link pairing is required.
+Installation and activation of the plugin in the serving process remain
+separate operator actions; the gateway commands above describe platform-adapter
+activation, not proof that an existing `hermes serve` process reloaded it.
+
+### Optional paired Link setup
+
+To use Link instead, create or sign in to the minimal passkey-backed Loopdy
+account in the app, then start host pairing:
 
 ```bash
 hermes loopdy link pair
@@ -218,7 +259,7 @@ encrypted payload and is shown only after the extension validates the pinned rel
 signature, recipient key, authenticated metadata, and bounded plaintext. Verification failure keeps
 the generic fallback notification and never exposes unverified content.
 
-Verify the native channel:
+Verify the optional Loopdy notification channel:
 
 ```bash
 hermes loopdy status
@@ -422,9 +463,13 @@ constrained JSON-tree and fixed native component-catalog approach.
 not claim adoption, endorsement, API compatibility, or copied code from any of
 these projects.
 
-## Native agent attachments
+## Assistant artifact and image reads
 
 Loopdy provides Hermes-parity delivery for assistant-generated images and files. The mobile client resolves assistant history through the authenticated plugin API, displays images inline, and presents other artifacts as named file cards. Downloads use the existing dashboard authentication headers or cookies with redirects disabled for token-bearing requests. Gateway credentials and local source paths are never placed in attachment URLs or returned to the client.
+
+These are host-to-client reads, not a native image-message upload contract.
+Native prompt attachments remain files-only; Wiki and artifact image reads do
+not change that boundary.
 
 Hermes native `send_image_file`, `send_document`, `send_video`, and `send_voice` callbacks are projected
 through the same policy-backed resolver. This covers media dispatched separately after streamed text;
@@ -437,7 +482,10 @@ Approved artifacts are copied into a profile-scoped durable cache and addressed 
 
 ## Approvals
 
-Installation does not activate Loopdy as an approval transport. To opt in, configure the active Hermes profile:
+Native workspace clients use Hermes' supported native approval operations and
+their exact offered scopes. They do not need to select the optional Loopdy
+approval transport below. Installation does not activate that transport; to
+opt in for the Loopdy platform, configure the active Hermes profile:
 
 ```yaml
 security:
@@ -471,7 +519,11 @@ response. It never contacts the relay and prints aggregate counts only.
 
 ## Authenticated app API
 
-Hermes mounts these routes under its normal dashboard authentication policy:
+Hermes mounts the established routes below under its normal dashboard
+authentication policy. Additional `/native/*` routes and their stricter verified
+interactive Session/context requirements are documented in
+[Native workspace API](docs/NATIVE_WORKSPACE_API.md); they do not borrow Link
+credentials.
 
 ```text
 GET    /api/plugins/loopdy/capabilities
@@ -511,7 +563,12 @@ hermes plugins doctor . --ci
 
 ## Wiki connections
 
-A compatible app can use Add Wiki to browse/type an existing safe folder and Save an account-scoped read/write connection through `wiki.connect`, without separate host approval or a Wiki device allowlist. The operation must be advertised alongside `wiki.v1`; older hosts require a plugin update. Hosts without secure descriptor-relative traversal, including Windows, omit Wiki operations. Explicit selection creates an account connection or upgrades an existing exact same-authority/profile file grant, rotating its generation when permissions change. `wiki.resolve`, reads, directory suggestions and Files grants do not create or upgrade Wiki access. Generated, mirrored and exported sources remain read-only. Nested Markdown is discovered by bounded recursive search.
+Native Wiki uses verified Hermes principal/profile authority without extra
+pairing; its exact routes, cross-device ownership and explicit disconnect are
+documented in [Native Wiki](docs/NATIVE_WIKI.md). It does not adopt Link grants.
+The following account-scoped behavior applies specifically to paired Link:
+
+A compatible paired-Link app can use Add Wiki to browse/type an existing safe folder and Save an account-scoped read/write connection through `wiki.connect`, without separate host approval or a Wiki device allowlist. The operation must be advertised alongside `wiki.v1`; older hosts require a plugin update. Hosts without secure descriptor-relative traversal, including Windows, omit Wiki operations. Explicit selection creates an account connection or upgrades an existing exact same-authority/profile file grant, rotating its generation when permissions change. `wiki.resolve`, reads, directory suggestions and Files grants do not create or upgrade Wiki access. Generated, mirrored and exported sources remain read-only. Nested Markdown is discovered by bounded recursive search.
 
 On hosted installations with a custom, non-credential-named Hermes home such as `/opt/data`, an ordinary Wiki subfolder can be selected directly from the authenticated app. The host home itself, its ancestors, credential/system folders and host-control subtrees remain excluded. The standard `~/.hermes` tree and other credential/control-named paths remain ungrantable. Directory identity, profile/authority isolation, overlapping grants and symlink protections still apply. Enter the canonical absolute folder path without a trailing slash; the request contract does not normalize paths. The durable account connection is available to replacement devices on that same paired account; device identities still fence individual in-flight save operations, not Wiki access.
 

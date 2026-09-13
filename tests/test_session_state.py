@@ -103,7 +103,7 @@ class SessionStateTests(unittest.TestCase):
         self.assertEqual([row["row_id"] for row in snapshot["messages"]], [row["id"] for row in canonical])
 
     def test_large_result_has_bounded_preview_and_lossless_explicit_content_read(self):
-        content = "👩🏽‍💻 original result\n" * 12_000
+        content = "👩🏽\u200d💻 original result\n" * 12_000
         row_id = self.db.append_message("session-one", "tool", content, tool_name="fixture", tool_call_id="call-one")
         reader = self.reader(maximum_bytes=8_192, maximum_row_bytes=2_048)
         page = reader.read(self.db, agent_id="default", stored_id="session-one")

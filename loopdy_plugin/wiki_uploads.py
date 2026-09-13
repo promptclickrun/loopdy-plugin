@@ -23,40 +23,22 @@ class WikiUploads:
 
     @staticmethod
     def _schema(connection):
-        with connection:
-            connection.executescript("""
-                CREATE TABLE IF NOT EXISTS wiki_uploads (
-                    operation_id TEXT PRIMARY KEY, authority_id TEXT NOT NULL,
-                    profile_id TEXT NOT NULL, device_id TEXT NOT NULL,
-                    wiki_id TEXT NOT NULL, generation TEXT NOT NULL, path TEXT NOT NULL,
-                    base_revision TEXT NOT NULL, total_bytes INTEGER NOT NULL,
-                    sha256 TEXT NOT NULL, binding TEXT NOT NULL,
-                    content BLOB NOT NULL, submitted INTEGER NOT NULL CHECK(submitted IN (0,1)),
-                    created_at INTEGER NOT NULL
-                );
-                CREATE TRIGGER IF NOT EXISTS wiki_upload_binding_immutable
-                BEFORE UPDATE OF operation_id,authority_id,profile_id,device_id,wiki_id,
-                    generation,path,base_revision,total_bytes,sha256,binding,created_at
-                ON wiki_uploads BEGIN SELECT RAISE(ABORT, 'immutable Wiki upload binding'); END;
-                CREATE TRIGGER IF NOT EXISTS wiki_upload_submitted_monotonic
-                BEFORE UPDATE OF submitted ON wiki_uploads WHEN OLD.submitted=1 AND NEW.submitted!=1
-                BEGIN SELECT RAISE(ABORT, 'immutable Wiki submission'); END;
-                CREATE TRIGGER IF NOT EXISTS wiki_upload_submitted_content
-                BEFORE UPDATE OF content ON wiki_uploads WHEN OLD.submitted=1
-                BEGIN SELECT RAISE(ABORT, 'immutable submitted Wiki bytes'); END;
-            """)
+        from .wiki_schema import SCHEMA_VERSION
+        if connection.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+            raise WikiServiceError("STATE_UNAVAILABLE", "Wiki upload schema is unavailable")
 
     @staticmethod
     def _binding(row):
-        return _request_digest(tuple(row[k] for k in (
+        values = tuple(row[k] for k in (
             "authority_id", "profile_id", "device_id", "wiki_id", "generation",
             "path", "base_revision", "total_bytes", "sha256",
-        )))
+        ))
+        return _request_digest(values if row["owner_kind"] == "link_device"
+                               else ("native_principal", row["principal_id"], *values))
 
     def _load(self, connection, operation_id, profile_id, device_id, *, write=False):
         row = connection.execute("SELECT * FROM wiki_uploads WHERE operation_id=?", (operation_id,)).fetchone()
-        if row is None or (row["authority_id"], row["profile_id"], row["device_id"]) != (
-                self.service._authority_id, profile_id, device_id):
+        if row is None or not self.service._matches_owner(row, profile_id, device_id):
             raise WikiServiceError("OPERATION_NOT_FOUND", "Save operation was not found")
         grant = self.service._authorize(connection, row["wiki_id"], profile_id, device_id, write=write)
         if grant["generation"] != row["generation"]:
@@ -74,7 +56,7 @@ class WikiUploads:
     def _outcome(self, connection, row):
         operation = self.service._operation(connection, row["operation_id"], row["profile_id"], row["device_id"])
         if operation is not None:
-            expected = _request_digest((row["authority_id"], row["profile_id"], row["device_id"],
+            expected = self.service._digest((row["authority_id"], row["profile_id"], row["device_id"],
                                         row["wiki_id"], row["generation"], row["path"],
                                         row["base_revision"], row["sha256"]))
             if operation["request_digest"] != expected:
@@ -84,7 +66,7 @@ class WikiUploads:
             return self.service._outcome(row["operation_id"], "indeterminate", None, "SAVE_INTERRUPTED")
         return self._receiving(row)
 
-    def begin(self, payload: dict, *, device_id: str) -> dict:
+    def begin(self, payload: dict, *, device_id: str | None) -> dict:
         p = validate_payload("wiki.save.begin", payload)
         profile = p["agentId"]
         with self.service._locked() as connection:
@@ -93,7 +75,7 @@ class WikiUploads:
             creating = _creation_revision(p["baseRevision"], grant["generation"])
             if Path(p["path"]).suffix.casefold() not in {".md", ".markdown"}:
                 raise WikiServiceError("UNSUPPORTED_CONTENT", "Only Markdown files can be edited")
-            binding = _request_digest((self.service._authority_id, profile, device_id, p["wikiId"],
+            binding = self.service._digest((self.service._authority_id, profile, device_id, p["wikiId"],
                                        grant["generation"], p["path"], p["baseRevision"], p["totalBytes"], p["sha256"]))
             existing = connection.execute("SELECT 1 FROM wiki_uploads WHERE operation_id=?", (p["operationId"],)).fetchone()
             if existing is not None:
@@ -119,14 +101,17 @@ class WikiUploads:
                 raise WikiServiceError("QUOTA_EXCEEDED", "Wiki upload storage requires host-local maintenance")
             self.service._revalidate(connection, grant)
             with connection:
-                connection.execute("INSERT INTO wiki_uploads VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                connection.execute(
+                    "INSERT INTO wiki_uploads(operation_id,authority_id,profile_id,device_id,wiki_id,generation,"
+                    "path,base_revision,total_bytes,sha256,binding,content,submitted,created_at,owner_kind,principal_id) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
                     p["operationId"], self.service._authority_id, profile, device_id, p["wikiId"],
                     grant["generation"], p["path"], p["baseRevision"], p["totalBytes"], p["sha256"],
-                    binding, b"", 0, time.time_ns(),
+                    binding, b"", 0, time.time_ns(), self.service._owner_kind, self.service._principal_id,
                 ))
             return self._receiving(self._load(connection, p["operationId"], profile, device_id))
 
-    def chunk(self, payload: dict, *, device_id: str) -> dict:
+    def chunk(self, payload: dict, *, device_id: str | None) -> dict:
         p = validate_payload("wiki.save.chunk", payload)
         data = chunk_bytes(p["data"])
         with self.service._locked() as connection:
@@ -142,14 +127,14 @@ class WikiUploads:
                 connection.execute("UPDATE wiki_uploads SET content=? WHERE operation_id=?", (content + data, p["operationId"]))
             return self._receiving(self._load(connection, p["operationId"], p["agentId"], device_id))
 
-    def status(self, payload: dict, *, device_id: str) -> dict:
+    def status(self, payload: dict, *, device_id: str | None) -> dict:
         p = validate_payload("wiki.save.status", payload)
         with self.service._locked() as connection:
             self._schema(connection)
             row = self._load(connection, p["operationId"], p["agentId"], device_id)
             return self._outcome(connection, row)
 
-    def commit(self, payload: dict, *, device_id: str) -> dict:
+    def commit(self, payload: dict, *, device_id: str | None) -> dict:
         p = validate_payload("wiki.save.commit", payload)
         with self.service._locked() as connection:
             self._schema(connection)

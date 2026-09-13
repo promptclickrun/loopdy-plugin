@@ -109,33 +109,38 @@ class WikiTransport:
         assert context is not None
         if service._authority_id != context.authority_id:
             raise WikiServiceError("WIKI_OWNER_CHANGED", "Wiki pairing changed during the request")
-        identity = {"profile_id": p["agentId"], "device_id": context.device_id}
-        if operation == "wiki.roots":
-            result = service.roots(**identity)
-        elif operation == "wiki.connect":
-            # This capability comes from the checked encrypted Link context,
-            # never a payload flag or caller-supplied account identifier.
-            result = service.connect(p["folderPath"], **identity, account_authorized=True)
-        elif operation == "wiki.resolve":
-            result = service.resolve(p["folderPath"], **identity)
-        elif operation == "wiki.list":
-            result = service.list_directory(p["wikiId"], **identity, path=p["path"],
-                offset=p["offset"], limit=p["limit"], query=p["query"], revision=p.get("revision"))
-        elif operation in {"wiki.read", "wiki.image"}:
-            method = service.read_file if operation == "wiki.read" else service.read_image
-            result = method(p["wikiId"], **identity, path=p["path"], offset=p["offset"],
-                            limit=p["limit"], revision=p.get("revision"))
-        elif operation == "wiki.search":
-            from .wiki_search import WikiSearch
-            result = WikiSearch(service).search(p, device_id=context.device_id)
-        else:
-            from .wiki_uploads import WikiUploads
-            uploads = WikiUploads(service)
-            handler = {"wiki.save.begin": uploads.begin, "wiki.save.chunk": uploads.chunk,
-                       "wiki.save.commit": uploads.commit, "wiki.save.status": uploads.status}[operation]
-            result = handler(p, device_id=context.device_id)
+        result = execute_wiki_operation(service, operation, p, device_id=context.device_id,
+                                        account_authorized=True)
         self.check_context(context)
         return bounded_result(result)
+
+
+def execute_wiki_operation(service: WikiService, operation: str, payload: dict, *,
+                           device_id: str | None, account_authorized: bool = False) -> dict:
+    """Shared domain dispatch; callers must first supply a verified service owner."""
+    p = validate_payload(operation, payload)
+    identity = {"profile_id": p["agentId"], "device_id": device_id}
+    if operation == "wiki.roots":
+        return service.roots(**identity)
+    if operation == "wiki.connect":
+        return service.connect(p["folderPath"], **identity, account_authorized=account_authorized)
+    if operation == "wiki.resolve":
+        return service.resolve(p["folderPath"], **identity)
+    if operation == "wiki.list":
+        return service.list_directory(p["wikiId"], **identity, path=p["path"],
+            offset=p["offset"], limit=p["limit"], query=p["query"], revision=p.get("revision"))
+    if operation in {"wiki.read", "wiki.image"}:
+        method = service.read_file if operation == "wiki.read" else service.read_image
+        return method(p["wikiId"], **identity, path=p["path"], offset=p["offset"],
+                      limit=p["limit"], revision=p.get("revision"))
+    if operation == "wiki.search":
+        from .wiki_search import WikiSearch
+        return WikiSearch(service).search(p, device_id=device_id)
+    from .wiki_uploads import WikiUploads
+    uploads = WikiUploads(service)
+    handler = {"wiki.save.begin": uploads.begin, "wiki.save.chunk": uploads.chunk,
+               "wiki.save.commit": uploads.commit, "wiki.save.status": uploads.status}[operation]
+    return handler(p, device_id=device_id)
 
 
 def production_factory(*, host_home: Path, config_getter: Callable[[], Any]) -> WikiTransport:

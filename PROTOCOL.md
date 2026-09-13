@@ -11,6 +11,18 @@ The [native Wiki adapter](docs/NATIVE_WIKI.md) reuses existing Wiki data DTOs wi
 server-proven native principal/profile authority, not Link/device credentials.
 No second pairing or authorization ceremony is required.
 
+Native workspace requests use the saved Hermes endpoint and its native
+authentication over stock REST or `/api/ws`. Link/account AEAD frames below are
+a separate paired transport, not the native HTTP auth protocol. The optional
+paired Direct listener still requires account lifecycle leases; direct APNs is
+only a notification provider. Neither substitutes for native Hermes login.
+
+Native prompt attachments are **files-only**. Prompt image submission is
+unavailable until an official message-bound native image surface is verified.
+Existing Wiki image reads, generated-media resolution and assistant artifact
+downloads are read paths, not authorization for image uploads. No custom upload
+shim or cross-transport image fallback is provided.
+
 The separate `native-project-git-read-v1` contract uses three fixed authenticated
 native POST routes with existing camelCase Project Git DTOs, real content tokens
 and diff paging. It requires exact public Project/session metadata plus safe
@@ -356,7 +368,7 @@ production Card data client fails closed. Opening a Card makes no third-party
 Card data request. Source bindings and refresh behavior remain reserved for a
 later security-reviewed release.
 
-Template synchronization uses request-bound encrypted workspace operations
+On paired Link, template synchronization uses request-bound encrypted workspace operations
 named exactly `cards.templates.list`, `cards.templates.install`, and
 `cards.templates.remove`. Bundles contain metadata, an embedded card document,
 a parameter schema, and a SHA-256 integrity value. Stores enforce profile and
@@ -364,7 +376,9 @@ account ownership, supported versions, hash validity, idempotent install,
 upgrade ordering, and atomic replacement. Parameters can replace declared
 literal slots only; they cannot alter component types, IDs, bindings,
 operations, or renderer-owned fields. Template operations never use the notification relay,
-and no production catalog origin is configured.
+and no production catalog origin is configured. Native clients instead use the
+fixed authenticated template routes in [Native workspace API](docs/NATIVE_WORKSPACE_API.md),
+with the same data-only store validation rather than Link/account authority.
 
 `loopdy.card` is additive. `loopdy.generative_ui` versions 1 and 2 continue to
 decode and render through the existing legacy path, and
@@ -383,9 +397,10 @@ constrained JSON-tree and fixed native component-catalog approach.
 not claim adoption, endorsement, API compatibility, or copied code from any of
 these projects.
 
-## Delivery providers
+## Optional notification delivery providers
 
-`relay` is the default. The host stores a bounded HTTPS origin, tenant identifier, and references to owner-controlled HMAC and P-256 signing-key material. It authenticates every request with a fresh nonce and revisioned idempotency coordinate. Ordinary alert content is encrypted end to end for the registered device; the relay cannot read the message. Live Activity updates carry only the sanitized state contract (phase, progress, counts, timestamps, and bounded identifiers). The relay does not receive Hermes transcripts, approval policy, credentials, local paths, or arbitrary tool arguments. Registration uses the base bundle topic only; the provider appends `.push-type.liveactivity` exactly once for ActivityKit delivery.
+`relay` is the default notification provider, not the default native chat route
+or a prerequisite for native workspace access. The host stores a bounded HTTPS origin, tenant identifier, and references to owner-controlled HMAC and P-256 signing-key material. It authenticates every request with a fresh nonce and revisioned idempotency coordinate. Ordinary alert content is encrypted end to end for the registered device; the relay cannot read the message. Live Activity updates carry only the sanitized state contract (phase, progress, counts, timestamps, and bounded identifiers). The relay does not receive Hermes transcripts, approval policy, credentials, local paths, or arbitrary tool arguments. Registration uses the base bundle topic only; the provider appends `.push-type.liveactivity` exactly once for ActivityKit delivery.
 
 The native Swift client registers an ActivityKit push token for each active session and updates a
 sanitized projection of reasoning, tool, and delegation progress. That state is not end-to-end
@@ -431,6 +446,12 @@ Hermes mounts this router under `/api/plugins/loopdy/`. It inherits the dashboar
 policy. Pairing belongs to the separate Loopdy Link service, so the Hermes plugin API deliberately
 has no pairing or Link-secret route. Relay and Link credentials remain host-side and are not
 returned by this API.
+
+The established routes listed below do not enumerate the newer `/native/*`
+families. Those additionally require a real verified interactive Session and
+their documented context/request-ID guards; see the native contract documents.
+An authenticated attachment download is still a read, not a prompt-image
+submission capability.
 
 ```text
 GET    /capabilities
@@ -514,7 +535,7 @@ Preferences include notification enablement, event toggles, `automatic`, `minima
 
 Approval responses accept `once`, `session`, `always`, or `deny` plus the immutable request digest. The client may submit only a scope present in the request's authoritative `allowed_choices`; the pending record must exist, remain unexpired and unanswered, offer the choice, and match that digest.
 
-## Native channel and push envelope
+## Loopdy platform notification channel and push envelope
 
 Hermes registers `loopdy` as an outbound platform with `all`, `device:<id>`, and `group:<id>` targets. Native sends, scheduled tasks, cron, lifecycle hooks, and host automation all enter the same local event ledger. Proactive delivery does not require an active mobile session.
 
@@ -571,7 +592,11 @@ Only a new `.md` or `.markdown` file beneath an existing authorized folder may b
 
 The same immutable operation identity and private durable journal cover upload retries, lost acknowledgements and restart recovery. Indeterminate operations are reconciled by status, not silently resubmitted as new creates. Native Scratchpad acknowledges a remote save only after exact verified readback and then adopts the saved revision for later edits.
 
-## Optional Wiki folder registration
+## Optional paired-Link Wiki folder registration
+
+This section describes Link's `wiki.v1` authority only. Native principal-owned
+connect/disconnect uses the separate `native-wiki-v1` contract without pairing,
+and does not adopt or upgrade these Link registrations.
 
 `wiki.connect` requires advertised operation support and `wiki.v1`. Its exact payload is the selected `agentId` and canonical absolute `folderPath`; caller account/device, authority, grant ID and write-policy fields are rejected. The trusted encrypted workspace boundary supplies current paired-account authority and authenticates the sending connection. Explicit selection creates a durable account-scoped read/write file connection without host approval, or converts the exact existing same-authority/profile registration. Access changes rotate its generation; generated/mirror/export sources remain read-only. A new device on the same account needs no Wiki allowlist entry. Ordinary Wiki folders under a custom data home such as `/opt/data` are allowed, but the home itself, its ancestors, credential/system roots, hidden/control subtrees and Wiki state remain excluded. Symlinks, changed pinned directory identity and conflicting overlapping registrations fail closed. Canonical paths must not end in a slash and are never silently normalized. `wiki.resolve` remains lookup-only. Clients must not fall back to another registration mechanism when connect is absent; hosts without secure descriptor-relative traversal omit Wiki operations.
 

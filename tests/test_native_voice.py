@@ -1,6 +1,7 @@
 """Native media ownership and at-most-once boundaries; no real provider calls."""
 import asyncio
 from dataclasses import replace
+import json
 import unittest
 
 from loopdy_plugin.native_context import NativeContext, NativeAPIError
@@ -15,6 +16,8 @@ class Provider:
         self.creates = 0
         self.results = []
         self.closed = False
+        self.provider_event_types = {}
+        self.schema_mismatches = 0
 
     async def create(self, sdp, **kwargs):
         self.creates += 1
@@ -88,6 +91,34 @@ class NativeVoiceTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(NativeAPIError):
             await self.hub.result(self.owner, dict(fields, delegationId="unseen"))
 
+    async def test_poll_reports_payload_free_provider_diagnostics_and_turn_counters(self):
+        await self.offer()
+        provider = self.providers[0]
+        provider.provider_event_types = {
+            "session.started": 1,
+            "delegation.created": 1,
+            "private_text": "must not escape",
+            "\ud800": 99,
+        }
+        provider.schema_mismatches = 2
+        await provider.event({"kind": "delegation", "id": "item", "text": "Check calendar"})
+        await self.hub.result(self.owner, dict(self.fields, delegationId="item", text="Two events."))
+
+        diagnostics = self.hub.poll(self.owner, self.fields, after=0)["diagnostics"]
+        self.assertEqual(set(diagnostics), {
+            "providerEventTypes", "schemaMismatches", "admittedDelegations", "appendedResults",
+        })
+        self.assertEqual(diagnostics["providerEventTypes"], {
+            "session.started": 1, "delegation.created": 1,
+        })
+        self.assertEqual(diagnostics["schemaMismatches"], 2)
+        self.assertEqual(diagnostics["admittedDelegations"], 1)
+        self.assertEqual(diagnostics["appendedResults"], 1)
+        encoded = json.dumps(diagnostics)
+        self.assertNotIn("Check calendar", encoded)
+        self.assertNotIn("Two events", encoded)
+        self.assertNotIn("must not escape", encoded)
+
     async def test_lost_append_receipt_is_not_retried(self):
         await self.offer()
         provider = self.providers[0]
@@ -109,4 +140,3 @@ class NativeVoiceTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.03)
         self.assertTrue(self.providers[0].closed)
         self.assertTrue(self.hub.poll(self.owner, self.fields, after=0)["closed"])
-

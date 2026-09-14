@@ -28,6 +28,37 @@ class _Socket:
 
 
 class LiveVoiceTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_provider_event_diagnostics_keep_raw_types_without_frame_payloads(self):
+        from loopdy_plugin.live_voice_provider import CodexLiveProvider
+        sdp = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
+        events = []
+        async def handler(request):
+            return httpx.Response(201, headers={"Location":"/v1/live/rtc_fixture"}, text=sdp)
+        ws = _Socket()
+        async def connect(url, **options):
+            return ws
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            provider = CodexLiveProvider(auth=_Auth(), http_client=client,
+                                         websocket_connect=connect, on_event=events.append)
+            try:
+                await provider.create(sdp)
+                await provider.wait_started()
+                await ws.incoming.put(json.dumps({
+                    "type": "unknown.provider.event", "private_text": "must not escape",
+                }))
+                await ws.incoming.put("not-json")
+                for _ in range(100):
+                    if provider.schema_mismatches >= 2:
+                        break
+                    await asyncio.sleep(0.001)
+                self.assertEqual(provider.provider_event_types["session.started"], 1)
+                self.assertEqual(provider.provider_event_types["unknown.provider.event"], 1)
+                self.assertEqual(provider.schema_mismatches, 2)
+                encoded = json.dumps(provider.provider_event_types)
+                self.assertNotIn("must not escape", encoded)
+            finally:
+                await provider.close()
+
     async def test_real_http_serializer_attaches_sideband_once_before_returning_sdp(self):
         from loopdy_plugin.live_voice_provider import CodexLiveProvider, CODEX_CALL_URL
         sdp = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"

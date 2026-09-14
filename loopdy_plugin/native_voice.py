@@ -18,7 +18,10 @@ from fastapi import Request
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from .native_context import NativeAPIError, NativeContext, native_context
-from .live_voice_provider import make_live_provider, validate_audio_sdp
+from .live_voice_provider import (
+    MAX_PROVIDER_EVENT_NAME_BYTES, MAX_PROVIDER_EVENT_TYPES,
+    make_live_provider, validate_audio_sdp,
+)
 
 CAPABILITY = "native-voice-v1"
 
@@ -38,6 +41,10 @@ class _Call:
     events: list = field(default_factory=list)
     delegations: dict = field(default_factory=dict)
     appended: set = field(default_factory=set)
+    admitted_delegations: int = 0
+    appended_results: int = 0
+    provider_event_types: dict[str, int] = field(default_factory=dict)
+    schema_mismatches: int = 0
     lease: float = 0
     watch: asyncio.Task | None = None
 
@@ -90,6 +97,7 @@ class NativeVoiceHub:
     async def _event(self, call, event):
         if call.closed or not isinstance(event, dict):
             return
+        self._refresh_diagnostics(call)
         kind = event.get("kind")
         if kind not in {"started", "sideband_attached", "transcript_delta", "transcript_done", "delegation",
                         "delegation_context_required", "provider_error", "transport_closed", "session_closed", "audio_cleared"}:
@@ -112,6 +120,7 @@ class NativeVoiceHub:
                 await self._close(call)
                 return
             call.delegations[identifier] = dict(event)
+            call.admitted_delegations = min(call.admitted_delegations + 1, 2147483647)
         call.sequence += 1
         call.events.append((call.sequence, event, encoded))
         if kind in {"transport_closed", "session_closed"} or (kind == "provider_error" and event.get("fatal") is not False):
@@ -123,10 +132,12 @@ class NativeVoiceHub:
             raise _reject("voice_feed_gap")
         call.events = [row for row in call.events if row[0] > after]
         call.lease = time.monotonic()
+        self._refresh_diagnostics(call)
         rows = call.events[:4]  # At most 128 KiB plus the envelope.
         return {"voiceId": fields["voiceId"], "closed": call.closed,
                 "next": rows[-1][0] if rows else after,
-                "events": [{"sequence": sequence, "event": event} for sequence, event, _ in rows]}
+                "events": [{"sequence": sequence, "event": event} for sequence, event, _ in rows],
+                "diagnostics": self._diagnostics(call)}
 
     async def result(self, owner, fields):
         call = self._owned(owner, fields)
@@ -135,7 +146,49 @@ class NativeVoiceHub:
             raise _reject("voice_result_unavailable")
         call.appended.add(identifier)  # A lost provider receipt never permits replay.
         await call.provider.append_result(identifier, fields["text"])
+        call.appended_results = min(call.appended_results + 1, 2147483647)
+        self._refresh_diagnostics(call)
         return {"voiceId": fields["voiceId"], "appended": True}
+
+    @staticmethod
+    def _copy_event_types(value):
+        if not isinstance(value, dict):
+            return {}
+        result = {}
+        for name, count in value.items():
+            if len(result) >= MAX_PROVIDER_EVENT_TYPES:
+                break
+            if not isinstance(name, str) or not name:
+                continue
+            try:
+                name_bytes = len(name.encode("utf-8"))
+            except UnicodeEncodeError:
+                continue
+            if (name_bytes > MAX_PROVIDER_EVENT_NAME_BYTES
+                    or any(ord(character) < 32 or ord(character) == 127 for character in name)
+                    or type(count) is not int or count < 0):
+                continue
+            result[name] = min(count, 2147483647)
+        return dict(sorted(result.items()))
+
+    def _refresh_diagnostics(self, call):
+        provider = call.provider
+        if provider is None:
+            return
+        call.provider_event_types = self._copy_event_types(
+            getattr(provider, "provider_event_types", {}))
+        mismatches = getattr(provider, "schema_mismatches", 0)
+        if type(mismatches) is int and mismatches >= 0:
+            call.schema_mismatches = min(mismatches, 2147483647)
+
+    @staticmethod
+    def _diagnostics(call):
+        return {
+            "providerEventTypes": dict(call.provider_event_types),
+            "schemaMismatches": call.schema_mismatches,
+            "admittedDelegations": call.admitted_delegations,
+            "appendedResults": call.appended_results,
+        }
 
     async def close(self, owner, fields):
         call = self._owned(owner, fields) if fields["voiceId"] in self.calls else self._claim(owner, fields)
@@ -145,6 +198,7 @@ class NativeVoiceHub:
     async def _close(self, call):
         if call.closed:
             return
+        self._refresh_diagnostics(call)
         call.closed = True
         call.events.clear()
         call.delegations.clear()

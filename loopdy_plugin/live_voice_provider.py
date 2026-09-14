@@ -31,6 +31,8 @@ MAX_EVENT_BYTES = 1048576
 MAX_EVENT_COUNT = 32
 MAX_TEXT_BYTES = 32768
 MAX_RESULT_UNITS = 1800
+MAX_PROVIDER_EVENT_TYPES = 64
+MAX_PROVIDER_EVENT_NAME_BYTES = 128
 VOICES = frozenset({"arbor", "breeze", "cove", "ember", "juniper", "maple", "sol", "spruce", "vale"})
 _CALL_ID = re.compile(r"(?:rtc_[A-Za-z0-9_-]{1,124}|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})\Z")
 DEFAULT_INSTRUCTIONS = (
@@ -251,6 +253,10 @@ class _LiveTransport:
         self._lease_deadline: float | None = None
         self._cleanup_confirmed = False
         self._provider_finalized = False
+        # Payload-free provider wire diagnostics. Keep only bounded event type
+        # names and counters so a stalled call can be distinguished from a
+        # schema rejection without retaining transcript or tool content.
+        self.provider_event_types: dict[str, int] = {}
         self.schema_mismatches = 0
 
     @property
@@ -424,6 +430,22 @@ class _LiveTransport:
         self._queued_bytes += size
         self._events.put_nowait((event, size))
 
+    def _record_provider_event_type(self, raw: str) -> None:
+        """Record only the bounded top-level wire event name."""
+        try:
+            envelope = json.loads(raw)
+        except (ValueError, RecursionError):
+            return
+        if not isinstance(envelope, Mapping):
+            return
+        name = envelope.get("type")
+        if (not _text(name, MAX_PROVIDER_EVENT_NAME_BYTES, nonempty=True)
+                or any(ord(character) < 32 or ord(character) == 127 for character in name)):
+            return
+        if name not in self.provider_event_types and len(self.provider_event_types) >= MAX_PROVIDER_EVENT_TYPES:
+            return
+        self.provider_event_types[name] = min(self.provider_event_types.get(name, 0) + 1, 2147483647)
+
     async def events(self) -> AsyncIterator[dict[str, Any]]:
         """One lossless bounded consumer; never race two delegation owners."""
         if self._on_event is not None or self._consuming:
@@ -458,6 +480,7 @@ class _LiveTransport:
                 self._reader_idle.clear()
                 if not isinstance(raw, str) or not _text(raw, MAX_FRAME_BYTES):
                     raise LiveProviderError("invalid_sideband_frame", stage="events", allocation_state=self._allocation)
+                self._record_provider_event_type(raw)
                 if self._state == "waiting_started":
                     early_count += 1
                     early_bytes += len(raw.encode("utf-8"))
@@ -891,6 +914,7 @@ class PublicLiveProvider(_LiveTransport):
             total_bytes += len(raw.encode("utf-8"))
             if total_bytes > MAX_EVENT_BYTES:
                 return
+            self._record_provider_event_type(raw)
             event = self.decode_event(raw)
             if event is not None and event["kind"] == "session_closed":
                 self._provider_finalized = True

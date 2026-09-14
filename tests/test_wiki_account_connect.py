@@ -17,7 +17,8 @@ class AccountConnectTests(unittest.TestCase):
     def test_legacy_schema_migration_preserves_policy_and_generation(self):
         before = self.service.list_grants()
         with self.service._locked() as connection:
-            connection.execute('ALTER TABLE wiki_grants DROP COLUMN access_scope')
+            from wiki_schema_fixtures import restore_legacy_schema
+            restore_legacy_schema(connection, omit_access_scope=True)
         reopened = fixtures.WikiTransport(state_dir=self.base / 'state', config_getter=lambda: self.config)
         self.assertEqual(reopened.host_service().list_grants(), before)
         self.assertEqual(before['grants'][0]['accessScope'], 'device')

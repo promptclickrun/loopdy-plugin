@@ -379,7 +379,7 @@ class WorkspaceControllerTests(unittest.TestCase):
         calls: list[dict[str, object]] = []
         hermes_cli = ModuleType("hermes_cli")
         hermes_cli.__path__ = []  # type: ignore[attr-defined]
-        web_server = ModuleType("hermes_cli.web_server")
+        web_server = ModuleType("hermes_cli.web_routers.models")
 
         def get_model_options(profile=None):
             calls.append({"profile": profile})
@@ -395,7 +395,7 @@ class WorkspaceControllerTests(unittest.TestCase):
             patch.object(backend, "_hermes_request", side_effect=ImportError),
             patch.dict(sys.modules, {
                 "hermes_cli": hermes_cli,
-                "hermes_cli.web_server": web_server,
+                "hermes_cli.web_routers.models": web_server,
             }),
         ):
             result = asyncio.run(backend._model_options("default"))

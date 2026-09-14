@@ -87,6 +87,8 @@ class _Call:
     close_task: asyncio.Task | None = None
     last_probe: float = 0.0
     delegation_briefs: dict = field(default_factory=dict)
+    delegation_aliases: dict = field(default_factory=dict)
+    delegation_jobs: dict = field(default_factory=dict)
     context_offset: int = -1
     context_incomplete: bool = False
 
@@ -411,9 +413,33 @@ class LiveVoiceRuntime:
             if not isinstance(text, str) or not text.strip():
                 await self._event(call, {"kind": "provider_error", "code": "delegation_context_unavailable"})
                 return
-            job = await self.jobs.delegate(call.owner, voice_id=call.voice_id,
-                                           delegation_id=event.get("id"), text=text)
+            delegation_id = _identifier(event.get("id"))
+            previous = call.delegation_briefs.get(delegation_id)
+            if previous is not None and previous != text:
+                raise ValueError("Live delegation content changed")
+            if len(call.delegation_briefs) >= 1024 and previous is None:
+                raise ValueError("Live delegation capacity exhausted")
+            call.delegation_briefs[delegation_id] = text
+            primary = call.delegation_aliases.get(delegation_id)
+            # Providers can emit the same pending request with new item IDs.
+            # Join that work within this voice owner; a later request after
+            # completion still creates a fresh job. Never replay a turn.
+            if primary is not None:
+                job = self.jobs.get(call.owner, call.delegation_jobs[primary])
+            else:
+                matches = (self.jobs.get(call.owner, job_id)
+                           for candidate, job_id in call.delegation_jobs.items()
+                           if call.delegation_briefs[candidate] == text)
+                job = next((row for row in matches if not row.terminal and row.state != "uncertain"), None)
+            if job is None:
+                job = await self.jobs.delegate(call.owner, voice_id=call.voice_id,
+                                               delegation_id=delegation_id, text=text)
+            call.delegation_aliases[delegation_id] = job.delegation_id
+            call.delegation_jobs[job.delegation_id] = job.job_id
             await self._event(call, {"kind": "job", "job": project_job(job)})
+            if job.terminal:
+                call.results[job.delegation_id] = (job.run_id, job.revision, job.summary)
+                await self._flush_results(call)
             return
         if kind in {"transcript_delta", "transcript_done"}:
             if event.get("role") == "user" and isinstance(event.get("text"), str):
@@ -425,7 +451,7 @@ class LiveVoiceRuntime:
                         call.context_incomplete = True
         if kind in {"started", "sideband_attached", "transcript_delta", "transcript_done", "audio_cleared", "provider_error", "transport_closed", "session_closed"}:
             await self._event(call, event)
-        if kind in {"transport_closed", "session_closed", "provider_error"}:
+        if kind in {"transport_closed", "session_closed"} or (kind == "provider_error" and event.get("fatal") is not False):
             self._spawn(self._close(call))
 
     async def _submit(self, job):
@@ -644,7 +670,10 @@ class LiveVoiceRuntime:
     async def _flush_results(self, call):
         if not call.ready or call.closed or not self._current(call.owner):
             return
-        for delegation_id, (run_id, revision, summary) in list(call.results.items()):
+        results = dict(call.results)
+        results.update({alias: call.results[primary] for alias, primary in call.delegation_aliases.items()
+                        if primary in call.results})
+        for delegation_id, (run_id, revision, summary) in results.items():
             key = (delegation_id, run_id, revision)
             if key in call.appended:
                 continue
@@ -768,6 +797,8 @@ class LiveVoiceRuntime:
         call.results.clear()
         call.transcripts.clear()
         call.delegation_briefs.clear()
+        call.delegation_aliases.clear()
+        call.delegation_jobs.clear()
         if call.close_task is None:
             async def cleanup():
                 result = {}

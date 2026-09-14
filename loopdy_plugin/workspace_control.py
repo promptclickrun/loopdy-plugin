@@ -826,7 +826,7 @@ class HermesWorkspaceBackend:
         templates = self.service.store.list_card_templates(profile=agent_id)
         return {
             "agentId": agent_id,
-            "templates": [_card_template_projection(value) for value in templates],
+            "templates": [card_template_projection(value) for value in templates],
         }
 
     async def cards_templates_install(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -842,7 +842,7 @@ class HermesWorkspaceBackend:
         return {
             "agentId": agent_id,
             "changed": result["changed"],
-            "template": _card_template_projection(result["template"]),
+            "template": card_template_projection(result["template"]),
         }
 
     async def cards_templates_remove(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -2708,7 +2708,7 @@ class HermesWorkspaceBackend:
             )
             return _object(result.get("config"), "Hermes config")
         except (ImportError, _HermesMethodUnavailable):
-            from hermes_cli.web_server import get_config
+            from hermes_cli.web_routers.config_env import get_config
 
             result = get_config(profile=agent_id)
             if inspect.isawaitable(result):
@@ -2723,7 +2723,7 @@ class HermesWorkspaceBackend:
                 unavailable_message="Hermes model options are unavailable",
             )
         except (ImportError, _HermesMethodUnavailable):
-            from hermes_cli.web_server import get_model_options
+            from hermes_cli.web_routers.models import get_model_options
 
             parameters = inspect.signature(get_model_options).parameters.values()
             supports_explicit_filter = any(
@@ -2743,7 +2743,7 @@ class HermesWorkspaceBackend:
         self, agent_id: str, config: dict[str, Any]
     ) -> None:
         from hermes_cli.web_models import ConfigUpdate
-        from hermes_cli.web_server import update_config
+        from hermes_cli.web_routers.config_env import update_config
 
         await update_config(
             ConfigUpdate(config=config, profile=agent_id),
@@ -2751,7 +2751,7 @@ class HermesWorkspaceBackend:
         )
 
     async def _skills_catalog(self, agent_id: str) -> list[dict[str, Any]]:
-        from hermes_cli.web_server import get_skills
+        from hermes_cli.web_routers.skills import get_skills
 
         return await get_skills(profile=agent_id)
 
@@ -2842,7 +2842,7 @@ class HermesWorkspaceBackend:
         return await workspace_capabilities.plugins(agent_id)
 
     async def _mcp_catalog(self, agent_id: str) -> dict[str, Any]:
-        from hermes_cli.web_server import list_mcp_servers
+        from hermes_cli.web_routers.mcp import list_mcp_servers
 
         return await list_mcp_servers(profile=agent_id)
 
@@ -3069,7 +3069,7 @@ class HermesWorkspaceBackend:
         return await asyncio.to_thread(_list_cron_jobs_sync, agent_id or "all")
 
     async def _cron_delivery_targets(self) -> list[dict[str, Any]]:
-        from cron.scheduler import cron_delivery_targets
+        from cron.scheduler_delivery import cron_delivery_targets
 
         return await asyncio.to_thread(cron_delivery_targets)
 
@@ -3124,7 +3124,7 @@ def _empty_payload(payload: Any) -> None:
         raise WorkspaceControlError("Workspace payload must be empty")
 
 
-def _card_template_projection(template: Any) -> dict[str, Any]:
+def card_template_projection(template: Any) -> dict[str, Any]:
     value = _object(template, "card template")
     keys = (
         "id",

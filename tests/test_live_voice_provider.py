@@ -28,6 +28,37 @@ class _Socket:
 
 
 class LiveVoiceTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_provider_event_diagnostics_keep_raw_types_without_frame_payloads(self):
+        from loopdy_plugin.live_voice_provider import CodexLiveProvider
+        sdp = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
+        events = []
+        async def handler(request):
+            return httpx.Response(201, headers={"Location":"/v1/live/rtc_fixture"}, text=sdp)
+        ws = _Socket()
+        async def connect(url, **options):
+            return ws
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            provider = CodexLiveProvider(auth=_Auth(), http_client=client,
+                                         websocket_connect=connect, on_event=events.append)
+            try:
+                await provider.create(sdp)
+                await provider.wait_started()
+                await ws.incoming.put(json.dumps({
+                    "type": "unknown.provider.event", "private_text": "must not escape",
+                }))
+                await ws.incoming.put("not-json")
+                for _ in range(100):
+                    if provider.schema_mismatches >= 2:
+                        break
+                    await asyncio.sleep(0.001)
+                self.assertEqual(provider.provider_event_types["session.started"], 1)
+                self.assertEqual(provider.provider_event_types["unknown.provider.event"], 1)
+                self.assertEqual(provider.schema_mismatches, 2)
+                encoded = json.dumps(provider.provider_event_types)
+                self.assertNotIn("must not escape", encoded)
+            finally:
+                await provider.close()
+
     async def test_real_http_serializer_attaches_sideband_once_before_returning_sdp(self):
         from loopdy_plugin.live_voice_provider import CodexLiveProvider, CODEX_CALL_URL
         sdp = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
@@ -77,6 +108,35 @@ class LiveVoiceTransportTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LiveVoiceProviderTests(unittest.TestCase):
+    def test_subscription_instructions_cover_delegation_and_continued_turns(self):
+        from loopdy_plugin.live_voice_provider import CodexLiveProvider, DEFAULT_INSTRUCTIONS
+
+        provider = CodexLiveProvider(auth=_Auth())
+        payload = provider._create_payload(
+            "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
+            DEFAULT_INSTRUCTIONS,
+            "cove",
+            (),
+        )
+        instructions = payload["session"]["instructions"].lower()
+        for phrase in (
+            "current information",
+            "calendar",
+            "reminders",
+            "health questions",
+            "delegate before answering",
+            "do not guess",
+            "keep listening for later utterances",
+            "queued for the next free speaking moment",
+            "does not end the call",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, instructions)
+        for phrase in ("greetings", "small talk", "brief clarification", "repeating a verified result"):
+            with self.subTest(non_delegated=phrase):
+                self.assertIn(phrase, instructions)
+        self.assertEqual(payload["session"]["delegation"], {"type": "client", "ack_filler": False})
+
     def test_subscription_delegation_preserves_opaque_identity_and_task(self):
         from loopdy_plugin.live_voice_provider import CodexLiveProvider
         event = CodexLiveProvider.decode_event({
@@ -97,9 +157,9 @@ class LiveVoiceProviderTests(unittest.TestCase):
 
     def test_results_use_speakable_quicksilver_channel(self):
         from loopdy_plugin.live_voice_provider import CodexLiveProvider
-        frames = CodexLiveProvider.result_frames("delegation_fixture_a", "Finished: " + "🧑🏾‍💻" * 150)
+        frames = CodexLiveProvider.result_frames("delegation_fixture_a", "Finished: " + "🧑🏾\u200d💻" * 150)
         self.assertGreater(len(frames), 1)
-        self.assertEqual("".join(x["content"][0]["text"] for x in frames), "Finished: " + "🧑🏾‍💻" * 150)
+        self.assertEqual("".join(x["content"][0]["text"] for x in frames), "Finished: " + "🧑🏾\u200d💻" * 150)
         for frame in frames:
             self.assertEqual(frame["type"], "delegation.context.append")
             self.assertEqual(frame["delegation_item_id"], "delegation_fixture_a")

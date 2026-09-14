@@ -21,6 +21,7 @@ from cryptography.hazmat.primitives.asymmetric.utils import (
 )
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from .groups_contracts import GROUPS_RESULT_ENVELOPE_BYTES, validate_result_version
 
 
 _GENERIC_PLAINTEXT_MAX_BYTES = 196_608
@@ -33,6 +34,9 @@ def _plaintext_limit(value: Any) -> int:
         return _GENERIC_PLAINTEXT_MAX_BYTES
     message_type = value.get("type")
     operation = value.get("operation")
+    if message_type == "workspace.result" and "groupsResultVersion" in value:
+        validate_result_version(value["groupsResultVersion"], operation)
+        return GROUPS_RESULT_ENVELOPE_BYTES
     if (
         message_type == "workspace.request"
         and operation in {"agents.avatar.set", "skills_tools.import"}

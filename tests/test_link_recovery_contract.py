@@ -43,12 +43,22 @@ class LinkRecoveryContractTests(unittest.IsolatedAsyncioTestCase):
         ))
 
     def test_advertised_capabilities_match_actual_supported_operations(self) -> None:
-        capabilities = workspace_capabilities()
-        assert isinstance(capabilities, dict), "Workspace result lacks capability metadata"
-        self.assertEqual(capabilities["protocolVersion"], 1)
-        self.assertEqual(capabilities["operations"], sorted(WORKSPACE_OPERATIONS))
-        self.assertIn("workspace-rejected-v1", capabilities["features"])
-        self.assertIn("backpressure-v1", capabilities["features"])
+        live_voice_operations = {
+            "voice.live.status", "voice.live.offer", "voice.live.close",
+            "voice.live.jobs", "voice.live.control",
+        }
+        for live_voice, capabilities in (
+            (False, workspace_capabilities(live_voice=False)),
+            (True, workspace_capabilities()),
+        ):
+            with self.subTest(live_voice=live_voice):
+                assert isinstance(capabilities, dict), "Workspace result lacks capability metadata"
+                self.assertEqual(capabilities["protocolVersion"], 1)
+                expected = WORKSPACE_OPERATIONS | (live_voice_operations if live_voice else set())
+                self.assertEqual(capabilities["operations"], sorted(expected))
+                self.assertEqual("live-voice-v1" in capabilities["features"], live_voice)
+                self.assertIn("workspace-rejected-v1", capabilities["features"])
+                self.assertIn("backpressure-v1", capabilities["features"])
 
     def test_new_app_operations_are_in_the_installable_plugin_contract(self) -> None:
         for operation in (

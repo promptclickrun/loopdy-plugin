@@ -626,41 +626,7 @@ class WorkspaceFilesService:
             )
 
     def _valid_grant_root(self, root: Path) -> Path:
-        if not isinstance(root, Path):
-            root = Path(root)
-        if not root.is_absolute():
-            raise WorkspaceFilesError(
-                "INVALID_GRANT", "Workspace root must be an absolute path"
-            )
-        try:
-            resolved = root.resolve(strict=True)
-        except OSError as error:
-            raise WorkspaceFilesError(
-                "INVALID_GRANT", "Workspace root is unavailable"
-            ) from error
-        if Path(os.path.abspath(os.fspath(root))) != resolved or not resolved.is_dir():
-            raise WorkspaceFilesError(
-                "INVALID_GRANT", "Workspace root must be a real directory without symbolic links"
-            )
-        normalized = str(resolved).rstrip("/").casefold() or "/"
-        home = Path.home().resolve()
-        if normalized in _SYSTEM_ROOTS or resolved == home:
-            raise WorkspaceFilesError(
-                "INVALID_GRANT", "This directory cannot be granted as a workspace root"
-            )
-        if _credential_root(resolved, home) or _protected_path(str(resolved)):
-            raise WorkspaceFilesError(
-                "INVALID_GRANT", "Credential and control directories cannot be granted"
-            )
-        try:
-            self._state_dir.resolve().relative_to(resolved)
-        except ValueError:
-            pass
-        else:
-            raise WorkspaceFilesError(
-                "INVALID_GRANT", "Workspace Files state cannot be inside a granted root"
-            )
-        return resolved
+        return validate_workspace_root(root, state_dir=self._state_dir)
 
     def _load_grant(self, workspace_id: str) -> _Grant:
         workspace_id = _valid_workspace_id(workspace_id)
@@ -984,6 +950,33 @@ def _read_descriptor(descriptor: int, limit: int) -> bytes:
             raise WorkspaceFilesError(
                 "REVISION_STALE", "File changed while it was being read"
             )
+
+
+def validate_workspace_root(root: Path, *, state_dir: Path) -> Path:
+    """Validate a root without creating a Files grant or touching its registry."""
+    if not isinstance(root, Path):
+        root = Path(root)
+    if not root.is_absolute():
+        raise WorkspaceFilesError("INVALID_GRANT", "Workspace root must be an absolute path")
+    try:
+        resolved = root.resolve(strict=True)
+    except OSError as error:
+        raise WorkspaceFilesError("INVALID_GRANT", "Workspace root is unavailable") from error
+    if Path(os.path.abspath(os.fspath(root))) != resolved or not resolved.is_dir():
+        raise WorkspaceFilesError("INVALID_GRANT", "Workspace root must be a real directory without symbolic links")
+    normalized = str(resolved).rstrip("/").casefold() or "/"
+    home = Path.home().resolve()
+    if normalized in _SYSTEM_ROOTS or resolved == home:
+        raise WorkspaceFilesError("INVALID_GRANT", "This directory cannot be granted as a workspace root")
+    if _credential_root(resolved, home) or _protected_path(str(resolved)):
+        raise WorkspaceFilesError("INVALID_GRANT", "Credential and control directories cannot be granted")
+    try:
+        state_dir.resolve().relative_to(resolved)
+    except ValueError:
+        pass
+    else:
+        raise WorkspaceFilesError("INVALID_GRANT", "Workspace Files state cannot be inside a granted root")
+    return resolved
 
 
 def _sanitize_git_status(result: dict[str, Any]) -> dict[str, Any]:

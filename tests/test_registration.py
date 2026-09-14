@@ -54,13 +54,30 @@ class _Context:
         self.approval = (name, present_fn)
 
     def register_hook(self, name, callback):
-        self.hooks[name] = callback
+        previous = self.hooks.get(name)
+        if previous is None:
+            self.hooks[name] = callback
+            return
+        def dispatch(*args, **kwargs):
+            first = previous(*args, **kwargs)
+            second = callback(*args, **kwargs)
+            return second if second is not None else first
+        self.hooks[name] = dispatch
 
     def register_cli_command(self, **kwargs):
         self.cli = kwargs
 
     def on_unload(self, callback):
-        self.unload = callback
+        previous = self.unload
+        if previous is None:
+            self.unload = callback
+        else:
+            def unload():
+                try:
+                    callback()
+                finally:
+                    previous()
+            self.unload = unload
 
 
 class _Service:
@@ -710,7 +727,7 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(unpair.loopdy_link_action, "unpair")
         self.assertEqual(status.loopdy_link_action, "status")
 
-    def test_successful_loopdy_link_pairing_requests_gateway_activation(self) -> None:
+    def test_retired_link_pairing_never_pairs_or_activates_gateway(self) -> None:
         from loopdy_plugin.registration import _handle_link_cli
 
         paired = {
@@ -722,7 +739,7 @@ class RegistrationTests(unittest.TestCase):
         output = io.StringIO()
 
         with (
-            patch("loopdy_plugin.registration.pair_host", return_value=paired),
+            patch("loopdy_plugin.registration.pair_host", return_value=paired) as pair,
             patch(
                 "loopdy_plugin.registration._request_gateway_activation",
                 return_value=True,
@@ -738,10 +755,11 @@ class RegistrationTests(unittest.TestCase):
                 identity_state=_Context().state,
             )
 
-        activate.assert_called_once_with()
+        activate.assert_not_called()
+        pair.assert_not_called()
         result = json.loads(output.getvalue())
-        self.assertEqual(result["state"], "paired")
-        self.assertEqual(result["gateway_activation"], "requested")
+        self.assertEqual(result["state"], "retired")
+        self.assertEqual(result["chat_transport"], "native")
 
     def test_loopdy_link_status_reads_the_matching_persisted_gateway_state(self) -> None:
         from loopdy_plugin.registration import _handle_link_cli
@@ -914,10 +932,12 @@ class RegistrationTests(unittest.TestCase):
         )
         self.assertEqual(context.approval[0], "loopdy")
         self.assertEqual(context.cli["name"], "loopdy")
+        from hermes_cli.plugins import VALID_HOOKS
         self.assertEqual(
             set(context.hooks),
             {
                 "pre_approval_request",
+                "post_approval_response",
                 "pre_tool_call",
                 "post_tool_call",
                 "pre_llm_call",
@@ -930,7 +950,7 @@ class RegistrationTests(unittest.TestCase):
                 "kanban_task_claimed",
                 "kanban_task_completed",
                 "kanban_task_blocked",
-            },
+            } | ({"on_room_member_activity"} if "on_room_member_activity" in VALID_HOOKS else set()),
         )
         self.assertEqual(set(context.skills), {"loopdy-marketplace-publish"})
         self.assertTrue(context.skills["loopdy-marketplace-publish"]["path"].is_file())

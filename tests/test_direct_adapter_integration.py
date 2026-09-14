@@ -49,9 +49,10 @@ class DirectAdapterTests(unittest.IsolatedAsyncioTestCase):
                 async with ws:
                     request={"version":1,"type":"direct.query","requestID":"query_fixture_0001",
                         "payload":{"version":1,"type":"workspace.request","requestId":"query_fixture_0001",
-                            "operation":"agents.list","payload":{},"sentAt":int(time.time())}}
+                            "operation":"agents.list","payload":{"linkProtocol":1},"sentAt":int(time.time())}}
                     await ws.send(json.dumps(request));result=json.loads(await asyncio.wait_for(ws.recv(),3))
                     self.assertEqual(result["result"]["type"],"workspace.result")
+                    self.assertIn("direct-enrollment-v1", result["result"]["capabilities"]["features"])
                     self.assertEqual(result["result"]["payload"]["agents"][0]["id"],"default")
                     catalog["devices"][1].update(lifecycle="revoked",authorizationEpoch=12,revokedAt=2,revision=2)
                     await runtime.refresh()

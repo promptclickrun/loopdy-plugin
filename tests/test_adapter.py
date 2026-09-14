@@ -243,6 +243,19 @@ class _ActivityBroker:
 
 
 class AdapterTests(unittest.TestCase):
+    def test_native_startup_never_reads_cloud_chat_credentials_or_starts_paired_direct(self):
+        service = _Service()
+        service.health = lambda: {"configured": False, "ready": False}
+        with patch("loopdy_plugin.adapter.load_runtime_config", return_value=None) as cloud_config:
+            adapter = LoopdyAdapter(PlatformConfig(enabled=True), service=service)
+            with patch.object(adapter, "_start_direct") as paired_direct:
+                self.assertTrue(asyncio.run(adapter.connect()))
+                self.assertTrue(adapter.is_connected)
+                self.assertIsNone(adapter.link_client)
+                cloud_config.assert_not_called()
+                paired_direct.assert_not_called()
+                asyncio.run(adapter.disconnect())
+
     def test_runtime_snapshot_reads_only_the_exact_current_owner(self):
         entry = SimpleNamespace(session_id="stored-one", session_key="route-one", origin=SimpleNamespace(profile="default"))
         class Store:
@@ -915,7 +928,7 @@ class AdapterTests(unittest.TestCase):
         self.assertIsNone(adapter.link_client)
         self.assertTrue(asyncio.run(adapter.connect()))
 
-    def test_connect_rejects_an_unconfigured_provider(self) -> None:
+    def test_native_connect_does_not_require_an_optional_notification_provider(self) -> None:
         service = _Service()
         service.health = lambda: {
             "configured": False,
@@ -925,7 +938,7 @@ class AdapterTests(unittest.TestCase):
         }
         adapter = LoopdyAdapter(PlatformConfig(enabled=True), service=service)
 
-        self.assertFalse(asyncio.run(adapter.connect()))
+        self.assertTrue(asyncio.run(adapter.connect()))
 
     def test_channel_message_resolves_the_active_profile_display_name(self) -> None:
         service = _Service()

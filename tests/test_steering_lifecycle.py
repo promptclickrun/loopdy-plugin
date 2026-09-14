@@ -13,10 +13,17 @@ from gateway.run import GatewayRunner
 from loopdy_plugin.adapter import LoopdyAdapter
 from loopdy_plugin.link_client import InboundLinkTurn, LoopdyLinkClient
 from loopdy_plugin.link_contracts import UserMessage
-from tests import test_adapter as adapter_fixtures
-from tests import test_link_client as link_fixtures
-from tests.test_adapter import _ActivityBroker, _LinkClient, _Service
-from tests.test_link_client import _State
+# Hermes also has a tests package. Resolve fixtures within this suite.
+if __package__:
+    from . import test_adapter as adapter_fixtures
+    from . import test_link_client as link_fixtures
+    from .test_adapter import _ActivityBroker, _LinkClient, _Service
+    from .test_link_client import _State
+else:
+    import test_adapter as adapter_fixtures
+    import test_link_client as link_fixtures
+    from test_adapter import _ActivityBroker, _LinkClient, _Service
+    from test_link_client import _State
 
 
 class SteeringLifecycleTests(unittest.TestCase):

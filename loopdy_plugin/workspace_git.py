@@ -131,7 +131,8 @@ class WorkspaceGitService:
         self,
         workspaces: Iterable[Mapping[str, Any]],
         *,
-        state_path: Path | str,
+        state_path: Path | str | None = None,
+        read_only: bool = False,
         timeout: float = 30.0,
         max_output_bytes: int = 4_000_000,
     ) -> None:
@@ -140,15 +141,23 @@ class WorkspaceGitService:
         self._locks: dict[str, threading.RLock] = {}
         self._confirmations: dict[str, Confirmation] = {}
         self._workspaces: dict[str, Workspace] = {}
-        self._state_path = Path(state_path)
-        self._state_path.parent.mkdir(parents=True, exist_ok=True)
+        self._read_only = read_only
+        self._state_path = Path(state_path) if state_path is not None else None
+        if not read_only:
+            if self._state_path is None:
+                raise ValueError("Writable Git service requires a state path")
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
         for value in workspaces:
             workspace = self._workspace(value)
+            if read_only and (workspace.operations != frozenset({"status"}) or workspace.mutations_enabled
+                              or workspace.remotes or workspace.branches):
+                raise ValueError("Read-only Git service requires a status-only policy")
             if workspace.workspace_id in self._workspaces:
                 raise ValueError("Duplicate workspace_id")
             self._workspaces[workspace.workspace_id] = workspace
             self._locks[workspace.workspace_id] = threading.RLock()
-        self._ensure_ledger()
+        if not read_only:
+            self._ensure_ledger()
 
     @classmethod
     def from_environment(cls, *, state_path: Path | str) -> "WorkspaceGitService":
@@ -263,6 +272,9 @@ class WorkspaceGitService:
             current = self.status(workspace_id)
             self._require_status(expected_status_token, current)
             selected = self._paths(workspace, [path], current)[0]
+            if self._read_only and any(item["path"] == selected and item["kind"] == "unmerged"
+                                       for item in current["files"]):
+                raise WorkspaceGitError("DIFF_UNSUPPORTED", "Combined conflict diffs are unavailable")
             if (
                 side not in {"staged", "worktree"}
                 or isinstance(offset, bool)
@@ -743,6 +755,9 @@ class WorkspaceGitService:
                     raise WorkspaceGitError("STATUS_STALE", "Workspace changed while projecting the selected path")
                 if overflow:
                     availability, rows = "oversized", []
+                elif self._read_only and (raw.startswith((b"diff --cc ", b"diff --combined "))
+                                         or b"\n@@@" in raw):
+                    raise WorkspaceGitError("DIFF_UNSUPPORTED", "Combined conflict diffs are unavailable")
                 elif b"Binary files " in raw or b"GIT binary patch" in raw:
                     availability, rows = "binary", []
                 else:

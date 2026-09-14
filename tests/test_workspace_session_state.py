@@ -77,7 +77,7 @@ class WorkspaceSessionStateTests(unittest.IsolatedAsyncioTestCase):
         self.backend._session_messages.assert_not_called()
 
     async def test_full_content_is_retrieved_by_canonical_reference_off_loop(self):
-        content = "result 👩🏽‍💻\n" * 10_000
+        content = "result 👩🏽\u200d💻\n" * 10_000
         self.db.append_message("stored-one", "tool", content, tool_call_id="call-one")
         page = await self.request("sessions.state")
         reference = page["messages"][-1]["contentReference"]

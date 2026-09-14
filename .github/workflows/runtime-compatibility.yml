@@ -1,0 +1,55 @@
+name: Hermes runtime compatibility
+on:
+  pull_request:
+    paths:
+      - plugin.yaml
+      - loopdy_plugin/**
+      - tests/**
+      - .github/workflows/runtime-compatibility.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  supported-runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: plugin
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: 0.21.1
+            revision: 8226c2f6a283c48fb97c1750a0ec2907739146d0
+          - version: 0.21.2
+            revision: 1c671beab29164d8931c5d01c5739502267089d8
+    name: Hermes ${{ matrix.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: plugin
+      - uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ matrix.revision }}
+          path: hermes-runtime
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -e ../hermes-runtime
+      - name: Validate actual registration and packaged installation
+        env:
+          PYTHONPATH: ${{ github.workspace }}/hermes-runtime:${{ github.workspace }}/plugin:${{ github.workspace }}/plugin/tests
+          HERMES_HOME: ${{ runner.temp }}/loopdy-compat-home
+        run: |
+          python -m unittest discover -s tests -p test_runtime_compatibility.py -v
+          python -m unittest discover -s tests -p test_plugin_update_installation.py -v
+          python -m unittest discover -s tests -p test_room_activity.py -v
+          python -m unittest discover -s tests -p test_workspace_control.py -v
+          python -m unittest discover -s tests -p test_live_voice_runtime.py -v
+          python -m unittest discover -s tests -p test_direct_adapter_integration.py -v
+          python -m unittest discover -s tests -p test_native_voice.py -v
+          python -m unittest discover -s tests -p test_native_api.py -v
+          python -m unittest discover -s tests -p test_adapter.py -v
+          python -m unittest discover -s tests -p test_registration.py -v

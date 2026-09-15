@@ -311,11 +311,11 @@ class GenerativeUiV2ContractTests(unittest.TestCase):
             request_id_factory=None,
         )
 
-        stale = json.loads(handler(payload))
+        stale = json.loads(handler(payload))["card"]
         self.assertEqual(stale["provenance"]["age_seconds"], 480)
 
         del payload["provenance"]["age_seconds"]
-        missing = json.loads(handler(payload))
+        missing = json.loads(handler(payload))["card"]
         self.assertEqual(missing["provenance"]["age_seconds"], 480)
 
     def test_rendered_envelope_recanonicalizes_a_mutated_age(self) -> None:

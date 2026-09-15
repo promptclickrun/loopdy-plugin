@@ -1803,11 +1803,6 @@ class LoopdyAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Render Hermes' prompt, then enqueue one request-bound Home card."""
-        voice = self._live_voice_runtime
-        if voice is not None and await voice.clarification(
-                chat_id=chat_id, question=question, clarify_id=clarify_id,
-                session_key=session_key, lease=current_turn_lease.get()):
-            return SendResult(success=True, message_id=clarify_id)
         from tools.clarify_gateway import (
             get_clarify_timeout,
             get_pending_for_session,
@@ -1817,6 +1812,56 @@ class LoopdyAdapter(BasePlatformAdapter):
         canonical_session = _text(session_key, 180)
         canonical_chat = _text(chat_id, 180)
         canonical_question = _text(question, 2_000)
+        values = metadata or {}
+        profile = (
+            _text(values.get("profile") or values.get("profile_name"), 80)
+            or _active_profile_id()
+        )
+        agent_name = (
+            _text(values.get("agent_name") or values.get("sender_name"), 80)
+            or profile_display_name(profile)
+        )
+
+        async def publish_managed_clarification() -> None:
+            """Publish only from Hermes' exact session row and observed hook turn."""
+            try:
+                store = getattr(self, "_session_store", None)
+                lookup = getattr(store, "lookup_by_session_key", None)
+                if not callable(lookup):
+                    raise RuntimeError("Hermes session index is unavailable")
+
+                def resolve_and_publish() -> None:
+                    entry = lookup(canonical_session)
+                    stored_session_id = str(getattr(entry, "session_id", "") or "").strip()
+                    entry_key = str(getattr(entry, "session_key", "") or "").strip()
+                    origin = getattr(entry, "origin", None)
+                    session_profile = str(getattr(origin, "profile", "") or "").strip()
+                    platform = getattr(getattr(origin, "platform", None), "value", None)
+                    if (entry_key != canonical_session or not stored_session_id
+                            or session_profile != profile or platform != "loopdy"):
+                        raise RuntimeError("Hermes clarification session metadata is unavailable")
+                    from .managed_notifications import get_managed_notifications
+                    get_managed_notifications().publish_observed_clarification(
+                        profile=session_profile,
+                        session_id=stored_session_id,
+                        request_id=canonical_id,
+                        question=canonical_question,
+                    )
+
+                await asyncio.to_thread(resolve_and_publish)
+            except Exception as error:
+                # The actionable Hermes prompt has already been presented. Never
+                # fail or duplicate it because optional push projection is absent.
+                code = str(getattr(error, "code", "") or type(error).__name__)
+                logger.warning("Managed clarification notification unavailable (%s)", code[:96])
+
+        voice = self._live_voice_runtime
+        if voice is not None and await voice.clarification(
+                chat_id=chat_id, question=question, clarify_id=clarify_id,
+                session_key=session_key, lease=current_turn_lease.get()):
+            await publish_managed_clarification()
+            return SendResult(success=True, message_id=clarify_id)
+
         normalized_choices = [
             value
             for value in (_text(choice, 500) for choice in list(choices or ())[:4])
@@ -1852,15 +1897,6 @@ class LoopdyAdapter(BasePlatformAdapter):
                 }
             ],
         }
-        values = metadata or {}
-        profile = (
-            _text(values.get("profile") or values.get("profile_name"), 80)
-            or _active_profile_id()
-        )
-        agent_name = (
-            _text(values.get("agent_name") or values.get("sender_name"), 80)
-            or profile_display_name(profile)
-        )
         detail = {
             "kind": "clarify",
             "request_id": canonical_id,
@@ -1887,6 +1923,7 @@ class LoopdyAdapter(BasePlatformAdapter):
                 status = str((existing or {}).get("status") or "")
                 prompt_message_id = "message_" + event.event_id.rsplit(":", 1)[-1]
                 if status == "sent":
+                    await publish_managed_clarification()
                     return SendResult(success=True, message_id=prompt_message_id)
                 if existing is None:
                     prompt_metadata = dict(metadata or {})
@@ -1917,6 +1954,7 @@ class LoopdyAdapter(BasePlatformAdapter):
                             self.service.store.mark_event_prompted,
                             event.event_id,
                         )
+                await publish_managed_clarification()
                 delivery = await self._deliver_link_notification_locked(
                     event,
                     target=target,
@@ -1933,6 +1971,7 @@ class LoopdyAdapter(BasePlatformAdapter):
         )
         if not result.success:
             return result
+        await publish_managed_clarification()
         self.service.enqueue(event, target=target)
         return result
 

@@ -1,4 +1,4 @@
-"""Notification-only native enrollment and durable, recipient-scoped delivery.
+"""Notification-only native enrollment and durable, account-scoped BuzzKit delivery.
 
 This module owns no Hermes runtime internals. Stock registered observers provide
 lifecycle facts; a plugin-owned worker drains frozen requests over HTTPS. Chat,
@@ -11,6 +11,7 @@ try:
 except ImportError:  # Unsupported private-store locking must not break legacy APIs.
     fcntl = None
 import hashlib
+import base64
 import json
 import logging
 import os
@@ -30,10 +31,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from .relay_crypto import (
-    b64url_decode, b64url_encode, canonical_json_bytes, encrypt_alert, key_id,
-    public_key_bytes, public_key_from_x963, sign_p1363,
-)
+from .relay_crypto import b64url_encode, canonical_json_bytes, key_id, public_key_bytes, sign_p1363
 from .session_state import open_profile_store
 
 ORIGIN = "https://link.loopdy.app"
@@ -41,8 +39,11 @@ ROOT = "/v1/notifications/host-grants"
 _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _PROFILE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
-_EVENT_TYPES = {"session.completed", "session.failed", "approval.required"}
+_EVENT_TYPES = {"session.completed", "session.failed", "approval.required", "clarification.required"}
 _APPROVAL_EVENT = "approval.required"
+_CLARIFICATION_EVENT = "clarification.required"
+_MAX_RICH_TEXT = 1_600
+_MAX_AVATAR_BYTES = 524_288
 _APPROVAL_GRACE_SECONDS = 3
 _APPROVAL_TTL_SECONDS = 60
 _APPROVAL_LIMIT = 4096
@@ -131,9 +132,11 @@ class ManagedNotifications:
         self._worker_lock = None
         self._loaded_profiles: set[str] = set()
         self._approval_profiles: set[str] = set()
+        self._clarification_profiles: set[str] = set()
         # An observation belongs to this producer lifetime, never a recovered prompt.
         self._approval_owner = str(uuid.uuid4())
         self._work: OrderedDict[tuple[str, str, str], dict[str, Any]] = OrderedDict()
+        self._responses: OrderedDict[tuple[str, str, str], str] = OrderedDict()
         self._child_owners: dict[tuple[str, str, str], str] = {}
         self._key = self._identity()
         self.public_key = b64url_encode(public_key_bytes(self._key.public_key()))
@@ -197,11 +200,19 @@ class ManagedNotifications:
         with self._lock:
             loaded = bool(self._loaded_profiles)
             approval_loaded = bool(self._approval_profiles)
+            clarification_loaded = bool(self._clarification_profiles)
         return {"version": 1, "hostKeyId": self.key_id, "hostPublicKey": self.public_key,
                 "managedEnrollmentSupported": True, "supportedEventTypes": sorted(_EVENT_TYPES),
                 "richLiveActivitySupported": True, "producerCapabilities": {
                     "sessionCompletion": loaded, "sessionFailure": loaded, "richLiveActivity": loaded,
-                    "nativeApproval": approval_loaded, "nativeClarification": False}}
+                    "nativeApproval": approval_loaded, "nativeClarification": clarification_loaded}}
+
+    def provider_contract(self) -> dict[str, Any]:
+        return {"version": 1, "provider": "buzzkit", "subscriberScope": "account",
+                "preferences": "buzzkit-topics", "richContentRequired": True,
+                "serverSendingAuthorityOnHost": False,
+                "eventTypes": sorted(_EVENT_TYPES), "maximumAvatarBytes": _MAX_AVATAR_BYTES,
+                "maximumTextCharacters": _MAX_RICH_TEXT}
 
     def _request(self, method: str, grant_id: str, suffix: str = "", raw: bytes = b"",
                  *, before_transport: Callable | None = None):
@@ -217,29 +228,35 @@ class ManagedNotifications:
         return self.transport(method, path, raw, headers)
 
     def _validate_grant(self, value: Any, grant_id: str) -> dict[str, Any]:
-        if not isinstance(value, dict) or value.get("grantId") != grant_id or value.get("hostKeyId") != self.key_id or value.get("hostPublicKey") != self.public_key or value.get("state") != "active":
+        if (not isinstance(value, dict) or value.get("grantId") != grant_id
+                or value.get("hostKeyId") != self.key_id
+                or value.get("hostPublicKey") != self.public_key
+                or value.get("provider") != "buzzkit"
+                or value.get("subscriberScope") != "account"
+                or value.get("state") != "active"):
             raise ManagedNotificationError("notification_grant_identity_mismatch", 403)
-        for field in ("revision", "recipientRevision", "authorizationEpoch", "createdAt", "expiresAt"):
+        for field in ("revision", "authorizationEpoch", "createdAt", "expiresAt"):
             if type(value.get(field)) is not int or value[field] < 1:
                 raise ManagedNotificationError("notification_grant_invalid", 502)
-        if not value["createdAt"] < value["expiresAt"] <= value["createdAt"] + 2592000 or value["expiresAt"] <= int(self.clock()):
+        if (not value["createdAt"] < value["expiresAt"] <= value["createdAt"] + 2592000
+                or value["expiresAt"] <= int(self.clock())):
             raise ManagedNotificationError("notification_grant_expired", 403)
         _identifier(value.get("profile"), _PROFILE)
-        _identifier(value.get("deviceId")); _identifier(value.get("tenantId"))
-        recipient = b64url_decode(value.get("recipientPublicKey"), expected_length=65)
-        public_key_from_x963(recipient)
         event_types = value.get("eventTypes")
-        if (key_id(recipient) != value.get("recipientKeyId") or not isinstance(event_types, list)
-                or not event_types or any(not isinstance(event_type, str) for event_type in event_types)
+        if (not isinstance(event_types, list) or not event_types
+                or any(not isinstance(event_type, str) for event_type in event_types)
                 or len(set(event_types)) != len(event_types) or not set(event_types) <= _EVENT_TYPES):
             raise ManagedNotificationError("notification_grant_invalid", 502)
-        # Public metadata only; whitelist prevents accidental future secrets at rest.
-        fields = ("grantId", "hostKeyId", "hostPublicKey", "deviceId", "recipientPublicKey", "recipientKeyId", "recipientRevision", "authorizationEpoch", "profile", "eventTypes", "createdAt", "expiresAt", "revision", "tenantId", "state")
+        fields = ("grantId", "hostKeyId", "hostPublicKey", "authorizationEpoch", "profile",
+                  "eventTypes", "createdAt", "expiresAt", "revision", "provider",
+                  "subscriberScope", "state")
+        if set(value) != set(fields):
+            raise ManagedNotificationError("notification_grant_invalid", 502)
         return {field: value[field] for field in fields}
 
     def enroll(self, grant_id: str, idempotency_key: str):
         _identifier(grant_id, _UUID); _identifier(idempotency_key, _UUID)
-        value = self._request("POST", grant_id, "/claim", canonical_json_bytes({"version": 1, "idempotencyKey": idempotency_key}))
+        value = self._request("POST", grant_id, "/claim", canonical_json_bytes({"version": 2, "idempotencyKey": idempotency_key}))
         grant = self._validate_grant(value.get("grant"), grant_id)
         with self._db() as db:
             if db.execute("SELECT COUNT(*) FROM grants").fetchone()[0] >= 256 and not db.execute("SELECT 1 FROM grants WHERE grant_id=?", (grant_id,)).fetchone():
@@ -421,8 +438,7 @@ class ManagedNotifications:
         if getattr(event, "type", None) not in {"session.completed", "session.failed"}: return False
         with self._db() as db:
             rows = db.execute("SELECT g.public_json FROM grants g JOIN subscriptions s USING(grant_id) WHERE g.state='active' AND g.expires>? AND s.profile=? AND s.session_id=?", (int(self.clock()), event.profile, event.session_id)).fetchall()
-        return any((grant := json.loads(row["public_json"]))["deviceId"] == device_id
-                   and event.type in grant["eventTypes"] for row in rows)
+        return any(event.type in json.loads(row["public_json"])["eventTypes"] for row in rows)
 
     @staticmethod
     def _approval_event_id(grant_id: str, profile: str, session_id: str, turn_id: str, tool_call_id: str):
@@ -471,21 +487,111 @@ class ManagedNotifications:
             self._retire_approval_scope(profile, session_id, turn_id, tool_call_id, "response")
             return
         self._session(profile, session_id)
-        self._queue_event(profile, session_id, turn_id, _APPROVAL_EVENT, tool_call_id=tool_call_id)
+        content = self._rich_text(payload.get("description") or payload.get("command"))
+        self._queue_event(profile, session_id, turn_id, _APPROVAL_EVENT,
+                          tool_call_id=tool_call_id, content_text=content)
+
+    @staticmethod
+    def _rich_text(value: Any) -> str:
+        if isinstance(value, str):
+            text = " ".join(value.split())
+        elif isinstance(value, dict):
+            text = " ".join(" ".join(str(value.get(key) or "").split())
+                            for key in ("text", "content", "message", "error"))
+            text = " ".join(text.split())
+        else:
+            text = ""
+        if not text:
+            raise ManagedNotificationError("notification_rich_content_required", 422)
+        return text if len(text) <= _MAX_RICH_TEXT else text[:_MAX_RICH_TEXT - 1].rstrip() + "…"
+
+    @staticmethod
+    def _agent_presentation(profile: str) -> tuple[str, dict[str, Any]]:
+        from .adapter import profile_display_name
+        from tui_gateway.server import handle_request
+
+        name = profile_display_name(profile)
+        response = handle_request({"jsonrpc": "2.0", "id": "loopdy-notification-avatar",
+                                   "method": "profiles.get_asset",
+                                   "params": {"name": profile, "asset": "avatar"}})
+        result = response.get("result") if isinstance(response, dict) else None
+        if not isinstance(result, dict) or result.get("found") is not True:
+            raise ManagedNotificationError("notification_agent_avatar_required", 422)
+        mime = result.get("mime")
+        size = result.get("size")
+        data_url = result.get("data")
+        if (mime not in {"image/png", "image/jpeg", "image/webp"}
+                or type(size) is not int or not 1 <= size <= _MAX_AVATAR_BYTES
+                or not isinstance(data_url, str) or not data_url.startswith(f"data:{mime};base64,")):
+            raise ManagedNotificationError("notification_agent_avatar_too_large", 422)
+        try:
+            blob = base64.b64decode(data_url.split(",", 1)[1], validate=True)
+        except (ValueError, TypeError) as error:
+            raise ManagedNotificationError("notification_agent_avatar_invalid", 422) from error
+        if len(blob) != size:
+            raise ManagedNotificationError("notification_agent_avatar_invalid", 422)
+        return name, {"mimeType": mime, "sha256": hashlib.sha256(blob).hexdigest(), "data": data_url}
+
+    def publish_observed_clarification(self, *, profile: str, session_id: str,
+                                       request_id: str, question: str) -> None:
+        """Bind a presented prompt to the one exact live Hermes hook turn.
+
+        The adapter has already resolved ``session_id`` from Hermes' public
+        session index. The turn comes only from the matching ``pre_llm_call``
+        observation; no routing key, request id, timestamp, or generated value is
+        accepted as a substitute.
+        """
+        profile = _identifier(profile, _PROFILE)
+        session_id = _identifier(session_id)
+        self._session(profile, session_id)
+        with self._lock:
+            turns = [key[2] for key, work in self._work.items()
+                     if key[:2] == (profile, session_id)
+                     and not work["terminal"] and work["outcome"] is None]
+        if len(turns) != 1:
+            raise ManagedNotificationError("notification_clarification_turn_unavailable", 409)
+        self.publish_clarification(
+            profile=profile,
+            session_id=session_id,
+            turn_id=turns[0],
+            request_id=request_id,
+            question=question,
+        )
+
+    def publish_clarification(self, *, profile: str, session_id: str, turn_id: str,
+                              request_id: str, question: str) -> None:
+        """Producer seam for the existing clarification presenter.
+
+        The parent adapter wiring calls this only after Hermes emitted an actionable
+        native clarification for the exact stored session. It performs no network I/O.
+        """
+        profile = _identifier(profile, _PROFILE)
+        with self._lock:
+            if profile not in self._clarification_profiles:
+                raise ManagedNotificationError("notification_clarification_producer_unavailable", 503)
+        session_id = _identifier(session_id)
+        turn_id = _identifier(turn_id)
+        request_id = _identifier(request_id)
+        self._session(profile, session_id)
+        self._queue_event(profile, session_id, turn_id, _CLARIFICATION_EVENT,
+                          event_key=request_id, content_text=self._rich_text(question))
 
     def _queue_event(self, profile: str, session_id: str, turn_id: str, event_type: str,
-                     *, tool_call_id: str | None = None):
+                     *, tool_call_id: str | None = None, event_key: str = "",
+                     content_text: str):
         approval = event_type == _APPROVAL_EVENT
         tool_call_id = _identifier(tool_call_id) if approval else ""
+        content_text = self._rich_text(content_text)
+        agent_name, avatar = self._agent_presentation(profile)
         now = int(self.clock())
         with self._db() as db:
-            # Serialize lifecycle tombstones with the event and frozen intent.
             db.execute("BEGIN IMMEDIATE")
             rows = db.execute("SELECT g.* FROM grants g JOIN subscriptions s USING(grant_id) WHERE g.state='active' AND g.expires>? AND s.profile=? AND s.session_id=?", (now, profile, session_id)).fetchall()
             for row in rows:
                 grant = json.loads(row["public_json"])
                 if event_type not in grant["eventTypes"]: continue
-                digest = hashlib.sha256(canonical_json_bytes([profile, session_id, turn_id, event_type])).hexdigest()
+                digest = hashlib.sha256(canonical_json_bytes(
+                    [profile, session_id, turn_id, event_type, event_key])).hexdigest()
                 event_id = self._approval_event_id(grant["grantId"], profile, session_id, turn_id, tool_call_id) if approval else grant["grantId"] + ":" + digest
                 if db.execute("SELECT 1 FROM events WHERE event_id=?", (event_id,)).fetchone(): continue
                 if approval:
@@ -493,32 +599,29 @@ class ManagedNotifications:
                     if db.execute("SELECT 1 FROM approval_attention WHERE event_id IN (?,?)", (event_id, turn_end)).fetchone(): continue
                     if db.execute("SELECT COUNT(*) FROM approval_attention WHERE grant_id=?", (grant["grantId"],)).fetchone()[0] >= _APPROVAL_LIMIT: continue
                 if db.execute("SELECT COUNT(*) FROM events WHERE grant_id=?", (grant["grantId"],)).fetchone()[0] >= 4096: continue
-                if db.execute("SELECT COUNT(*) FROM pending WHERE grant_id=? AND state IN ('pending','sending')", (grant["grantId"],)).fetchone()[0] >= 256: continue
-                from .events import LoopdyEvent
-                policy_event = LoopdyEvent(event_id=event_id, type=event_type, profile=profile, session_id=session_id)
-                policy = self.preference_policy(policy_event, grant["deviceId"]) if self.preference_policy else {}
-                detail = {"eventId": event_id, "eventType": event_type, "profile": profile, "sessionId": session_id, "turnId": turn_id, "occurredAt": now}
-                expires = min(now + (_APPROVAL_TTL_SECONDS if approval else 900), grant["expiresAt"])
+                if db.execute("SELECT COUNT(*) FROM pending WHERE grant_id=? AND state IN ('pending','sending')", (grant["grantId"],)).fetchone()[0] >= 32: continue
+                content_kind = ("approval" if approval else "clarification" if event_type == _CLARIFICATION_EVENT
+                                else "failure" if event_type == "session.failed" else "reply")
+                detail = {"eventId": event_id, "eventType": event_type, "profile": profile,
+                          "sessionId": session_id, "turnId": turn_id, "occurredAt": now,
+                          "agent": {"id": profile, "name": agent_name,
+                                    "avatarSha256": avatar["sha256"]},
+                          "content": {"kind": content_kind, "text": content_text}}
+                expires = min(now + (_APPROVAL_TTL_SECONDS if approval else 300 if event_type == _CLARIFICATION_EVENT else 900), grant["expiresAt"])
                 if approval:
                     db.execute("INSERT INTO approval_attention VALUES(?,?,?,?,?,?,?,?,?,?)",
                                (event_id, grant["grantId"], profile, session_id, turn_id, tool_call_id,
-                                self._approval_owner, "retired" if policy.get("suppression") else "pending",
-                                expires, "suppressed" if policy.get("suppression") else "observed"))
-                if policy.get("suppression"):
-                    # Suppression is durable; a retry or quiet-hours boundary cannot replay it.
-                    db.execute("INSERT INTO events VALUES(?,?,?,?)", (event_id, grant["grantId"], canonical_json_bytes(detail).decode(), now))
-                    continue
-                body = "Your agent requested approval" if approval else ("Your agent finished" if event_type == "session.completed" else "Your agent could not finish")
-                envelope = encrypt_alert(tenant_id=grant["tenantId"], device_id=grant["deviceId"],
-                    delivery_id="ng-" + str(uuid.uuid5(uuid.NAMESPACE_URL, event_id)), event_id=event_id,
-                    event_type=event_type, title="Loopdy", body=body,
-                    recipient_public_key=b64url_decode(grant["recipientPublicKey"], expected_length=65), sender_private_key=self._key,
-                    issued=now, expires=expires, ephemeral_private_key=ec.generate_private_key(ec.SECP256R1()), salt=os.urandom(32), nonce=os.urandom(12))
+                                self._approval_owner, "pending", expires, "observed"))
                 reference = session_reference(profile, session_id)
-                raw = canonical_json_bytes({"version": 1, "eventId": event_id, "eventType": event_type, "sessionReference": reference, "envelope": envelope, "sound": policy.get("sound") is not False})
-                db.execute("INSERT INTO events VALUES(?,?,?,?)", (event_id, grant["grantId"], canonical_json_bytes(detail).decode(), now))
+                raw = canonical_json_bytes({"version": 2, "eventId": event_id,
+                    "eventType": event_type, "sessionReference": reference, "turnId": turn_id,
+                    "occurredAt": now, "agent": {"id": profile, "name": agent_name, "avatar": avatar},
+                    "content": {"kind": content_kind, "text": content_text}, "sound": True})
+                db.execute("INSERT INTO events VALUES(?,?,?,?)",
+                           (event_id, grant["grantId"], canonical_json_bytes(detail).decode(), now))
                 due = now + _APPROVAL_GRACE_SECONDS if approval else now
-                db.execute("INSERT INTO pending(intent_id,grant_id,path,raw,expires,state,next_attempt,session_ref) VALUES(?,?,?,?,?,'pending',?,?)", (event_id, grant["grantId"], "/events", raw, expires, due, reference))
+                db.execute("INSERT INTO pending(intent_id,grant_id,path,raw,expires,state,next_attempt,session_ref) VALUES(?,?,?,?,?,'pending',?,?)",
+                           (event_id, grant["grantId"], "/events", raw, expires, due, reference))
         self._wake.set()
 
     def observe(self, hook: str, *, profile: str, **payload: Any):
@@ -544,6 +647,18 @@ class ManagedNotifications:
         with self._db() as db:
             if not db.execute("SELECT 1 FROM subscriptions s JOIN grants g USING(grant_id) WHERE s.profile=? AND s.session_id=? AND g.state='active' AND g.expires>?", (profile, session_id, int(self.clock()))).fetchone(): return
         turn = payload.get("turn_id")
+        if hook == "post_llm_call" and isinstance(turn, str) and _ID.fullmatch(turn):
+            coordinate = (profile, session_id, turn)
+            try:
+                response_text = self._rich_text(payload.get("assistant_response"))
+            except ManagedNotificationError:
+                response_text = ""
+            if response_text:
+                with self._lock:
+                    self._responses[coordinate] = response_text
+                    self._responses.move_to_end(coordinate)
+                    while len(self._responses) > 256:
+                        self._responses.popitem(last=False)
         if not child_hook and isinstance(turn, str) and _ID.fullmatch(turn):
             if hook == "on_session_end":
                 self._retire_approval_scope(profile, session_id, turn, "", "turn_end")
@@ -553,10 +668,18 @@ class ManagedNotifications:
                     self._retire_approval_scope(profile, session_id, turn, tool, "tool_end")
         if (hook == "on_session_end" and isinstance(turn, str) and _ID.fullmatch(turn)
                 and payload.get("interrupted") is not True):
-            if payload.get("failed") is True:
-                self._queue_event(profile, session_id, turn, "session.failed")
-            elif payload.get("completed") is True:
-                self._queue_event(profile, session_id, turn, "session.completed")
+            with self._lock:
+                content = self._responses.pop((profile, session_id, turn), "")
+            # Alert presentation must not prevent the authoritative work/Activity
+            # terminal below, including turns with no text or unavailable avatars.
+            try:
+                if payload.get("failed") is True:
+                    content = self._rich_text(payload.get("error") or content)
+                    self._queue_event(profile, session_id, turn, "session.failed", content_text=content)
+                elif payload.get("completed") is True and content:
+                    self._queue_event(profile, session_id, turn, "session.completed", content_text=content)
+            except (ValueError, OSError):
+                logger.warning("Notification presentation unavailable; work state remains authoritative")
         with self._lock:
             if child_hook:
                 child = payload.get("child_session_id") or payload.get("child_subagent_id")
@@ -637,7 +760,7 @@ class ManagedNotifications:
                 expires = min(timestamp + 120, row["grant_expires"], row["lease_expires"])
                 if expires <= timestamp: continue
                 update_id = b64url_encode(hashlib.sha256(canonical_json_bytes([row["grant_id"], row["activity_id"], turn, signature, timestamp])).digest())
-                update = {"version": 1, "updateId": update_id, "sessionReference": row["session_ref"], "phase": phase,
+                update = {"version": 2, "updateId": update_id, "sessionReference": row["session_ref"], "phase": phase,
                           "currentAction": action, "progress": 100 if terminal else 0, "completedSteps": 0,
                           "activeSubagentCount": count, "latestTool": None, "timestamp": timestamp, "expires": expires}
                 due = now if terminal or phase == "waiting" else max(now, pending["next_attempt"] if pending else row["last_queued_at"] + 30)
@@ -647,11 +770,15 @@ class ManagedNotifications:
                 db.execute("UPDATE activities SET work_turn=?,state=?,last_timestamp=?,last_signature=?,last_queued_at=? WHERE activity_id=?", (turn, "terminal_pending" if terminal else "active", timestamp, signature, due, row["activity_id"]))
         self._wake.set()
 
-    def producer_loaded(self, profile: str, *, start_worker: bool = True, approval_hooks_loaded: bool = False):
+    def producer_loaded(self, profile: str, *, start_worker: bool = True,
+                        approval_hooks_loaded: bool = False,
+                        clarification_producer_loaded: bool = False):
         with self._lock:
             self._loaded_profiles.add(profile)
             if approval_hooks_loaded:
                 self._approval_profiles.add(profile)
+            if clarification_producer_loaded:
+                self._clarification_profiles.add(profile)
             if start_worker and self._worker is None:
                 lock_path = self.directory / "worker.lock"
                 fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -669,6 +796,7 @@ class ManagedNotifications:
         with self._lock:
             self._loaded_profiles.clear()
             self._approval_profiles.clear()
+            self._clarification_profiles.clear()
             if self._worker_lock is not None and (self._worker is None or not self._worker.is_alive()):
                 self._worker_lock.close(); self._worker_lock = None
 

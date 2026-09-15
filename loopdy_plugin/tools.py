@@ -6,7 +6,12 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from .generative_ui import V2_COMPONENTS, render_envelope, render_v2_envelope
+from .generative_ui import (
+    V2_COMPONENTS,
+    render_envelope,
+    render_v2_envelope,
+    rendered_card_delivery,
+)
 from .loopdy_cards import canonical_json as canonical_card_json
 from .loopdy_cards import render_card
 from .store import form_action_response
@@ -33,7 +38,12 @@ def _handler(tool_name):
     def handle(payload, **_kwargs):
         if not isinstance(payload, dict):
             raise ValueError("renderer arguments must be an object")
-        return json.dumps(render_envelope(tool_name, payload), ensure_ascii=False)
+        return json.dumps(
+            rendered_card_delivery(render_envelope(tool_name, payload)),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
     return handle
 
 
@@ -86,7 +96,7 @@ def _card_parameters() -> dict[str, Any]:
 
 def _card_handler(now: Callable[[], datetime]):
     def handle(payload, **_kwargs):
-        return canonical_card_json(render_card(payload, now=now()))
+        return canonical_card_json(rendered_card_delivery(render_card(payload, now=now())))
 
     return handle
 
@@ -108,6 +118,14 @@ def _v2_data_schema(component: str) -> dict[str, Any]:
     if component == "dashboard":
         metric = _strict_object({"id": identifier, "label": _text(80), "value_text": _text(60), "secondary_text": _text(100), "status": {"type": "string", "enum": ["neutral", "positive", "warning", "negative"]}, "status_label": _text(60)}, ["id", "label", "value_text", "status", "status_label"])
         return _strict_object({"description": _text(300), "metrics": {"type": "array", "minItems": 1, "maxItems": 12, "items": metric}, "charts": {"type": "array", "maxItems": 2, "items": _chart_schema(3, 40)}}, ["description", "metrics"])
+    if component == "checklist":
+        item = _strict_object({"id": identifier, "label": _text(120), "detail": _text(240), "completed": {"type": "boolean"}}, ["id", "label", "completed"])
+        return _strict_object({"description": _text(300), "items": {"type": "array", "minItems": 1, "maxItems": 40, "items": item}}, ["items"])
+    if component == "selection":
+        option = _strict_object({"id": identifier, "label": _text(120), "detail": _text(240), "enabled": {"type": "boolean"}, "stage_text": {"type": "string", "minLength": 1, "maxLength": 500}}, ["id", "label", "enabled", "stage_text"])
+        return _strict_object({"description": _text(300), "mode": {"type": "string", "enum": ["single", "multiple"]}, "options": {"type": "array", "minItems": 1, "maxItems": 24, "items": option}, "max_selected": _integer(1, 10), "submit_label": _text(40)}, ["mode", "options", "submit_label"])
+    if component == "automation":
+        return _strict_object({"description": _text(300), "job_id": _text(120), "profile": _text(120), "state": {"type": "string", "enum": ["active", "paused", "completed", "failed"]}, "schedule": _text(240), "delivery": _text(160), "prompt": {"type": "string", "minLength": 1, "maxLength": 1600}, "next_runs": {"type": "array", "maxItems": 7, "items": {"type": "string", "format": "date-time"}}, "operations": {"type": "array", "maxItems": 3, "uniqueItems": True, "items": {"type": "string", "enum": ["pause", "resume", "run"]}}, "stage_text": {"type": "string", "minLength": 1, "maxLength": 1600}}, ["job_id", "profile", "state", "schedule", "delivery", "prompt", "operations"])
     option = _strict_object({"id": identifier, "label": _text(80)}, ["id", "label"])
     options = {"type": "array", "minItems": 1, "maxItems": 20, "items": option}
     common = {"id": identifier, "label": _text(100), "help_text": _text(240), "required": {"type": "boolean"}}
@@ -180,7 +198,12 @@ def _v2_handler(
                 created_at=int(created.timestamp()),
                 expires_at=int(created.timestamp()) + 300,
             )
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        return json.dumps(
+            rendered_card_delivery(value),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
     return handle
 
 
@@ -287,7 +310,7 @@ def _template_render_handler(
         )
         # This deliberately ends on the same renderer-owned validator as
         # loopdy_render_card; templates do not gain a parallel rendering path.
-        return canonical_card_json(render_card(document, now=now()))
+        return canonical_card_json(rendered_card_delivery(render_card(document, now=now())))
 
     return handle
 
@@ -503,10 +526,16 @@ _MISSING_TEMPLATE_PARAMETER = object()
 
 
 def _template_tool_description(action: str) -> str:
+    delivery = (
+        " The tool call alone does not display a rendered card: include the returned "
+        "display_markdown exactly once in the assistant answer."
+        if action == "Render" else ""
+    )
     return (
         f"{action} profile-installed Loopdy Card templates for the direct callable native "
         "Loopdy renderer. Call it when visible in the current tool list. When progressively "
         "disclosed, use tool_search, tool_describe, and tool_call to invoke this exact tool."
+        + delivery
     )
 
 
@@ -615,6 +644,8 @@ def register(
                 "name": name,
                 "description": (
                     f"Render a bounded Loopdy {component} display-only card. "
+                    "The tool call alone does not display the card: include the returned "
+                    "display_markdown exactly once in the assistant answer. "
                     "This is a direct callable native Loopdy renderer. Call it directly "
                     "when it is visible in the current tool list. When Hermes has "
                     "progressively disclosed it and it is absent, use the official "
@@ -634,7 +665,9 @@ def register(
                 "name": name,
                 "description": (
                     f"Render a bounded Loopdy {component} native v2 card. This is a direct callable "
-                    "native Loopdy renderer. Call it directly when it is visible in the current "
+                    "native Loopdy renderer. The tool call alone does not display the card: include "
+                    "the returned display_markdown exactly once in the assistant answer. Call it "
+                    "directly when it is visible in the current "
                     "tool list. When Hermes has progressively disclosed it and it is absent, use "
                     "the official tool_search, tool_describe, and tool_call bridge to invoke this "
                     "exact renderer; do not substitute or wrap another tool."
@@ -661,9 +694,11 @@ def register(
                 "Call this renderer directly when it is visible in the current tool list. When Hermes has progressively "
                 "disclosed it and it is absent, use the official tool_search, tool_describe, "
                 "and tool_call bridge to invoke this exact renderer; do not substitute or "
-                "wrap another tool. For scheduler-owned Loopdy Inbox delivery, your final response must be "
-                "exactly the returned JSON envelope, with no prose or code fence. The renderer tool result "
-                "alone is not delivered by cron. In a normal interactive chat, do not repeat the JSON."
+                "wrap another tool. In normal interactive chat, the tool call alone does not display the card: "
+                "include the returned display_markdown exactly once in the assistant answer. For scheduler-owned "
+                "Loopdy Inbox delivery, preserve the raw-envelope path: your final response must be exactly the "
+                "JSON object in the returned card field, with no prose or code fence. The renderer tool result "
+                "alone is not delivered by cron."
             ),
             "parameters": _card_parameters(),
         },

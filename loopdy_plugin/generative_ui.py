@@ -71,6 +71,13 @@ def render_envelope(tool_name, payload):
 
 V2_MAX_BYTES = 32_768
 ACTION_MAX_BYTES = 8_192
+CARD_DELIVERY_SCHEMA = "loopdy.card_delivery"
+CARD_DELIVERY_VERSION = 1
+CARD_FENCE_LANGUAGE = "loopdy-card"
+CARD_DELIVERY_INSTRUCTION = (
+    "Calling the renderer does not display the card. Include display_markdown "
+    "exactly once in the assistant answer."
+)
 V2_COMPONENTS = (
     "weather_forecast",
     "sports_game",
@@ -78,6 +85,9 @@ V2_COMPONENTS = (
     "chart",
     "dashboard",
     "form",
+    "checklist",
+    "selection",
+    "automation",
 )
 V2_FORBIDDEN = {
     "url", "uri", "href", "style", "styles", "css", "html", "javascript",
@@ -117,6 +127,48 @@ def canonical_json(value: Any) -> str:
         raise GenerativeUIError("invalid_payload", "Payload is not canonical JSON") from error
     except TypeError as error:
         raise GenerativeUIError("invalid_payload", "Payload is not canonical JSON") from error
+
+
+def rendered_card_delivery(card: Any) -> dict[str, Any]:
+    """Build the inert Markdown carriage used by durable assistant messages."""
+
+    validated = validate_rendered_envelope(card)
+    card_json = canonical_json(validated)
+    return {
+        "schema": CARD_DELIVERY_SCHEMA,
+        "version": CARD_DELIVERY_VERSION,
+        "card": validated,
+        "display_markdown": f"```{CARD_FENCE_LANGUAGE}\n{card_json}\n```",
+        "instruction": CARD_DELIVERY_INSTRUCTION,
+    }
+
+
+def extract_rendered_envelope(value: Any) -> dict[str, Any]:
+    """Accept a legacy raw result or a strict renderer delivery wrapper."""
+
+    if isinstance(value, (str, bytes)):
+        value = parse_v2_json(value)
+    if not isinstance(value, dict):
+        raise GenerativeUIError("invalid_payload", "Renderer result must be an object")
+    if value.get("schema") != CARD_DELIVERY_SCHEMA:
+        return validate_rendered_envelope(value)
+    _object(
+        value,
+        {"schema", "version", "card", "display_markdown", "instruction"},
+        {"schema", "version", "card", "display_markdown", "instruction"},
+    )
+    if value.get("version") != CARD_DELIVERY_VERSION or isinstance(value.get("version"), bool):
+        raise GenerativeUIError("unsupported_version", "Unsupported card delivery version")
+    card = validate_rendered_envelope(value.get("card"))
+    expected_markdown = (
+        f"```{CARD_FENCE_LANGUAGE}\n{canonical_json(card)}\n```"
+    )
+    if (
+        value.get("display_markdown") != expected_markdown
+        or value.get("instruction") != CARD_DELIVERY_INSTRUCTION
+    ):
+        raise GenerativeUIError("invalid_payload", "Card delivery wrapper does not match its card")
+    return card
 
 
 def parse_v2_json(raw: str | bytes) -> dict[str, Any]:
@@ -231,8 +283,11 @@ def validate_rendered_envelope(value: Any) -> dict[str, Any]:
         raise GenerativeUIError("unsupported_version", "Unsupported Generative UI version")
 
     _payload_size(value, V2_MAX_BYTES)
-    _global_check(value)
     component = value.get("component")
+    # Only the renderer-owned form action is validated by its exact typed
+    # schema below. Arbitrary action fields elsewhere remain forbidden.
+    _global_check({key: item for key, item in value.items()
+                   if not (component == "form" and key == "action")})
     if component not in V2_COMPONENTS:
         raise GenerativeUIError("unsupported_component", "Unsupported Generative UI component")
     allowed = {
@@ -335,6 +390,9 @@ def _validate_component(component: str, data: Any) -> dict[str, Any]:
         "chart": lambda value: _chart(value, 6, 60, 240),
         "dashboard": _dashboard,
         "form": _form,
+        "checklist": _checklist,
+        "selection": _selection,
+        "automation": _automation,
     }[component](data)
 
 
@@ -565,6 +623,114 @@ def _form(value: Any) -> dict[str, Any]:
             if "default" in parsed and (("min" in parsed and parsed["default"] < parsed["min"]) or ("max" in parsed and parsed["default"] > parsed["max"])): _raise("invalid_value", "Date default is outside the declared range")
         normalized.append(item)
     return {"description": _string(value["description"], 1, 300), "submit_label": _string(value["submit_label"], 1, 40), "fields": normalized}
+
+
+def _checklist(value: Any) -> dict[str, Any]:
+    _object(value, {"description", "items"}, {"items"})
+    items = _array(value["items"], 1, 40)
+    normalized = []
+    ids = set()
+    for raw in items:
+        _object(raw, {"id", "label", "detail", "completed"}, {"id", "label", "completed"})
+        item_id = _identifier_v2(raw["id"])
+        if item_id in ids:
+            _raise("invalid_value", "Checklist item IDs must be unique")
+        ids.add(item_id)
+        item = {
+            "id": item_id,
+            "label": _string(raw["label"], 1, 120),
+            "completed": _boolean(raw["completed"]),
+        }
+        if "detail" in raw:
+            item["detail"] = _string(raw["detail"], 1, 240)
+        normalized.append(item)
+    result: dict[str, Any] = {"items": normalized}
+    if "description" in value:
+        result["description"] = _string(value["description"], 1, 300)
+    return result
+
+
+def _selection(value: Any) -> dict[str, Any]:
+    _object(
+        value,
+        {"description", "mode", "options", "max_selected", "submit_label"},
+        {"mode", "options", "submit_label"},
+    )
+    mode = _enum(value["mode"], {"single", "multiple"})
+    options = _array(value["options"], 1, 24)
+    normalized = []
+    ids = set()
+    for raw in options:
+        _object(
+            raw,
+            {"id", "label", "detail", "enabled", "stage_text"},
+            {"id", "label", "enabled", "stage_text"},
+        )
+        option_id = _identifier_v2(raw["id"])
+        if option_id in ids:
+            _raise("invalid_value", "Selection option IDs must be unique")
+        ids.add(option_id)
+        option = {
+            "id": option_id,
+            "label": _string(raw["label"], 1, 120),
+            "enabled": _boolean(raw["enabled"]),
+            "stage_text": _string(raw["stage_text"], 1, 500, textarea=True),
+        }
+        if "detail" in raw:
+            option["detail"] = _string(raw["detail"], 1, 240)
+        normalized.append(option)
+    result: dict[str, Any] = {
+        "mode": mode,
+        "options": normalized,
+        "submit_label": _string(value["submit_label"], 1, 40),
+    }
+    if "description" in value:
+        result["description"] = _string(value["description"], 1, 300)
+    if mode == "multiple":
+        result["max_selected"] = _integer(
+            value.get("max_selected", min(10, len(options))),
+            1,
+            min(10, len(options)),
+        )
+    elif "max_selected" in value:
+        _raise("invalid_value", "Single selection cannot declare max_selected")
+    return result
+
+
+def _automation(value: Any) -> dict[str, Any]:
+    _object(
+        value,
+        {
+            "description", "job_id", "profile", "state", "schedule", "delivery",
+            "prompt", "next_runs", "operations", "stage_text",
+        },
+        {"job_id", "profile", "state", "schedule", "delivery", "prompt", "operations"},
+    )
+    operations = [_enum(item, {"pause", "resume", "run"}) for item in _array(value["operations"], 0, 3)]
+    if len(set(operations)) != len(operations):
+        _raise("invalid_value", "Automation operations must be unique")
+    state = _enum(value["state"], {"active", "paused", "completed", "failed"})
+    if ("pause" in operations and state != "active") or ("resume" in operations and state != "paused"):
+        _raise("invalid_value", "Automation operations do not match the snapshot state")
+    result: dict[str, Any] = {
+        "job_id": _string(value["job_id"], 1, 120),
+        "profile": _string(value["profile"], 1, 120),
+        "state": state,
+        "schedule": _string(value["schedule"], 1, 240),
+        "delivery": _string(value["delivery"], 1, 160),
+        "prompt": _string(value["prompt"], 1, 1_600, textarea=True),
+        "operations": operations,
+    }
+    if "description" in value:
+        result["description"] = _string(value["description"], 1, 300)
+    if "next_runs" in value:
+        result["next_runs"] = [
+            _timestamp_text(_timestamp(item))
+            for item in _array(value["next_runs"], 0, 7)
+        ]
+    if "stage_text" in value:
+        result["stage_text"] = _string(value["stage_text"], 1, 1_600, textarea=True)
+    return result
 
 
 def _submitted_value(field: dict[str, Any], value: Any) -> Any:

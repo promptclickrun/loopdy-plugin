@@ -57,7 +57,7 @@ class GenerativeUiActionTests(unittest.TestCase):
                 session_id=session_id,
                 task_id="task-1",
             )
-        )
+        )["card"]
 
     def submit(self, *, key: str = KEY_ONE, values: dict | None = None, session_id: str = "stored-session", now: int = NOW_SECONDS + 10) -> dict:
         values = values or {"departure_day": "friday", "bags": 2}
@@ -80,6 +80,7 @@ class GenerativeUiActionTests(unittest.TestCase):
                 "loopdy_render_weather_forecast", "loopdy_render_sports_game", "loopdy_render_stock_quote",
                 "loopdy_render_chart", "loopdy_render_dashboard", "loopdy_render_form",
                 "loopdy_render_card",
+                "loopdy_render_checklist", "loopdy_render_selection", "loopdy_render_automation",
                 "loopdy_search_card_templates", "loopdy_get_card_template", "loopdy_render_card_template",
                 "loopdy_await_form_response", "loopdy_marketplace_prepare_upload",
             },

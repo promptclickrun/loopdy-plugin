@@ -58,6 +58,12 @@ def capabilities():
     return _call(lambda: get_managed_notifications().capabilities())
 
 
+@router.get("/provider")
+def provider():
+    """Safe readiness contract; never returns a BuzzKit key or subscriber id."""
+    return _call(lambda: get_managed_notifications().provider_contract())
+
+
 @router.post("/enroll")
 def enroll(body: EnrollmentBody):
     return _call(lambda: get_managed_notifications().enroll(body.grantId, body.idempotencyKey))

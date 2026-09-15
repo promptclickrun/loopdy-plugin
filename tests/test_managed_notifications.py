@@ -5,6 +5,8 @@ import sqlite3
 import tempfile
 import unittest
 import uuid
+import hashlib
+from unittest.mock import patch
 from cryptography.hazmat.primitives.asymmetric import ec
 from loopdy_plugin.managed_notifications import ManagedNotifications, ManagedNotificationError, host_request_transcript
 from loopdy_plugin.relay_crypto import b64url_encode, b64url_decode, key_id, public_key_bytes, public_key_from_x963, verify_p1363
@@ -19,11 +21,13 @@ class ManagedNotificationTests(unittest.TestCase):
         self.grant_id = str(uuid.uuid4())
         self.service = ManagedNotifications(Path(self.temp.name)/"managed", transport=self.transport,
             clock=lambda: self.now, session_opener=lambda profile, read, read_only: read(self))
-        recipient = public_key_bytes(ec.generate_private_key(ec.SECP256R1()).public_key())
+        avatar = {"mimeType":"image/png","sha256":hashlib.sha256(b"fixture-avatar").hexdigest(),"data":"data:image/png;base64,Zml4dHVyZS1hdmF0YXI="}
+        presentation = patch.object(ManagedNotifications, "_agent_presentation", return_value=("Fixture Agent", avatar))
+        presentation.start()
+        self.addCleanup(presentation.stop)
         self.grant = dict(grantId=self.grant_id,hostKeyId=self.service.key_id,hostPublicKey=self.service.public_key,
-            deviceId="mobile-a",recipientPublicKey=b64url_encode(recipient),recipientKeyId=key_id(recipient),
-            recipientRevision=1,authorizationEpoch=1,profile="default",eventTypes=["session.completed","session.failed"],
-            createdAt=self.now-10,expiresAt=self.now+3600,revision=1,tenantId="fixture-tenant",state="active")
+            authorizationEpoch=1,profile="default",eventTypes=["session.completed","session.failed"],
+            createdAt=self.now-10,expiresAt=self.now+3600,revision=1,provider="buzzkit",subscriberScope="account",state="active")
         self.service.enroll(self.grant_id,str(uuid.uuid4()))
         self.service.subscribe(self.grant_id,"default","native-session",True)
         self.calls.clear()
@@ -42,12 +46,12 @@ class ManagedNotificationTests(unittest.TestCase):
         verify_p1363(public,b64url_decode(headers["x-loopdy-signature"]),signed)
         if path.endswith("/events"):
             if self.fail_send: raise ManagedNotificationError("synthetic_unavailable",503)
-            return {"version":1,"status":"accepted","deliveryId":json.loads(raw)["envelope"]["delivery_id"]}
+            return {"version":1,"status":"accepted","deliveryId":"msg_fixture"}
         return {"version":1,"grant":self.grant}
 
     def test_capability_distinguishes_supported_events_from_lazy_producer_load(self):
         caps=self.service.capabilities()
-        self.assertEqual(set(caps["supportedEventTypes"]),{"session.completed","session.failed","approval.required"})
+        self.assertEqual(set(caps["supportedEventTypes"]),{"session.completed","session.failed","approval.required","clarification.required"})
         self.assertFalse(caps["producerCapabilities"]["nativeApproval"])
         self.assertFalse(caps["producerCapabilities"]["sessionCompletion"])
         self.service.producer_loaded("default",start_worker=False)
@@ -129,8 +133,9 @@ class ManagedNotificationTests(unittest.TestCase):
         with self.assertRaises(ManagedNotificationError):
             self.service.work_snapshot(self.grant_id,"default","unsubscribed")
 
-    def test_one_native_terminal_event_persists_and_retries_identical_ciphertext(self):
+    def test_one_native_terminal_event_persists_and_retries_identical_rich_payload(self):
         payload=dict(profile="default",session_id="native-session",turn_id="turn-a",completed=True,platform="desktop")
+        self.service.observe("post_llm_call",profile="default",session_id="native-session",turn_id="turn-a",assistant_response="The requested fixture work is complete.")
         self.service.observe("on_session_end",**payload)
         self.service.observe("on_session_end",**payload)
         with sqlite3.connect(self.service.db_path) as db:
@@ -168,16 +173,17 @@ class ManagedNotificationTests(unittest.TestCase):
             with self.assertRaises(ManagedNotificationError): reopened.enrollment(self.grant_id)
         finally: reopened.close()
 
-    def test_policy_suppression_is_durable_not_delayed_until_quiet_hours_end(self):
+    def test_vendor_preference_authority_is_not_duplicated_in_plugin_policy(self):
         self.service.preference_policy=lambda event,device:{"suppression":"quiet_hours","sound":False}
         payload=dict(profile="default",session_id="native-session",turn_id="turn-a",completed=True,platform="desktop")
+        self.service.observe("post_llm_call",profile="default",session_id="native-session",turn_id="turn-a",assistant_response="A real fixture reply")
         self.service.observe("on_session_end",**payload)
         self.service.preference_policy=None
         self.service.observe("on_session_end",**payload)
         self.service.drain_pending()
-        self.assertEqual(self.calls,[])
+        self.assertEqual(len(self.calls),1)
         with sqlite3.connect(self.service.db_path) as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM events").fetchone()[0],1)
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM pending").fetchone()[0],0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM pending WHERE state='accepted'").fetchone()[0],1)
 
 if __name__ == "__main__": unittest.main()

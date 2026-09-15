@@ -44,7 +44,7 @@ class ManagedApprovalNotificationTests(unittest.TestCase):
                 "SELECT raw FROM pending WHERE state='pending' AND grant_id=? AND path='/events'",
                 (self.grant_id,))]
 
-    def test_human_approval_queues_one_exact_grant_owned_generic_alert(self):
+    def test_human_approval_queues_exact_grant_owned_request_content(self):
         self.enroll_approval()
         self.service.observe("pre_llm_call", profile="default", session_id="native-session",
                              turn_id="turn-a", platform="desktop")
@@ -57,7 +57,7 @@ class ManagedApprovalNotificationTests(unittest.TestCase):
         detail = self.service.event(self.grant_id, rows[0]["eventId"])["event"]
         self.assertEqual(detail["turnId"], "turn-a")
         self.assertEqual(detail["sessionId"], "native-session")
-        self.assertNotIn("PRIVATE", json.dumps(detail))
+        self.assertEqual(detail["content"]["text"], "PRIVATE description")
         self.assertNotIn("requestId", detail, "The observer did not supply a native request ID")
 
     def test_old_completion_only_grant_does_not_authorize_approval(self):

@@ -41,7 +41,7 @@ from .activity_bridge import (
 from .attachments import AttachmentStore
 from .events import LoopdyEvent
 from .hooks import normalize_hook
-from .generative_ui import parse_v2_json, validate_rendered_envelope
+from .generative_ui import extract_rendered_envelope
 from .link_client import load_runtime_config
 from .link_contracts import generative_ui_event, notification_event
 from .link_identity import pre_llm_context_from_state
@@ -341,7 +341,11 @@ def register(
         if approval_hooks_supported:
             for hook in ("pre_approval_request", "post_approval_response"):
                 ctx.register_hook(hook, partial(observe_managed, hook))
-        managed.producer_loaded(profile, approval_hooks_loaded=approval_hooks_supported)
+        managed.producer_loaded(
+            profile,
+            approval_hooks_loaded=approval_hooks_supported,
+            clarification_producer_loaded=True,
+        )
         ctx.on_unload(managed.close)
     except (OSError, ValueError, sqlite3.Error):
         # Notification storage/identity failure must never break foreground chat.
@@ -402,6 +406,10 @@ def _pre_llm_call(
         "polished use cases. For a new static layout that does not match a typed renderer, "
         "use loopdy_render_card with embedded values and an empty data_sources array. "
         "Live Loopdy Card data refresh is unavailable in this release. "
+        "In interactive chat, a renderer tool call alone does not display a card: include the returned "
+        "display_markdown exactly once in the assistant answer so it survives history and exports. "
+        "For scheduler-owned Loopdy Inbox delivery, instead return only the raw JSON object from the "
+        "wrapper's card field. "
         "For current weather or forecast requests, use "
         "loopdy_render_weather_forecast after obtaining the data when a card is useful; "
         "if Hermes has progressively disclosed the renderer, use the official "
@@ -478,9 +486,7 @@ def _publish_generative_ui_result(
     if not link_session_id or not tool_call_id:
         return
     try:
-        result = payload.get("result")
-        decoded = result if isinstance(result, dict) else parse_v2_json(result)
-        card = validate_rendered_envelope(decoded)
+        card = extract_rendered_envelope(payload.get("result"))
         profile = str(payload.get("profile_name") or "default").strip() or "default"
         digest = hashlib.sha256(
             f"{link_session_id}\x1f{turn_id}\x1f{tool_call_id}".encode("utf-8")

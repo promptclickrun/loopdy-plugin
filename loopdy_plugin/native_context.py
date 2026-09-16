@@ -137,4 +137,18 @@ def native_context(request: Request) -> NativeContext:
     from .native_project_git import CAPABILITY as project_git_capability, supported as project_git_supported
     if project_git_supported():
         features.append(project_git_capability)
+    try:
+        from .agent_templates import CAPABILITY as agent_templates_capability
+        from .agent_templates import available as agent_templates_available
+        if agent_templates_available():
+            features.append(agent_templates_capability)
+    except ImportError:
+        pass
+    try:
+        from .workspace_artifacts import CAPABILITY as workspace_files_capability
+        from .workspace_artifacts import available as workspace_files_available
+        if workspace_files_available():
+            features.append(workspace_files_capability)
+    except ImportError:
+        pass
     return NativeContext(provider, user_id, display_name, profile, tuple(features), RUNTIME_ID)

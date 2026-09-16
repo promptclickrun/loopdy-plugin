@@ -761,16 +761,69 @@ class LoopdyStore:
             row = connection.execute(
                 "SELECT value FROM metadata WHERE key='provider_mode'"
             ).fetchone()
-        return _provider_mode(row["value"] if row is not None else "relay")
+        return _provider_mode(row["value"] if row is not None else "managed")
 
     def set_provider_mode(self, mode: str) -> None:
-        normalized = _provider_mode(mode)
+        requested = str(mode or "").strip().lower()
+        if requested not in {"managed", "direct"}:
+            raise ValueError("Loopdy provider mode must be managed or direct")
         with self._connect() as connection:
             connection.execute(
                 "INSERT INTO metadata(key, value) VALUES ('provider_mode', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (normalized,),
+                (requested,),
             )
+
+    def retire_legacy_relay(self) -> bool:
+        """Atomically remove persisted Cloudflare relay delivery state."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            mode = connection.execute(
+                "SELECT value FROM metadata WHERE key='provider_mode'"
+            ).fetchone()
+            has_config = connection.execute(
+                "SELECT 1 FROM metadata WHERE key='relay_config_v1'"
+            ).fetchone() is not None
+            has_devices = connection.execute(
+                "SELECT 1 FROM devices WHERE provider IN ('relay', 'legacy_relay') LIMIT 1"
+            ).fetchone() is not None
+            has_activity = connection.execute(
+                "SELECT 1 FROM relay_live_activities LIMIT 1"
+            ).fetchone() is not None
+            has_operations = connection.execute(
+                "SELECT 1 FROM pending_relay_operations LIMIT 1"
+            ).fetchone() is not None
+            has_updates = connection.execute(
+                "SELECT 1 FROM pending_relay_live_activity_updates LIMIT 1"
+            ).fetchone() is not None
+            has_deliveries = connection.execute(
+                "SELECT 1 FROM event_deliveries WHERE provider='relay' LIMIT 1"
+            ).fetchone() is not None
+            if not any((has_config, has_devices, has_activity, has_operations, has_updates,
+                        has_deliveries, mode is not None and str(mode["value"]) == "relay")):
+                return False
+            generation = self._metadata_integer(connection, "relay_config_generation", 0) + 1
+            connection.execute("DELETE FROM event_deliveries WHERE provider='relay'")
+            connection.execute("DELETE FROM provider_receipts WHERE provider='relay'")
+            connection.execute("DELETE FROM pending_relay_live_activity_updates")
+            connection.execute("DELETE FROM pending_relay_operations")
+            connection.execute("DELETE FROM relay_live_activities")
+            connection.execute("DELETE FROM devices WHERE provider IN ('relay', 'legacy_relay')")
+            connection.execute("DELETE FROM metadata WHERE key='relay_config_v1'")
+            connection.execute(
+                "INSERT INTO metadata(key, value) VALUES ('provider_mode', 'managed') "
+                "ON CONFLICT(key) DO UPDATE SET value='managed'"
+            )
+            connection.execute(
+                "INSERT INTO metadata(key, value) VALUES ('relay_config_generation', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(generation),),
+            )
+            connection.execute(
+                "INSERT INTO metadata(key, value) VALUES ('relay_config_state', 'disabled') "
+                "ON CONFLICT(key) DO UPDATE SET value='disabled'"
+            )
+            return True
 
     def save_apns_config(self, config: Mapping[str, Any]) -> None:
         allowed = {"team_id", "key_id", "topic", "environment", "key_path"}
@@ -801,52 +854,11 @@ class LoopdyStore:
             connection.execute("DELETE FROM metadata WHERE key='apns_config'")
 
     def save_relay_config(self, config: Mapping[str, Any]) -> None:
-        allowed = {
-            "base_url",
-            "tenant_id",
-            "credential_key_id",
-            "hmac_secret_reference",
-            "signing_key_secret_reference",
-        }
-        if set(config) != allowed:
-            raise ValueError("Relay configuration must contain only approved references")
-        value = {key: str(config[key]).strip() for key in sorted(allowed)}
-        if any(not item for item in value.values()):
-            raise ValueError("Relay configuration is incomplete")
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            generation = self._metadata_integer(connection, "relay_config_generation", 0) + 1
-            connection.execute(
-                "UPDATE event_deliveries SET status='failed', failure='relay_target_changed', "
-                "relay_request_body_json='', claim_token='', claim_expires=0, next_attempt_at=0 "
-                "WHERE provider='relay' AND status='queued'"
-            )
-            connection.execute("DELETE FROM pending_relay_live_activity_updates")
-            connection.execute("DELETE FROM pending_relay_operations")
-            connection.execute(
-                "INSERT INTO metadata(key, value) VALUES ('relay_config_v1', ?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (_json(value),),
-            )
-            connection.execute(
-                "INSERT INTO metadata(key, value) VALUES ('relay_config_generation', ?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (str(generation),),
-            )
-            connection.execute(
-                "INSERT INTO metadata(key, value) VALUES ('relay_config_state', 'enabled') "
-                "ON CONFLICT(key) DO UPDATE SET value='enabled'"
-            )
+        del config
+        raise ValueError("Legacy Cloudflare relay configuration is retired")
 
     def load_relay_config(self) -> dict[str, str] | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT value FROM metadata WHERE key='relay_config_v1'"
-            ).fetchone()
-        value = None if row is None else _load_json(row["value"], None)
-        if not isinstance(value, dict):
-            return None
-        return {str(key): str(item) for key, item in value.items()}
+        return None
 
     def clear_relay_config(self) -> None:
         with self._connect() as connection:
@@ -875,11 +887,7 @@ class LoopdyStore:
             return self._metadata_integer(connection, "relay_config_generation", 0)
 
     def relay_config_enabled(self) -> bool:
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT value FROM metadata WHERE key='relay_config_state'"
-            ).fetchone()
-        return row is None or str(row["value"]) == "enabled"
+        return False
 
     def has_pending_live_activity_updates(self) -> bool:
         with self._connect() as connection:
@@ -4201,8 +4209,10 @@ def _required_text(value: str, name: str, maximum: int) -> str:
 
 def _provider_mode(value: Any) -> str:
     normalized = str(value or "").strip().lower()
-    if normalized not in {"managed", "direct", "relay"}:
-        raise ValueError("Loopdy provider mode must be managed, direct, or relay")
+    if normalized == "relay":
+        return "managed"
+    if normalized not in {"managed", "direct"}:
+        raise ValueError("Loopdy provider mode must be managed or direct")
     return normalized
 
 

@@ -51,7 +51,10 @@ class ManagedNotificationTests(unittest.TestCase):
 
     def test_capability_distinguishes_supported_events_from_lazy_producer_load(self):
         caps=self.service.capabilities()
-        self.assertEqual(set(caps["supportedEventTypes"]),{"session.completed","session.failed","approval.required","clarification.required"})
+        self.assertEqual(set(caps["supportedEventTypes"]), {
+            "session.completed", "session.failed", "approval.required", "clarification.required",
+            "scheduled.completed", "scheduled.failed", "subagent.completed", "subagent.failed",
+        })
         self.assertFalse(caps["producerCapabilities"]["nativeApproval"])
         self.assertFalse(caps["producerCapabilities"]["sessionCompletion"])
         self.service.producer_loaded("default",start_worker=False)

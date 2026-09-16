@@ -86,8 +86,12 @@ class LoopdyService:
         queue_size: int = 256,
     ):
         self.store = store
+        self.store.retire_legacy_relay()
         self.managed_alert_owner: Callable[[LoopdyEvent, str], bool] | None = None
-        self._providers = dict(providers or {})
+        self._providers = {
+            key: value for key, value in dict(providers or {}).items()
+            if key in {"managed", "direct"}
+        }
         self._sleep = sleep_fn
         self._jitter = jitter_fn
         self._now = now_fn
@@ -118,12 +122,8 @@ class LoopdyService:
         }
         self._closed = False
         self._closing = False
-        if self.store.has_pending_live_activity_updates() or self.store.has_pending_relay_live_activity_updates():
+        if self.store.has_pending_live_activity_updates():
             self._ensure_live_activity_worker()
-        if self.store.has_pending_relay_operations():
-            self._ensure_worker()
-        if self.store.queued_relay_events(limit=1):
-            self._resume_queued_relay_events()
 
     def health(self) -> dict[str, Any]:
         mode = self.store.provider_mode()
@@ -158,110 +158,13 @@ class LoopdyService:
     ) -> dict[str, Any]:
         """Mirror cloud-confirmed relay readiness from an authenticated Link device."""
         self._assert_open()
-        if not isinstance(registration, RelayReady):
-            raise ValueError("Loopdy Link relay readiness is invalid")
-        if registration.scope != "host_relay":
-            raise ValueError("Loopdy Link wake readiness cannot configure a host relay device")
-        if registration.device_id != str(sender_device_id or ""):
-            raise ValueError("Loopdy Link relay device does not match the verified sender")
-        now = int(self._timestamp())
-        if registration.lease_expires <= now:
-            raise ExpiredHostRelayEnrollment("Loopdy Link host-relay enrollment has expired")
-        if registration.sent_at > now + 300:
-            raise ValueError("Loopdy Link relay readiness is from the future")
-
-        acknowledged_ids = list(registration.acknowledged_sender_key_ids)
-        with self._provider_lease("relay") as provider:
-            sender_key_set_fn = getattr(provider, "sender_key_set", None)
-            if not callable(sender_key_set_fn):
-                sender_key_set_fn = getattr(getattr(provider, "client", None), "sender_key_set", None)
-            selector = getattr(provider, "select_sender_key_id", None)
-            if not callable(sender_key_set_fn) or not callable(selector):
-                raise ValueError("Relay sender-key configuration is unavailable")
-            sender_key_set = sender_key_set_fn()
-            if (
-                not isinstance(sender_key_set, dict)
-                or sender_key_set.get("revision") != registration.sender_key_revision
-            ):
-                raise ValueError("Loopdy Link relay sender-key revision is invalid")
-            configured_ids = {
-                str(item.get("key_id"))
-                for item in (sender_key_set.get("current"), sender_key_set.get("previous"))
-                if isinstance(item, dict) and item.get("key_id")
-            }
-            if not set(acknowledged_ids).issubset(configured_ids):
-                raise ValueError("Loopdy Link relay sender-key acknowledgement is invalid")
-            selected_id = selector(acknowledged_ids)
-            if selected_id not in acknowledged_ids:
-                raise ValueError("Loopdy Link relay sender-key acknowledgement is invalid")
-
-        existing = self.store.get_device(registration.device_id)
-        if existing is not None and int(existing.get("revision") or 0) > registration.acknowledgement_revision:
-            raise ValueError("Loopdy Link relay readiness revision is stale")
-
-        def matches_registration(device: Mapping[str, Any]) -> bool:
-            return (
-                device.get("provider") == "relay"
-                and not device.get("revoked")
-                and device.get("recipient_public_key") == registration.recipient_public_key
-                and device.get("recipient_key_id") == registration.recipient_key_id
-                and int(device.get("lease_expires") or 0) == registration.lease_expires
-                and device.get("token_environment") == registration.environment
-                and device.get("label") == registration.device_name
-            )
-
-        if existing is not None and int(existing.get("revision") or 0) in {
-            registration.enrollment_revision,
-            registration.acknowledgement_revision,
-        } and not matches_registration(existing):
-            raise ValueError("Loopdy Link relay readiness conflicts with the local device")
-
-        changed = False
-        existing_revision = 0 if existing is None else int(existing.get("revision") or 0)
-        if existing_revision < registration.enrollment_revision:
-            result = self.store.register_relay_device(
-                device_id=registration.device_id,
-                recipient_public_key=registration.recipient_public_key,
-                recipient_key_id=registration.recipient_key_id,
-                revision=registration.enrollment_revision,
-                lease_expires=registration.lease_expires,
-                normalized_body=registration.wire_value(),
-                token_environment=registration.environment,
-                label=registration.device_name,
-                now=now,
-            )
-            changed = bool(result.get("changed"))
-            existing_revision = registration.enrollment_revision
-
-        if existing_revision < registration.acknowledgement_revision:
-            result = self.store.acknowledge_relay_sender_keys(
-                device_id=registration.device_id,
-                revision=registration.acknowledgement_revision,
-                sender_key_revision=registration.sender_key_revision,
-                acknowledged_sender_key_ids=acknowledged_ids,
-                normalized_body=registration.wire_value(),
-                now=now,
-            )
-            changed = changed or bool(result.get("changed"))
-        else:
-            current = self.store.get_device(registration.device_id) or {}
-            if (
-                int(current.get("sender_key_revision") or 0)
-                != registration.sender_key_revision
-                or current.get("acknowledged_sender_key_ids") != sorted(acknowledged_ids)
-            ):
-                raise ValueError("Loopdy Link relay readiness conflicts with the local acknowledgement")
-
-        return {
-            "ready": True,
-            "changed": changed,
-            "device_id": registration.device_id,
-            "revision": registration.acknowledgement_revision,
-        }
+        raise ValueError("Legacy Cloudflare relay enrollment is retired")
 
     def set_provider_mode(self, mode: str) -> dict[str, Any]:
         self._assert_open()
         normalized = str(mode or "").strip().lower()
+        if normalized not in {"managed", "direct"}:
+            raise ValueError("Loopdy provider mode must be managed or direct")
         retire: Any | None = None
         with self._provider_lock:
             if normalized == "direct":
@@ -274,11 +177,6 @@ class LoopdyService:
                 self._reset_provider_bookkeeping_locked(replacement)
                 self._providers["direct"] = replacement
                 retire = previous
-            elif normalized == "relay":
-                try:
-                    self._provider("relay")
-                except (ValueError, DeliveryError) as error:
-                    raise ValueError("Configure relay before selecting the relay provider") from error
             elif normalized == "managed":
                 previous = self._providers.pop("direct", None)
                 retire = previous
@@ -289,36 +187,14 @@ class LoopdyService:
 
     def configure_relay(self, config: RelayConfig) -> dict[str, Any]:
         self._assert_open()
-        if not isinstance(config, RelayConfig):
-            raise ValueError("Relay configuration is invalid")
-        replacement = RelayPushProvider(RelayClient(config))
-        try:
-            replacement.client.validate_local_credentials()
-        except Exception:
-            replacement.close()
-            raise
-        previous: Any | None = None
-        try:
-            with self._provider_lock:
-                self._assert_open()
-                self.store.save_relay_config(config.stored_values())
-                previous = self._providers.get("relay")
-                self._reset_provider_bookkeeping_locked(replacement)
-                self._providers["relay"] = replacement
-                self.store.set_provider_mode("relay")
-        except Exception:
-            replacement.close()
-            raise
-        if previous is not None and previous is not replacement:
-            self._retire_provider(previous)
-        return self.health()
+        raise ValueError("Legacy Cloudflare relay configuration is retired")
 
     def remove_relay_configuration(self) -> dict[str, Any]:
         self._assert_open()
         previous: Any | None = None
         with self._provider_lock:
             previous = self._providers.pop("relay", None)
-            self.store.clear_relay_config()
+            self.store.retire_legacy_relay()
             if self.store.provider_mode() == "relay":
                 self.store.set_provider_mode("managed")
         if previous is not None:
@@ -365,7 +241,7 @@ class LoopdyService:
         active_mode = self.store.provider_mode()
         selected_provider = str(provider or active_mode).strip().lower()
         if selected_provider not in {"managed", "direct"}:
-            raise ValueError("Use revisioned relay registration for relay devices")
+            raise ValueError("Legacy Cloudflare relay is retired; use managed or direct notifications")
         normalized_groups = list(groups or [])
         _validate_device_routing(device_id, normalized_groups)
         _validate_endpoint(selected_provider, endpoint_id)
@@ -424,66 +300,7 @@ class LoopdyService:
 
     def relay_operation(self, operation: str, body: Mapping[str, Any]) -> dict[str, Any]:
         self._assert_open()
-        normalized_operation = _relay_operation_name(operation)
-        if normalized_operation not in {
-            "register_device",
-            "acknowledge_sender_keys",
-            "revoke_device",
-            "register_live_activity",
-            "revoke_live_activity",
-            "revoke_tenant",
-            "delete_tenant",
-        }:
-            raise ValueError("Unknown relay operation")
-        normalized = self._validate_relay_operation_body(normalized_operation, body)
-        key_name = "device_id" if "device_id" in normalized else (
-            "activity_id" if "activity_id" in normalized else "tenant_id"
-        )
-        operation_key = str(normalized.get(key_name) or "")
-        if not operation_key:
-            raise ValueError("Relay operation owner is required")
-        pending = self.store.pending_relay_operation(normalized_operation, operation_key)
-        if pending is None:
-            generation = self.store.relay_config_generation()
-            self.store.save_pending_relay_operation(
-                operation=normalized_operation,
-                device_id=operation_key,
-                revision=normalized["revision"],
-                idempotency_key=normalized["idempotency_key"],
-                body=normalized,
-                relay_generation=generation,
-            )
-            pending = self.store.pending_relay_operation(normalized_operation, operation_key)
-        else:
-            generation = int(pending.get("relay_generation") or 0)
-            stored_digest = str(pending.get("request_digest") or "")
-            try:
-                stored = json.loads(str(pending["body_json"]))
-            except (TypeError, ValueError, json.JSONDecodeError) as error:
-                self.store.quarantine_relay_operation(normalized_operation, operation_key, error=str(error))
-                raise ValueError("Stored relay operation request is invalid") from error
-            if not isinstance(stored, dict):
-                self.store.quarantine_relay_operation(normalized_operation, operation_key, error="invalid request")
-                raise ValueError("Stored relay operation request is invalid")
-            if stored_digest and stored_digest != _request_digest(normalized):
-                if not _can_resume_relay_registration(stored, normalized_operation, normalized):
-                    raise ValueError("Relay operation request conflict")
-            if int(pending.get("terminal") or 0):
-                if not stored_digest or not self.store.reset_relay_operation(
-                    normalized_operation, operation_key, request_digest=stored_digest
-                ):
-                    raise DeliveryError("relay_operation_terminal", retryable=False)
-                pending = self.store.pending_relay_operation(normalized_operation, operation_key)
-                if pending is None:
-                    raise DeliveryError("relay_operation_terminal", retryable=False)
-                generation = int(pending.get("relay_generation") or 0)
-            normalized = stored
-        if pending is None:
-            raise DeliveryError("relay_operation_pending", retryable=True)
-        response = self._process_relay_operation_row(pending, normalized_operation, ignore_due=True)
-        if response is None:
-            raise DeliveryError("relay_operation_pending", retryable=True)
-        return response
+        raise ValueError("Legacy Cloudflare relay operations are retired")
 
     def _validate_relay_operation_body(
         self, operation: str, body: Mapping[str, Any]
@@ -704,6 +521,7 @@ class LoopdyService:
 
     def reconcile_relay_operations(self) -> int:
         self._assert_open()
+        return 0
         recovered = 0
         # Claim one row at a time.  A network call can outlive the claim
         # lease; leasing a whole page up front would make unrelated rows
@@ -805,6 +623,7 @@ class LoopdyService:
     def recover_terminal_relay_registrations(self) -> dict[str, int]:
         """Apply exact legacy provider-conflict responses without relay I/O."""
         self._assert_open()
+        return {"claimed": 0, "applied": 0, "skipped": 0, "remote_calls": 0}
         totals = {"claimed": 0, "applied": 0, "skipped": 0, "remote_calls": 0}
         for pending in self.store.claim_terminal_provider_conflict_registrations(limit=10):
             totals["claimed"] += 1
@@ -1698,23 +1517,11 @@ class LoopdyService:
             if provider is not None:
                 return provider
             if mode == "managed":
-                provider = ExpoPushProvider()
+                raise ValueError("Complete BuzzKit notification setup in Loopdy before sending alerts")
             elif mode == "direct":
                 provider = ApnsPushProvider(load_apns_config(self.store.load_apns_config() or {}))
-            elif mode == "relay":
-                if not self.store.relay_config_enabled():
-                    raise ValueError("Relay configuration is disabled; configuration is missing")
-                values = self.store.load_relay_config()
-                if values is None:
-                    raise ValueError("Relay configuration is missing")
-                provider = RelayPushProvider(RelayClient(RelayConfig(**values)))
-                try:
-                    provider.client.validate_local_credentials()
-                except Exception:
-                    provider.close()
-                    raise
             else:
-                raise ValueError("Loopdy provider mode must be managed, direct, or relay")
+                raise ValueError("Loopdy provider mode must be managed or direct")
             self._reset_provider_bookkeeping_locked(provider)
             self._providers[mode] = provider
             return provider
@@ -2151,8 +1958,6 @@ class LoopdyService:
                     # The database is the durable source of truth. The
                     # in-memory queue is only a wake-up accelerator, so this
                     # bounded scan also drains rows beyond the startup page.
-                    self._resume_queued_relay_events()
-                    self.reconcile_relay_operations()
                     self.reconcile_receipts()
                     last_recovery_scan = now
                 except Exception as error:
@@ -2401,7 +2206,6 @@ class LoopdyService:
                 if self._closed:
                     return
                 self._reconcile_live_activity_updates()
-                self._reconcile_relay_live_activity_updates()
                 continue
             try:
                 if item is None:

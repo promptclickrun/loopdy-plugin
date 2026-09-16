@@ -106,6 +106,12 @@ class ToolRegistrationTests(unittest.TestCase):
                     self.assertNotIn("calendarID", renderer_schema["parameters"]["properties"])
                     self.assertNotIn("occurrenceStart", renderer_schema["parameters"]["properties"])
                 continue
+            if tool_name == "loopdy_react_to_message":
+                from loopdy_plugin.reactions import PARAMETERS
+                self.assertEqual(renderer_schema["parameters"], PARAMETERS)
+                self.assertIn("React to a human message", description)
+                self.assertIn("Never use reactions as processing status", description)
+                continue
             if tool_name == "loopdy_await_form_response":
                 self.assertNotIn("renderer", description)
                 self.assertIn("exact-session", description)
@@ -129,11 +135,13 @@ class ToolRegistrationTests(unittest.TestCase):
             "body": "Connected",
         }, task_id="test-task")
         self.assertIsInstance(result, str)
-        self.assertEqual(json.loads(result)["schema"], "loopdy.generative_ui")
-        self.assertEqual(
-            result,
-            '{"schema": "loopdy.generative_ui", "version": 1, "component": "summary", "title": "Ready", "body": "Connected"}',
-        )
+        from loopdy_plugin.generative_ui import extract_rendered_envelope
+        delivery = json.loads(result)
+        self.assertEqual(delivery["schema"], "loopdy.card_delivery")
+        self.assertEqual(extract_rendered_envelope(delivery), {
+            "schema": "loopdy.generative_ui", "version": 1,
+            "component": "summary", "title": "Ready", "body": "Connected",
+        })
 
 
 if __name__ == "__main__":

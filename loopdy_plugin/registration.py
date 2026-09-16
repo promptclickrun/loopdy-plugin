@@ -54,7 +54,6 @@ from .plugin_update import (
     production_manager,
 )
 from .providers.apns import load_apns_config
-from .relay_client import RelayConfig
 from .targets import parse_target, validate_target
 from .tools import register as register_tools
 
@@ -721,7 +720,7 @@ def setup_cli(parser: Any) -> None:
     )
 
     provider = actions.add_parser("provider", help="Show or select the push provider")
-    provider.add_argument("mode", nargs="?", choices=("managed", "direct", "relay"))
+    provider.add_argument("mode", nargs="?", choices=("managed", "direct"))
 
     configure_apns = actions.add_parser(
         "configure-apns",
@@ -742,32 +741,6 @@ def setup_cli(parser: Any) -> None:
         help="Remove direct APNs configuration from this Hermes host",
     )
     remove_apns.add_argument("--yes", action="store_true", help="Confirm removal")
-
-    configure_relay = actions.add_parser(
-        "configure-relay",
-        help="Configure relay coordinates and local secret references",
-    )
-    configure_relay.add_argument("--base-url", required=True)
-    configure_relay.add_argument("--tenant-id", required=True)
-    configure_relay.add_argument("--credential-key-id", required=True)
-    configure_relay.add_argument("--hmac-secret-ref", required=True)
-    configure_relay.add_argument("--signing-key-secret-ref", required=True)
-
-    remove_relay = actions.add_parser(
-        "remove-relay",
-        help="Remove relay configuration from this Hermes host",
-    )
-    remove_relay.add_argument("--yes", action="store_true", help="Confirm removal")
-
-    recover_relay_registration = actions.add_parser(
-        "recover-terminal-relay-registration",
-        help="Apply verified stored relay registrations without network calls",
-    )
-    recover_relay_registration.add_argument(
-        "--yes",
-        action="store_true",
-        help="Confirm local journal recovery",
-    )
 
     test = actions.add_parser("test", help="Send an opaque test wakeup")
     test.add_argument("--target", default=_home_target())
@@ -867,9 +840,6 @@ def handle_cli(
                 "provider": service.store.provider_mode(),
                 "provider_health": service.health(),
                 "apns": _redacted_apns_config(apns),
-                "relay": _redacted_relay_config(
-                    getattr(service.store, "load_relay_config", lambda: None)()
-                ),
             }
         )
         return
@@ -912,33 +882,7 @@ def handle_cli(
             service.set_provider_mode("managed")
         _print_json({"provider": service.store.provider_mode(), "apns": None})
         return
-    if action == "configure-relay":
-        config = RelayConfig(
-            base_url=args.base_url,
-            tenant_id=args.tenant_id,
-            credential_key_id=args.credential_key_id,
-            hmac_secret_reference=args.hmac_secret_ref,
-            signing_key_secret_reference=args.signing_key_secret_ref,
-        )
-        service.configure_relay(config)
-        _print_json(
-            {
-                "provider": "relay",
-                "relay": _redacted_relay_config(config.stored_values()),
-            }
-        )
-        return
-    if action == "remove-relay":
-        if not bool(getattr(args, "yes", False)):
-            raise ValueError("Pass --yes to confirm relay configuration removal")
-        service.remove_relay_configuration()
-        _print_json({"provider": service.store.provider_mode(), "relay": None})
-        return
-    if action == "recover-terminal-relay-registration":
-        if not bool(getattr(args, "yes", False)):
-            raise ValueError("Pass --yes to confirm stored relay registration recovery")
-        _print_json(service.recover_terminal_relay_registrations())
-        return
+
     if action == "test":
         target = str(args.target or "all").strip()
         verdict = validate_target(target)
@@ -1136,20 +1080,6 @@ def _redacted_apns_config(config: Any) -> dict[str, Any] | None:
         "topic": str(config.get("topic") or ""),
         "environment": str(config.get("environment") or ""),
         "key_file": os.path.basename(str(config.get("key_path") or "")),
-    }
-
-
-def _redacted_relay_config(config: Any) -> dict[str, Any] | None:
-    if not isinstance(config, dict):
-        return None
-    return {
-        "base_url": str(config.get("base_url") or ""),
-        "tenant_id": str(config.get("tenant_id") or ""),
-        "credential_key_id": str(config.get("credential_key_id") or ""),
-        "hmac_secret_reference_configured": bool(config.get("hmac_secret_reference")),
-        "signing_key_secret_reference_configured": bool(
-            config.get("signing_key_secret_reference")
-        ),
     }
 
 

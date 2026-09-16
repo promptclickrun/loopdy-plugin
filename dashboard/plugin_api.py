@@ -9,13 +9,12 @@ import json
 import re
 import sys
 import time
-import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import quote
 
-from fastapi import APIRouter, Body, HTTPException, Query, Request, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, Response
 from pydantic import (
     BaseModel,
@@ -23,7 +22,6 @@ from pydantic import (
     Field,
     StrictBool,
     StrictInt,
-    ValidationError,
     field_validator,
     model_validator,
 )
@@ -43,7 +41,6 @@ from loopdy_plugin.generative_ui import (  # noqa: E402
 )
 from loopdy_plugin.link_contracts import PLUGIN_VERSION  # noqa: E402
 from loopdy_plugin.provider import DeliveryError  # noqa: E402
-from loopdy_plugin.relay_crypto import b64url_decode, key_id  # noqa: E402
 from loopdy_plugin.targets import validate_target  # noqa: E402
 from loopdy_plugin.workspace_control import HermesWorkspaceBackend  # noqa: E402
 from loopdy_plugin.workspace_git import (  # noqa: E402
@@ -55,6 +52,10 @@ from loopdy_plugin.native_api import router as native_router  # noqa: E402
 from loopdy_plugin.room_activity_api import router as room_activity_router  # noqa: E402
 from loopdy_plugin.native_wiki_api import router as native_wiki_router  # noqa: E402
 from loopdy_plugin.native_project_git import router as native_project_git_router  # noqa: E402
+from loopdy_plugin.agent_templates import (  # noqa: E402
+    capability as agent_templates_capability,
+    router as agent_templates_router,
+)
 
 
 router = APIRouter()
@@ -63,6 +64,7 @@ router.include_router(native_router)
 router.include_router(room_activity_router, prefix="/native")
 router.include_router(native_wiki_router)
 router.include_router(native_project_git_router)
+router.include_router(agent_templates_router)
 from loopdy_plugin.managed_notifications_api import router as managed_notifications_router
 router.include_router(managed_notifications_router)
 _WORKSPACE_GIT_STATE_PATH = data_path().with_name("workspace-git.sqlite3")
@@ -73,39 +75,7 @@ _TIME = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 _ZONE = re.compile(r"^[A-Za-z0-9_+.-]+(?:/[A-Za-z0-9_+.-]+)*$")
 _EXPO_TOKEN = re.compile(r"^(?:Exponent|Expo)PushToken\[[A-Za-z0-9._~-]{8,200}\]$")
 _APNS_TOKEN = re.compile(r"^[0-9a-fA-F]{64,200}$")
-_RELAY_IDENTIFIER = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,179}$"
-_RELAY_GROUP = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$"
-_RELAY_KEY_ID = r"^[A-Za-z0-9_-]{43}$"
-_RELAY_PUBLIC_KEY = r"^[A-Za-z0-9_-]{87}$"
-_RELAY_SESSION_REF = r"^[A-Za-z0-9_-]{2,86}$"
-_RELAY_TOKEN = r"^(?:[0-9a-fA-F]{2}){1,256}$"
-_RELAY_TOPIC = r"^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$"
-_RELAY_UUID = r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
-_MAX_SAFE_REVISION = 9_007_199_254_740_991
 _DETAIL_MODES = ("automatic", "minimal", "detailed")
-_RELAY_DIAGNOSTIC_FIELDS = {
-    "acknowledged_sender_key_ids",
-    "activity_id",
-    "confirmation",
-    "device_id",
-    "environment",
-    "groups",
-    "idempotency_key",
-    "issued",
-    "label",
-    "lease_expires",
-    "provider",
-    "push_token",
-    "recipient_key_id",
-    "recipient_public_key",
-    "revision",
-    "sender_key_revision",
-    "session_ref",
-    "tenant_id",
-    "timestamp",
-    "topic",
-    "version",
-}
 _clock = lambda: int(time.time())
 
 
@@ -114,7 +84,7 @@ class StrictBody(BaseModel):
 
 
 class ProviderUpdate(StrictBody):
-    mode: Literal["managed", "direct", "relay"]
+    mode: Literal["managed", "direct"]
 
 
 class DeviceRegistration(StrictBody):
@@ -124,129 +94,6 @@ class DeviceRegistration(StrictBody):
     token_environment: Literal["production", "sandbox"] = "production"
     label: str = Field(default="", max_length=120)
     groups: list[str] = Field(default_factory=list, max_length=50)
-
-
-class RelayRequest(StrictBody):
-    version: StrictInt = Field(ge=1, le=1)
-    idempotency_key: str = Field(pattern=_RELAY_UUID)
-
-
-class RelayDeviceRegistration(RelayRequest):
-    device_id: str = Field(pattern=_RELAY_IDENTIFIER)
-    revision: StrictInt = Field(gt=0, le=_MAX_SAFE_REVISION)
-    issued: StrictInt = Field(gt=0, le=9_999_999_999)
-    lease_expires: StrictInt = Field(gt=0, le=9_999_999_999)
-    provider: Literal["relay"]
-    recipient_public_key: str = Field(pattern=_RELAY_PUBLIC_KEY)
-    recipient_key_id: str = Field(pattern=_RELAY_KEY_ID)
-    push_token: str = Field(pattern=_RELAY_TOKEN)
-    environment: Literal["production", "sandbox"]
-    topic: str = Field(max_length=255, pattern=_RELAY_TOPIC)
-    label: str
-    groups: list[str] = Field(default_factory=list, max_length=50)
-
-    @field_validator("label")
-    @classmethod
-    def validate_label(cls, value: str) -> str:
-        if value != unicodedata.normalize("NFC", value) or len(value.encode("utf-8")) > 120:
-            raise ValueError("label must be NFC and no more than 120 UTF-8 bytes")
-        return value
-
-    @field_validator("groups")
-    @classmethod
-    def validate_groups(cls, values: list[str]) -> list[str]:
-        if any(re.fullmatch(_RELAY_GROUP, value) is None for value in values):
-            raise ValueError("groups must contain printable ASCII identifiers")
-        return values
-
-    @field_validator("topic")
-    @classmethod
-    def validate_base_topic(cls, value: str) -> str:
-        if value.endswith(".push-type.liveactivity"):
-            raise ValueError("topic must be the base bundle identifier")
-        return value
-
-    @field_validator("push_token")
-    @classmethod
-    def canonicalize_push_token(cls, value: str) -> str:
-        # APNs tokens are hex bytes. Canonicalize their case before the value
-        # participates in relay signatures, idempotency, or durable storage.
-        return value.lower()
-
-    @model_validator(mode="after")
-    def validate_registration(self):
-        public_key = b64url_decode(self.recipient_public_key, expected_length=65)
-        if public_key[0] != 4 or key_id(public_key) != self.recipient_key_id:
-            raise ValueError("recipient_key_id does not match recipient_public_key")
-        if self.lease_expires <= self.issued or self.lease_expires - self.issued > 2_592_000:
-            raise ValueError("registration lease exceeds 30 days")
-        return self
-
-
-class RelaySenderKeyAcknowledgement(RelayRequest):
-    device_id: str = Field(pattern=_RELAY_IDENTIFIER)
-    revision: StrictInt = Field(gt=0, le=_MAX_SAFE_REVISION)
-    sender_key_revision: StrictInt = Field(gt=0, le=_MAX_SAFE_REVISION)
-    acknowledged_sender_key_ids: list[str] = Field(min_length=1, max_length=2)
-
-    @field_validator("acknowledged_sender_key_ids")
-    @classmethod
-    def validate_sender_key_ids(cls, values: list[str]) -> list[str]:
-        if len(values) != len(set(values)):
-            raise ValueError("acknowledged sender key IDs must be unique")
-        for value in values:
-            b64url_decode(value, expected_length=32)
-        return values
-
-
-class RelayDeviceRevoke(RelayRequest):
-    device_id: str = Field(pattern=_RELAY_IDENTIFIER)
-    revision: StrictInt = Field(gt=0, le=_MAX_SAFE_REVISION)
-
-
-class RelayTenantRevoke(RelayRequest):
-    tenant_id: str = Field(pattern=_RELAY_IDENTIFIER)
-    revision: StrictInt = Field(gt=0, le=_MAX_SAFE_REVISION)
-
-
-class RelayTenantDelete(RelayTenantRevoke):
-    confirmation: Literal["delete"]
-
-
-class RelayLiveActivityRegistration(RelayRequest):
-    activity_id: str = Field(pattern=_RELAY_IDENTIFIER)
-    device_id: str = Field(pattern=_RELAY_IDENTIFIER)
-    session_ref: str = Field(pattern=_RELAY_SESSION_REF)
-    push_token: str = Field(pattern=_RELAY_TOKEN)
-    environment: Literal["production", "sandbox"]
-    topic: str = Field(max_length=255, pattern=_RELAY_TOPIC)
-    revision: StrictInt = Field(gt=0, le=_MAX_SAFE_REVISION)
-    timestamp: StrictInt = Field(gt=0, le=9_999_999_999)
-    lease_expires: StrictInt = Field(gt=0, le=9_999_999_999)
-
-    @field_validator("topic")
-    @classmethod
-    def validate_base_topic(cls, value: str) -> str:
-        if value.endswith(".push-type.liveactivity"):
-            raise ValueError("topic must be the base bundle identifier")
-        return value
-
-    @model_validator(mode="after")
-    def validate_live_activity_registration(self):
-        if len(b64url_decode(self.session_ref)) > 64:
-            raise ValueError("session_ref exceeds 64 bytes")
-        if (
-            self.lease_expires <= self.timestamp
-            or self.lease_expires - self.timestamp > 28_800
-        ):
-            raise ValueError("Live Activity registration lease exceeds eight hours")
-        return self
-
-
-class RelayLiveActivityRevoke(RelayRequest):
-    activity_id: str = Field(pattern=_RELAY_IDENTIFIER)
-    revision: StrictInt = Field(gt=0, le=_MAX_SAFE_REVISION)
-    timestamp: StrictInt = Field(gt=0, le=9_999_999_999)
 
 
 class LiveActivityRegistration(StrictBody):
@@ -426,9 +273,9 @@ def capabilities() -> dict[str, Any]:
         "plugin_version": PLUGIN_VERSION,
         "schema_version": 2,
         "channel": "loopdy",
-        "default_provider": "relay",
+        "default_provider": "managed",
         "provider": health,
-        "providers": ["relay", "direct"],
+        "providers": ["managed", "direct"],
         "detail_modes": list(_DETAIL_MODES),
         "approval_transport": "loopdy",
         "approval_choices": ["once", "session", "always", "deny"],
@@ -439,18 +286,6 @@ def capabilities() -> dict[str, Any]:
             "host_only": True,
             "required": ["team_id", "key_id", "topic", "environment", "key_path"],
             "cli": "hermes loopdy configure-apns",
-        },
-        "relay_setup": {
-            "host_only": True,
-            "managed_enrollment": True,
-            "required": [
-                "base_url",
-                "tenant_id",
-                "credential_key_id",
-                "hmac_secret_reference",
-                "signing_key_secret_reference",
-            ],
-            "cli": "hermes loopdy configure-relay",
         },
         "capabilities": {
             "device_management": True,
@@ -464,7 +299,6 @@ def capabilities() -> dict[str, Any]:
             "proactive_delivery": True,
             "provider_selection": True,
             "native_agent_attachments": True,
-            "encrypted_relay": True,
         },
         "agent_attachments": {
             "schema_version": 1,
@@ -491,6 +325,7 @@ def capabilities() -> dict[str, Any]:
             "max_action_bytes": 8_192,
         },
         "workspace_git": _active_workspace_git().capabilities(),
+        "agent_templates": agent_templates_capability(),
     }
 
 
@@ -637,41 +472,6 @@ def register_device(body: DeviceRegistration) -> dict[str, Any]:
         return {**result, "token_fingerprint": _token_fingerprint(body.push_token)}
     except Exception as error:
         raise _api_error(error) from error
-
-
-@router.post("/relay/devices/register", status_code=status.HTTP_201_CREATED)
-def register_relay_device(body: Any = Body(...)) -> dict[str, Any]:
-    return _relay_operation("register_device", RelayDeviceRegistration, body)
-
-
-@router.post("/relay/devices/ack-sender-keys")
-def acknowledge_relay_sender_keys(body: Any = Body(...)) -> dict[str, Any]:
-    return _relay_operation("acknowledge_sender_keys", RelaySenderKeyAcknowledgement, body)
-
-
-@router.post("/relay/devices/revoke")
-def revoke_relay_device(body: Any = Body(...)) -> dict[str, Any]:
-    return _relay_operation("revoke_device", RelayDeviceRevoke, body)
-
-
-@router.post("/relay/live-activities/register", status_code=status.HTTP_201_CREATED)
-def register_relay_live_activity(body: Any = Body(...)) -> dict[str, Any]:
-    return _relay_operation("register_live_activity", RelayLiveActivityRegistration, body)
-
-
-@router.post("/relay/live-activities/revoke")
-def revoke_relay_live_activity(body: Any = Body(...)) -> dict[str, Any]:
-    return _relay_operation("revoke_live_activity", RelayLiveActivityRevoke, body)
-
-
-@router.post("/relay/tenant/revoke")
-def revoke_relay_tenant(body: Any = Body(...)) -> dict[str, Any]:
-    return _relay_operation("revoke_tenant", RelayTenantRevoke, body)
-
-
-@router.post("/relay/tenant/delete")
-def delete_relay_tenant(body: Any = Body(...)) -> dict[str, Any]:
-    return _relay_operation("delete_tenant", RelayTenantDelete, body)
 
 
 @router.delete("/devices/{device_id}")
@@ -910,52 +710,6 @@ def _preferences(body: PreferenceUpdate) -> dict[str, Any]:
     if "preferences_version" in fields:
         result["preferences_version"] = body.preferences_version
     return result
-
-
-def _relay_operation(
-    operation: str,
-    body_type: type[RelayRequest],
-    value: Any,
-) -> dict[str, Any]:
-    try:
-        body = body_type.model_validate(value)
-        result = dict(_active_service().relay_operation(operation, body.model_dump()))
-        result.pop("push_token", None)
-        result.pop("recipient_public_key", None)
-        return result
-    except ValidationError as error:
-        raise _api_error(ValueError(_relay_validation_detail(error))) from error
-    except ValueError as error:
-        raise _api_error(ValueError("Invalid relay request")) from error
-    except Exception as error:
-        raise _api_error(error) from error
-
-
-def _relay_validation_detail(error: ValidationError) -> str:
-    diagnostics: list[str] = []
-    for item in error.errors(include_url=False, include_input=False):
-        location = item.get("loc")
-        field = "request"
-        if isinstance(location, tuple):
-            candidate = next(
-                (
-                    str(part)
-                    for part in location
-                    if isinstance(part, str) and part in _RELAY_DIAGNOSTIC_FIELDS
-                ),
-                "",
-            )
-            if candidate:
-                field = candidate
-        rule = str(item.get("type") or "invalid")
-        if re.fullmatch(r"[a-z0-9_]+", rule) is None:
-            rule = "invalid"
-        diagnostic = f"{field}:{rule}"
-        if diagnostic not in diagnostics:
-            diagnostics.append(diagnostic)
-        if len(diagnostics) == 3:
-            break
-    return f"Invalid relay request ({','.join(diagnostics or ['request:invalid'])})"
 
 
 def _active_service():

@@ -136,6 +136,12 @@ class NativeAPITests(unittest.TestCase):
         from loopdy_plugin.native_project_git import supported
         if supported():
             expected.append("native-project-git-read-v1")
+        from loopdy_plugin.agent_templates import available as templates_available
+        from loopdy_plugin.workspace_artifacts import available as files_available
+        if templates_available():
+            expected.append("native-agent-templates-v1")
+        if files_available():
+            expected.append("native-workspace-files-v1")
         self.assertEqual(value["features"], expected)
         self.assertEqual(value["servingProfileId"], "default")
         self.assertEqual(result.headers["cache-control"], "no-store")

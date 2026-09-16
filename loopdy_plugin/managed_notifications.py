@@ -1,4 +1,4 @@
-"""Notification-only native enrollment and durable, account-scoped BuzzKit delivery.
+"""Notification-only native enrollment and durable, scoped BuzzKit delivery.
 
 This module owns no Hermes runtime internals. Stock registered observers provide
 lifecycle facts; a plugin-owned worker drains frozen requests over HTTPS. Chat,
@@ -39,7 +39,11 @@ ROOT = "/v1/notifications/host-grants"
 _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _PROFILE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
-_EVENT_TYPES = {"session.completed", "session.failed", "approval.required", "clarification.required"}
+_CRON_SESSION = re.compile(r"^cron_.+_\d{8}_\d{6}$")
+_EVENT_TYPES = {
+    "session.completed", "session.failed", "scheduled.completed", "scheduled.failed",
+    "approval.required", "clarification.required", "subagent.completed", "subagent.failed",
+}
 _APPROVAL_EVENT = "approval.required"
 _CLARIFICATION_EVENT = "clarification.required"
 _MAX_RICH_TEXT = 1_600
@@ -138,6 +142,7 @@ class ManagedNotifications:
         self._work: OrderedDict[tuple[str, str, str], dict[str, Any]] = OrderedDict()
         self._responses: OrderedDict[tuple[str, str, str], str] = OrderedDict()
         self._child_owners: dict[tuple[str, str, str], str] = {}
+        self._child_goals: dict[tuple[str, str, str], str] = {}
         self._key = self._identity()
         self.public_key = b64url_encode(public_key_bytes(self._key.public_key()))
         self.key_id = key_id(public_key_bytes(self._key.public_key()))
@@ -208,11 +213,18 @@ class ManagedNotifications:
                     "nativeApproval": approval_loaded, "nativeClarification": clarification_loaded}}
 
     def provider_contract(self) -> dict[str, Any]:
-        return {"version": 1, "provider": "buzzkit", "subscriberScope": "account",
+        return {"version": 1, "provider": "buzzkit",
+                "subscriberScopes": ["notification-instance", "account"],
                 "preferences": "buzzkit-topics", "richContentRequired": True,
                 "serverSendingAuthorityOnHost": False,
                 "eventTypes": sorted(_EVENT_TYPES), "maximumAvatarBytes": _MAX_AVATAR_BYTES,
-                "maximumTextCharacters": _MAX_RICH_TEXT}
+                "maximumTextCharacters": _MAX_RICH_TEXT,
+                "topics": {
+                    "chat-replies-completions": ["session.completed", "session.failed"],
+                    "scheduled-tasks-deliveries": ["scheduled.completed", "scheduled.failed"],
+                    "questions-approvals": ["approval.required", "clarification.required"],
+                    "subagent-completions": ["subagent.completed", "subagent.failed"],
+                }}
 
     def _request(self, method: str, grant_id: str, suffix: str = "", raw: bytes = b"",
                  *, before_transport: Callable | None = None):
@@ -232,7 +244,7 @@ class ManagedNotifications:
                 or value.get("hostKeyId") != self.key_id
                 or value.get("hostPublicKey") != self.public_key
                 or value.get("provider") != "buzzkit"
-                or value.get("subscriberScope") != "account"
+                or value.get("subscriberScope") not in {"notification-instance", "account"}
                 or value.get("state") != "active"):
             raise ManagedNotificationError("notification_grant_identity_mismatch", 403)
         for field in ("revision", "authorizationEpoch", "createdAt", "expiresAt"):
@@ -247,12 +259,20 @@ class ManagedNotifications:
                 or any(not isinstance(event_type, str) for event_type in event_types)
                 or len(set(event_types)) != len(event_types) or not set(event_types) <= _EVENT_TYPES):
             raise ManagedNotificationError("notification_grant_invalid", 502)
+        if value["subscriberScope"] == "notification-instance":
+            _identifier(value.get("instanceId"), _UUID)
+        elif "instanceId" in value:
+            _identifier(value.get("instanceId"), _UUID)
         fields = ("grantId", "hostKeyId", "hostPublicKey", "authorizationEpoch", "profile",
                   "eventTypes", "createdAt", "expiresAt", "revision", "provider",
                   "subscriberScope", "state")
-        if set(value) != set(fields):
+        expected = set(fields) | ({"instanceId"} if "instanceId" in value else set())
+        if set(value) != expected:
             raise ManagedNotificationError("notification_grant_invalid", 502)
-        return {field: value[field] for field in fields}
+        result = {field: value[field] for field in fields}
+        if "instanceId" in value:
+            result["instanceId"] = value["instanceId"]
+        return result
 
     def enroll(self, grant_id: str, idempotency_key: str):
         _identifier(grant_id, _UUID); _identifier(idempotency_key, _UUID)
@@ -601,6 +621,8 @@ class ManagedNotifications:
                 if db.execute("SELECT COUNT(*) FROM events WHERE grant_id=?", (grant["grantId"],)).fetchone()[0] >= 4096: continue
                 if db.execute("SELECT COUNT(*) FROM pending WHERE grant_id=? AND state IN ('pending','sending')", (grant["grantId"],)).fetchone()[0] >= 32: continue
                 content_kind = ("approval" if approval else "clarification" if event_type == _CLARIFICATION_EVENT
+                                else "scheduled" if event_type.startswith("scheduled.")
+                                else "subagent" if event_type.startswith("subagent.")
                                 else "failure" if event_type == "session.failed" else "reply")
                 detail = {"eventId": event_id, "eventType": event_type, "profile": profile,
                           "sessionId": session_id, "turnId": turn_id, "occurredAt": now,
@@ -673,11 +695,16 @@ class ManagedNotifications:
             # Alert presentation must not prevent the authoritative work/Activity
             # terminal below, including turns with no text or unavailable avatars.
             try:
+                scheduled = payload.get("platform") == "cron" or _CRON_SESSION.fullmatch(session_id) is not None
                 if payload.get("failed") is True:
                     content = self._rich_text(payload.get("error") or content)
-                    self._queue_event(profile, session_id, turn, "session.failed", content_text=content)
+                    self._queue_event(profile, session_id, turn,
+                                      "scheduled.failed" if scheduled else "session.failed",
+                                      content_text=content)
                 elif payload.get("completed") is True and content:
-                    self._queue_event(profile, session_id, turn, "session.completed", content_text=content)
+                    self._queue_event(profile, session_id, turn,
+                                      "scheduled.completed" if scheduled else "session.completed",
+                                      content_text=content)
             except (ValueError, OSError):
                 logger.warning("Notification presentation unavailable; work state remains authoritative")
         with self._lock:
@@ -701,7 +728,9 @@ class ManagedNotifications:
                         if evicted is None: return
                         self._work.pop(evicted)
                         for child_key in tuple(self._child_owners):
-                            if child_key[:2] == evicted[:2] and self._child_owners[child_key] == evicted[2]: self._child_owners.pop(child_key, None)
+                            if child_key[:2] == evicted[:2] and self._child_owners[child_key] == evicted[2]:
+                                self._child_owners.pop(child_key, None)
+                                self._child_goals.pop(child_key, None)
                     work = {"turn": turn, "phase": "thinking", "outcome": None, "children": {}, "terminal": False,
                             "observed_at": int(self.clock())}
                     self._work[coordinate] = work
@@ -717,11 +746,29 @@ class ManagedNotifications:
                     if len(work["children"]) >= 128 and child not in work["children"]: return
                     self._child_owners.setdefault(owner_key, parent_turn)
                     if self._child_owners[owner_key] != work["turn"]: return
+                    goal = payload.get("child_goal")
+                    if isinstance(goal, str):
+                        goal = " ".join(goal.split())
+                        if goal:
+                            self._child_goals.setdefault(owner_key, goal[:400])
                     # A repeated start after stop cannot resurrect this child.
                     work["children"].setdefault(child, "active")
                 else:
                     if self._child_owners.get(owner_key) != work["turn"] or work["children"].get(child) != "active": return
                     work["children"][child] = "ended"
+                    status = payload.get("child_status")
+                    goal = payload.get("child_goal")
+                    if not isinstance(goal, str) or not " ".join(goal.split()):
+                        goal = self._child_goals.get(owner_key, "")
+                    goal = " ".join(goal.split()) if isinstance(goal, str) else ""
+                    if status in ("completed", "failed") and goal:
+                        self._queue_event(
+                            profile, session_id, turn,
+                            "subagent.completed" if status == "completed" else "subagent.failed",
+                            event_key=child,
+                            content_text=f"{goal} — {status}",
+                        )
+                    self._child_goals.pop(owner_key, None)
             elif turn != work["turn"] or work["terminal"] or work["outcome"] is not None: return
             elif hook == "on_session_end":
                 if payload.get("interrupted") is True:
@@ -797,6 +844,7 @@ class ManagedNotifications:
             self._loaded_profiles.clear()
             self._approval_profiles.clear()
             self._clarification_profiles.clear()
+            self._child_goals.clear()
             if self._worker_lock is not None and (self._worker is None or not self._worker.is_alive()):
                 self._worker_lock.close(); self._worker_lock = None
 

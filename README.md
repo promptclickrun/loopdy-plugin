@@ -81,6 +81,18 @@ options, skills, MCP, and scheduled-task delivery. These locations exist on both
 supported runtimes. Compatibility tests exercise Doctor with the legacy import
 removal policy enabled; no deprecated-import override is required.
 
+### Tool-start notification safety
+
+On hosts with `register_middleware`, tool-start notification observers use the
+public `tool_request` middleware and return `None`, leaving arguments and policy
+checks unchanged. Notification-only work must not occupy `pre_tool_call`: Hermes
+can veto a concurrent tool when that fail-closed callback is already running.
+The managed and legacy notification producers retain their event coordinates,
+and observer failures log a bounded warning without reflecting private details.
+Older hosts without middleware retain the legacy hook integration; this
+concurrency fix requires the middleware-capable host. No timeout settings or
+authorization checks are disabled.
+
 ## Host context compatibility
 
 Ordinary Link chat does not require the optional Hermes `ToolExecutionContext`

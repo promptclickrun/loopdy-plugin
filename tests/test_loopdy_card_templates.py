@@ -284,6 +284,9 @@ class LoopdyCardTemplateToolTests(unittest.TestCase):
                 "template_id": "build-health",
                 "parameters": {},
             }))
+            from loopdy_plugin.generative_ui import extract_rendered_envelope
+            self.assertEqual(rendered["schema"], "loopdy.card_delivery")
+            rendered = extract_rendered_envelope(rendered)
             self.assertEqual(validate_card_result(rendered, now=NOW), rendered)
 
             isolated = _PluginContext()
@@ -321,6 +324,9 @@ class LoopdyCardTemplateToolTests(unittest.TestCase):
                 "parameters": {"Status-Label": "Ready"},
             }))
 
+            from loopdy_plugin.generative_ui import extract_rendered_envelope
+            self.assertEqual(rendered["schema"], "loopdy.card_delivery")
+            rendered = extract_rendered_envelope(rendered)
             self.assertEqual(rendered["title"], "Ready")
             self.assertEqual(rendered["spoken_summary"], "Build is Ready")
             self.assertEqual(

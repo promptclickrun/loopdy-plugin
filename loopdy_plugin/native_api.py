@@ -87,6 +87,12 @@ async def device_tools(operation: str, request: Request) -> Response:
     return await native_device_tools.request(operation, request)
 
 
+@router.post("/workspace-files/{operation}")
+async def workspace_files(operation: str, request: Request) -> Response:
+    from .workspace_artifacts import request as workspace_files_request
+    return await workspace_files_request(operation, request)
+
+
 class _Body(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     agentId: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")

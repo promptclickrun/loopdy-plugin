@@ -83,6 +83,7 @@ class GenerativeUiActionTests(unittest.TestCase):
                 "loopdy_render_checklist", "loopdy_render_selection", "loopdy_render_automation",
                 "loopdy_search_card_templates", "loopdy_get_card_template", "loopdy_render_card_template",
                 "loopdy_await_form_response", "loopdy_marketplace_prepare_upload",
+                "loopdy_react_to_message",
             },
         )
         for name, schema in self.context.schemas.items():

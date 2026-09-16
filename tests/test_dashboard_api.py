@@ -301,12 +301,13 @@ class DashboardApiTests(unittest.TestCase):
             value = capabilities.json()
             from loopdy_plugin.link_contracts import PLUGIN_VERSION
             self.assertEqual(value["plugin_version"], PLUGIN_VERSION)
-            self.assertEqual(value["default_provider"], "relay")
+            self.assertEqual(value["default_provider"], "managed")
             self.assertEqual(value["detail_modes"], ["automatic", "minimal", "detailed"])
             self.assertTrue(value["capabilities"]["native_channel"])
             self.assertTrue(value["capabilities"]["proactive_delivery"])
-            self.assertEqual(value["providers"], ["relay", "direct"])
-            self.assertTrue(value["capabilities"]["encrypted_relay"])
+            self.assertEqual(value["providers"], ["managed", "direct"])
+            self.assertNotIn("encrypted_relay", value["capabilities"])
+            self.assertNotIn("relay_setup", value)
             self.assertIn("channel.message", value["event_types"])
             self.assertIn("delegation.started", value["event_types"])
             self.assertIn("delegation.completed", value["event_types"])
@@ -316,7 +317,7 @@ class DashboardApiTests(unittest.TestCase):
 
             provider = client.get("/provider")
             self.assertEqual(provider.status_code, 200)
-            self.assertEqual(provider.json()["mode"], "relay")
+            self.assertEqual(provider.json()["mode"], "managed")
             self.assertEqual(module._service.reconciled, 1)
             self.assertEqual(client.put("/provider", json={"mode": "managed"}).status_code, 200)
             direct = client.put("/provider", json={"mode": "direct"})
@@ -347,173 +348,17 @@ class DashboardApiTests(unittest.TestCase):
             self.assertNotIn("push_token", listed_device)
             self.assertEqual(len(listed_device["token_fingerprint"]), 12)
 
-            relay_common = {
-                "version": 1,
-                "idempotency_key": "11111111-1111-4111-8111-111111111111",
-            }
-            relay_device = {
-                **relay_common,
-                "device_id": "relay_phone_01",
-                "revision": 1,
-                "issued": 1_735_689_600,
-                "lease_expires": 1_738_281_600,
-                "provider": "relay",
-                "recipient_public_key": "BHzyexiNA09-ilI4AwS1GsPAiWnid_IbNaYLSPxHZpl4B3dVENuO0EApPZrGn3Qw27p9reY86YIpngS3nSJ4c9E",
-                "recipient_key_id": "qfMA61lg6JEzr3NiARoeJvDi6i423EAqBK9sGSuJGow",
-                "push_token": "b" * 64,
-                "environment": "production",
-                "topic": "com.example.loopdy",
-                "label": "Phone",
-                "groups": [],
-            }
-            relay_registered = client.post("/relay/devices/register", json=relay_device)
-            self.assertEqual(relay_registered.status_code, 201)
-            self.assertNotIn("push_token", relay_registered.text)
-            self.assertNotIn("recipient_public_key", relay_registered.text)
-            uppercase_token = "AB" * 32
-            uppercase_registered = client.post(
-                "/relay/devices/register",
-                json={**relay_device, "push_token": uppercase_token},
-            )
-            self.assertEqual(uppercase_registered.status_code, 201)
-            self.assertEqual(
-                module._service.relay_operations[-1][1]["push_token"],
-                uppercase_token.lower(),
-            )
-            rejected_topic = client.post(
-                "/relay/devices/register",
-                json={
-                    **relay_device,
-                    "topic": "com.example.loopdy.push-type.liveactivity",
-                },
-            )
-            self.assertEqual(rejected_topic.status_code, 400)
-            self.assertNotIn("push-type.liveactivity", rejected_topic.text)
-            invalid_token_only = "not-an-apns-token"
-            invalid_token_response = client.post(
-                "/relay/devices/register",
-                json={**relay_device, "push_token": invalid_token_only},
-            )
-            self.assertEqual(invalid_token_response.status_code, 400)
-            self.assertEqual(
-                invalid_token_response.json()["detail"],
-                "Invalid relay request (push_token:string_pattern_mismatch)",
-            )
-            self.assertNotIn(invalid_token_only, invalid_token_response.text)
-            rejected_token = "A" * 65
-            rejected_key = "!" * 87
-            rejected = client.post(
-                "/relay/devices/register",
-                json={
-                    **relay_device,
-                    "push_token": rejected_token,
-                    "recipient_public_key": rejected_key,
-                },
-            )
-            self.assertEqual(rejected.status_code, 400)
-            self.assertNotIn(rejected_token, rejected.text)
-            self.assertNotIn(rejected_key, rejected.text)
-            for invalid_revision in (True, 1.5, 9_007_199_254_740_992):
-                with self.subTest(invalid_revision=invalid_revision):
-                    invalid = client.post(
-                        "/relay/devices/register",
-                        json={**relay_device, "revision": invalid_revision},
-                    )
-                    self.assertEqual(invalid.status_code, 400)
-                    self.assertRegex(
-                        invalid.json()["detail"],
-                        r"^Invalid relay request \(revision:[a-z0-9_]+\)$",
-                    )
-            self.assertEqual(
-                client.post(
-                    "/relay/devices/ack-sender-keys",
-                    json={
-                        **relay_common,
-                        "device_id": "relay_phone_01",
-                        "revision": 2,
-                        "sender_key_revision": 1,
-                        "acknowledged_sender_key_ids": [
-                            "YX4396SNMKY95u_qpE-qSDLgbBfQAOVJnTxYdswiUIA"
-                        ],
-                    },
-                ).status_code,
-                200,
-            )
-            self.assertEqual(
-                client.post(
-                    "/relay/devices/revoke",
-                    json={
-                        **relay_common,
-                        "device_id": "relay_phone_01",
-                        "revision": 3,
-                    },
-                ).status_code,
-                200,
-            )
-            live_activity = {
-                **relay_common,
-                "activity_id": "activity_fixture_01",
-                "device_id": "relay_phone_01",
-                "session_ref": "Q0RFRkdISUpLTE1OT1A",
-                "push_token": "c" * 64,
-                "environment": "production",
-                "topic": "com.example.loopdy",
-                "revision": 1,
-                "timestamp": 1_735_689_842,
-                "lease_expires": 1_735_718_642,
-            }
-            self.assertEqual(
-                client.post("/relay/live-activities/register", json=live_activity).status_code,
-                201,
-            )
-            self.assertEqual(
-                client.post(
-                    "/relay/live-activities/revoke",
-                    json={
-                        **relay_common,
-                        "activity_id": "activity_fixture_01",
-                        "revision": 2,
-                        "timestamp": 1_735_689_843,
-                    },
-                ).status_code,
-                200,
-            )
-            self.assertEqual(
-                client.post(
-                    "/relay/tenant/revoke",
-                    json={
-                        **relay_common,
-                        "tenant_id": "TENANT_EXAMPLE",
-                        "revision": 3,
-                    },
-                ).status_code,
-                200,
-            )
-            self.assertEqual(
-                client.post(
-                    "/relay/tenant/delete",
-                    json={
-                        **relay_common,
-                        "tenant_id": "TENANT_EXAMPLE",
-                        "revision": 4,
-                        "confirmation": "delete",
-                    },
-                ).status_code,
-                200,
-            )
-            self.assertEqual(
-                [operation for operation, _body in module._service.relay_operations],
-                [
-                    "register_device",
-                    "register_device",
-                    "acknowledge_sender_keys",
-                    "revoke_device",
-                    "register_live_activity",
-                    "revoke_live_activity",
-                    "revoke_tenant",
-                    "delete_tenant",
-                ],
-            )
+            self.assertEqual(client.put("/provider", json={"mode": "relay"}).status_code, 422)
+            for retired_route in (
+                "/relay/devices/register", "/relay/devices/ack-sender-keys",
+                "/relay/devices/revoke", "/relay/live-activities/register",
+                "/relay/live-activities/revoke", "/relay/tenant/revoke",
+                "/relay/tenant/delete",
+            ):
+                with self.subTest(retired_route=retired_route):
+                    self.assertEqual(client.post(retired_route, json={}).status_code, 404)
+                    self.assertNotIn(retired_route, app.openapi()["paths"])
+            self.assertEqual(module._service.relay_operations, [])
 
             activity_token = "a" * 64
             live_activity_body = {

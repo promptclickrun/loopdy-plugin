@@ -53,7 +53,7 @@ class LoopdyCardToolTests(unittest.TestCase):
 
         self.assertEqual(1, context.names.count("loopdy_render_card"))
         self.assertEqual(
-            [*LEGACY_RENDERERS, "loopdy_render_card", "loopdy_await_form_response", "loopdy_marketplace_prepare_upload"],
+            [*LEGACY_RENDERERS, "loopdy_render_checklist", "loopdy_render_selection", "loopdy_render_automation", "loopdy_render_card", "loopdy_await_form_response", "loopdy_marketplace_prepare_upload", "loopdy_react_to_message"],
             context.names,
         )
 
@@ -84,6 +84,9 @@ class LoopdyCardToolTests(unittest.TestCase):
 
         result = json.loads(context.handlers["loopdy_render_card"](payload))
 
+        from loopdy_plugin.generative_ui import extract_rendered_envelope
+        self.assertEqual("loopdy.card_delivery", result["schema"])
+        result = extract_rendered_envelope(result)
         self.assertEqual("loopdy.card", result["schema"])
         self.assertEqual(1, result["version"])
         self.assertEqual("2026-09-02T12:00:00Z", result["created_at"])

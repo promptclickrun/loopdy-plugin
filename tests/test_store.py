@@ -17,11 +17,9 @@ from loopdy_plugin.store import LoopdyStore
 
 
 class StoreTests(unittest.TestCase):
-    def test_fresh_store_defaults_to_relay(self) -> None:
+    def test_fresh_store_defaults_to_managed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            store = LoopdyStore(Path(directory) / "loopdy.sqlite3")
-
-            self.assertEqual(store.provider_mode(), "relay")
+            self.assertEqual(LoopdyStore(Path(directory) / "loopdy.sqlite3").provider_mode(), "managed")
 
     def test_device_reconciliation_preserves_preferences_when_omitted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -498,123 +496,17 @@ class StoreTests(unittest.TestCase):
             )
             self.assertEqual(reopened.pending_provider_receipts("direct"), [])
 
-    def test_provider_mode_accepts_relay_and_rejects_legacy_or_unknown_values(self) -> None:
+    def test_provider_mode_accepts_supported_modes_and_rejects_relay(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = LoopdyStore(Path(directory) / "loopdy.sqlite3")
-            store.set_provider_mode("relay")
-            self.assertEqual(store.provider_mode(), "relay")
-            for invalid in ("legacy_relay", "unknown"):
-                with self.subTest(invalid=invalid):
-                    with self.assertRaisesRegex(ValueError, "managed, direct, or relay"):
-                        store.set_provider_mode(invalid)
+            for mode in ("managed", "direct"):
+                store.set_provider_mode(mode)
+                self.assertEqual(store.provider_mode(), mode)
+            for invalid in ("relay", "legacy_relay", "unknown"):
+                with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                    store.set_provider_mode(invalid)
 
-    def test_relay_device_registration_is_monotonic_idempotent_leased_and_tombstoned(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            store = LoopdyStore(Path(directory) / "loopdy.sqlite3")
-            body = {
-                "version": 1,
-                "device_id": "relay_phone_01",
-                "revision": 7,
-                "recipient_key_id": "key_fixture_01",
-            }
-            first = store.register_relay_device(
-                device_id="relay_phone_01",
-                recipient_public_key="B" + "A" * 86,
-                recipient_key_id="key_fixture_01",
-                revision=7,
-                lease_expires=2_692_000,
-                normalized_body=body,
-                label="Phone",
-                groups=["personal"],
-                now=100_000,
-            )
-            duplicate = store.register_relay_device(
-                device_id="relay_phone_01",
-                recipient_public_key="B" + "A" * 86,
-                recipient_key_id="key_fixture_01",
-                revision=7,
-                lease_expires=2_692_000,
-                normalized_body=body,
-                label="Phone",
-                groups=["personal"],
-                now=100_001,
-            )
-            self.assertTrue(first["changed"])
-            self.assertFalse(duplicate["changed"])
-            self.assertEqual(store.resolve_devices("all", "relay", now=100_003), [])
-            with self.assertRaisesRegex(ValueError, "revision"):
-                store.register_relay_device(
-                    device_id="relay_phone_01",
-                    recipient_public_key="B" + "A" * 86,
-                    recipient_key_id="key_fixture_01",
-                    revision=6,
-                    lease_expires=2_692_000,
-                    normalized_body={**body, "revision": 6},
-                    now=100_002,
-                )
-            with self.assertRaisesRegex(ValueError, "idempotency"):
-                store.register_relay_device(
-                    device_id="relay_phone_01",
-                    recipient_public_key="B" + "A" * 86,
-                    recipient_key_id="key_fixture_01",
-                    revision=7,
-                    lease_expires=2_692_000,
-                    normalized_body={**body, "label": "Different"},
-                    now=100_003,
-                )
 
-            acknowledged = store.acknowledge_relay_sender_keys(
-                device_id="relay_phone_01",
-                revision=8,
-                sender_key_revision=1,
-                acknowledged_sender_key_ids=["sender_key_fixture_01"],
-                normalized_body={
-                    "version": 1,
-                    "device_id": "relay_phone_01",
-                    "revision": 8,
-                    "sender_key_revision": 1,
-                    "acknowledged_sender_key_ids": ["sender_key_fixture_01"],
-                },
-                now=100_004,
-            )
-            self.assertTrue(acknowledged["changed"])
-            self.assertEqual(
-                [
-                    device["device_id"]
-                    for device in store.resolve_devices("all", "relay", now=100_005)
-                ],
-                ["relay_phone_01"],
-            )
-
-            revoked = store.revoke_relay_device(
-                device_id="relay_phone_01",
-                revision=9,
-                normalized_body={"version": 1, "device_id": "relay_phone_01", "revision": 9},
-                now=100_005,
-            )
-            self.assertTrue(revoked["changed"])
-            self.assertTrue(store.list_devices()[0]["revoked"])
-            with self.assertRaisesRegex(ValueError, "higher revision"):
-                store.register_relay_device(
-                    device_id="relay_phone_01",
-                    recipient_public_key="B" + "A" * 86,
-                    recipient_key_id="key_fixture_01",
-                    revision=9,
-                    lease_expires=2_692_000,
-                    normalized_body={**body, "revision": 9},
-                    now=100_006,
-                )
-            reactivated = store.register_relay_device(
-                device_id="relay_phone_01",
-                recipient_public_key="B" + "A" * 86,
-                recipient_key_id="key_fixture_02",
-                revision=10,
-                lease_expires=2_692_000,
-                normalized_body={**body, "revision": 10, "recipient_key_id": "key_fixture_02"},
-                now=100_007,
-            )
-            self.assertTrue(reactivated["changed"])
-            self.assertFalse(store.list_devices()[0]["revoked"])
 
     def test_relay_recipient_key_change_clears_sender_ack_but_same_key_renewal_preserves_it(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -681,105 +573,11 @@ class StoreTests(unittest.TestCase):
                         now=100_004,
                     )
 
-    def test_relay_config_generation_invalidates_old_devices_without_remote_revoke(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            store = LoopdyStore(Path(directory) / "loopdy.sqlite3")
-            old_config = {
-                "base_url": "https://relay.example.invalid",
-                "tenant_id": "TENANT_EXAMPLE",
-                "credential_key_id": "credential_fixture_01",
-                "hmac_secret_reference": "env:LOOPDY_RELAY_HMAC",
-                "signing_key_secret_reference": "env:LOOPDY_RELAY_SIGNING_KEY",
-            }
-            store.save_relay_config(old_config)
-            store.register_relay_device(
-                device_id="relay_phone_01",
-                recipient_public_key="B" + "A" * 86,
-                recipient_key_id="key_fixture_01",
-                revision=1,
-                lease_expires=2_692_000,
-                normalized_body={"device_id": "relay_phone_01", "revision": 1},
-                now=100_000,
-            )
-            store.acknowledge_relay_sender_keys(
-                device_id="relay_phone_01",
-                revision=2,
-                sender_key_revision=1,
-                acknowledged_sender_key_ids=["sender_key_fixture_01"],
-                normalized_body={"device_id": "relay_phone_01", "revision": 2},
-                now=100_000,
-            )
-            self.assertEqual(len(store.resolve_devices("all", "relay", now=100_001)), 1)
-            store.save_relay_config({**old_config, "credential_key_id": "credential_fixture_02"})
-            self.assertEqual(store.resolve_devices("all", "relay", now=100_001), [])
-            self.assertFalse(store.list_devices()[0]["revoked"])
-            store.register_relay_device(
-                device_id="relay_phone_01",
-                recipient_public_key="B" + "A" * 86,
-                recipient_key_id="key_fixture_01",
-                revision=3,
-                lease_expires=2_691_000,
-                normalized_body={"device_id": "relay_phone_01", "revision": 3},
-                now=100_001,
-            )
-            self.assertEqual(store.list_devices()[0]["relay_generation"], store.relay_config_generation())
 
-    def test_removed_relay_config_exposes_disabled_rows_as_revoked(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            store = LoopdyStore(Path(directory) / "loopdy.sqlite3")
-            store.save_relay_config(
-                {
-                    "base_url": "https://relay.example.invalid",
-                    "tenant_id": "TENANT_EXAMPLE",
-                    "credential_key_id": "credential_fixture_01",
-                    "hmac_secret_reference": "env:LOOPDY_RELAY_HMAC",
-                    "signing_key_secret_reference": "env:LOOPDY_RELAY_SIGNING_KEY",
-                }
-            )
-            store.register_relay_device(
-                device_id="relay_phone_01",
-                recipient_public_key="B" + "A" * 86,
-                recipient_key_id="key_fixture_01",
-                revision=1,
-                lease_expires=2_692_000,
-                normalized_body={"device_id": "relay_phone_01", "revision": 1},
-                now=100_000,
-            )
 
-            store.clear_relay_config()
 
-            self.assertTrue(store.list_devices()[0]["revoked"])
-            self.assertTrue(store.get_device("relay_phone_01")["revoked"])
 
-    def test_relay_tenant_tombstone_cancels_activities_and_pending_updates(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            store = LoopdyStore(Path(directory) / "loopdy.sqlite3")
-            store.save_relay_config({
-                "base_url": "https://relay.example.invalid",
-                "tenant_id": "TENANT_EXAMPLE",
-                "credential_key_id": "credential_fixture_01",
-                "hmac_secret_reference": "env:LOOPDY_RELAY_HMAC",
-                "signing_key_secret_reference": "env:LOOPDY_RELAY_SIGNING_KEY",
-            })
-            store.register_relay_device(
-                device_id="relay_phone_01", recipient_public_key="B" + "A" * 86,
-                recipient_key_id="key_fixture_01", revision=1, lease_expires=2_692_000,
-                normalized_body={"device_id": "relay_phone_01", "revision": 1}, now=100_000,
-            )
-            store.register_relay_live_activity(
-                activity_id="activity_fixture_01", device_id="relay_phone_01",
-                session_ref="Q0RFRkdISUpLTE1OT1A", revision=1, timestamp=1_000,
-                lease_expires=29_800,
-                normalized_body={"activity_id": "activity_fixture_01", "revision": 1},
-            )
-            store.defer_relay_live_activity_update(
-                activity_id="activity_fixture_01", status="completed", detail="",
-                tool_name="", active_session_count=0, delay_seconds=0, failure="offline",
-            )
-            store.revoke_relay_tenant()
-            self.assertEqual(store.resolve_devices("all", "relay", now=100_001), [])
-            self.assertEqual(store.active_relay_live_activities("Q0RFRkdISUpLTE1OT1A", now=100_001), [])
-            self.assertEqual(store.pending_relay_live_activity_updates(), [])
+
 
     def test_relay_tenant_delete_purges_only_relay_local_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -892,55 +690,7 @@ class StoreTests(unittest.TestCase):
 
             self.assertIsNone(store.pending_relay_live_activity_update("relay_activity_01"))
 
-    def test_relay_config_and_reregistration_cancel_queued_ciphertext(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            store = LoopdyStore(Path(directory) / "loopdy.sqlite3")
-            config = {
-                "base_url": "https://relay.example.invalid",
-                "tenant_id": "TENANT_EXAMPLE",
-                "credential_key_id": "credential_fixture_01",
-                "hmac_secret_reference": "env:LOOPDY_RELAY_HMAC",
-                "signing_key_secret_reference": "env:LOOPDY_RELAY_SIGNING_KEY",
-            }
-            store.save_relay_config(config)
-            now = 100_000
-            store.register_relay_device(
-                device_id="relay_phone_01",
-                recipient_public_key="B" + "A" * 86,
-                recipient_key_id="key_fixture_01",
-                revision=1,
-                lease_expires=now + 2_592_000,
-                normalized_body={"device_id": "relay_phone_01", "revision": 1},
-                now=now,
-            )
-            event = build_event("channel.message", correlation=("queued-ciphertext",))
-            store.record_event(event, target="all")
-            store.record_device_delivery(
-                event_id=event.event_id,
-                device_id="relay_phone_01",
-                provider="relay",
-                status="queued",
-                target_revision=1,
-                target_generation=store.relay_config_generation(),
-                relay_request_body={"device_id": "relay_phone_01", "ciphertext": "old"},
-            )
 
-            store.save_relay_config({**config, "credential_key_id": "credential_fixture_02"})
-            canceled = store.list_event_deliveries(event.event_id)[0]
-            self.assertEqual(canceled["status"], "failed")
-            self.assertEqual(canceled["failure"], "relay_target_changed")
-            self.assertEqual(canceled["relay_request_body_json"], "")
-
-            store.register_relay_device(
-                device_id="relay_phone_01",
-                recipient_public_key="B" + "A" * 86,
-                recipient_key_id="key_fixture_01",
-                revision=2,
-                lease_expires=now + 2_592_000,
-                normalized_body={"device_id": "relay_phone_01", "revision": 2},
-                now=now + 1,
-            )
-            self.assertEqual(store.list_event_deliveries(event.event_id)[0]["relay_request_body_json"], "")
 
     def test_relay_operation_journal_persists_response_for_restart_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1072,31 +822,7 @@ class StoreTests(unittest.TestCase):
                     )
                 )
 
-    def test_relay_registration_cas_rejects_generation_changed_during_remote_call(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            store = LoopdyStore(Path(directory) / "loopdy.sqlite3")
-            config = {
-                "base_url": "https://relay.example.invalid",
-                "tenant_id": "TENANT_EXAMPLE",
-                "credential_key_id": "credential_fixture_01",
-                "hmac_secret_reference": "env:LOOPDY_RELAY_HMAC",
-                "signing_key_secret_reference": "env:LOOPDY_RELAY_SIGNING_KEY",
-            }
-            store.save_relay_config(config)
-            expected = store.relay_config_generation()
-            store.save_relay_config({**config, "credential_key_id": "credential_fixture_02"})
 
-            with self.assertRaisesRegex(ValueError, "generation"):
-                store.register_relay_device(
-                    device_id="relay_phone_01",
-                    recipient_public_key="B" + "A" * 86,
-                    recipient_key_id="key_fixture_01",
-                    revision=1,
-                    lease_expires=2_692_000,
-                    normalized_body={"device_id": "relay_phone_01", "revision": 1},
-                    expected_relay_generation=expected,
-                    now=100_000,
-                )
 
     def test_pending_delivery_retains_original_relay_revision_and_recipient_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

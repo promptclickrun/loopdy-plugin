@@ -2997,16 +2997,9 @@ class LoopdyAdapter(BasePlatformAdapter):
             task.add_done_callback(self._voice_tasks.discard)
             return
         if isinstance(payload, InboundLinkRelayReady):
-            # Link APNs is an account-scoped wake channel owned by the Link
-            # service.  It must never be mistaken for this host's optional
-            # notification-relay tenant.  Only an explicitly host-scoped
-            # registration may enter the local relay delivery ledger.
-            if payload.registration.scope == "host_relay":
-                await asyncio.to_thread(
-                    self.service.adopt_link_relay_device,
-                    payload.registration,
-                    sender_device_id=payload.sender_device_id,
-                )
+            # Legacy host-relay readiness frames are ignored. Link chat and
+            # its authorization broker remain independent of notification
+            # enrollment and BuzzKit owns notification delivery.
             return
         await self.receive_link_turn(payload)
 

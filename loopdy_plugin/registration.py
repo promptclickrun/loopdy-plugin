@@ -291,8 +291,8 @@ def register(
     if callable(reset_api_usage):
         ctx.register_hook("on_session_reset", reset_api_usage)
     for hook_name in NOTIFICATION_HOOKS:
-        ctx.register_hook(
-            hook_name,
+        _register_notification_observer(
+            ctx, hook_name,
             partial(
                 _deliver_hook,
                 hook_name,
@@ -329,7 +329,7 @@ def register(
             managed.observe(hook, profile=str(ctx.profile_name or profile), **payload)
         for hook in ("pre_llm_call", "post_llm_call", "pre_tool_call", "post_tool_call",
                      "on_session_end", "subagent_start", "subagent_stop"):
-            ctx.register_hook(hook, partial(observe_managed, hook))
+            _register_notification_observer(ctx, hook, partial(observe_managed, hook))
         # Registration is additive: retain the existing voice observer and the
         # explicitly selected legacy transport. Older SDKs can warn-and-register
         # unknown names, so registration alone is not proof of an emitter.
@@ -358,6 +358,32 @@ def register(
         release_service(active_service)
 
     ctx.on_unload(unload)
+
+
+def _register_notification_observer(ctx: Any, hook: str, callback: Any) -> None:
+    """Keep tool-start telemetry out of Hermes's fail-closed policy hooks.
+
+    Hermes suppresses concurrent invocations of a bounded hook callback. For
+    pre_tool_call that suppression vetoes the tool, even when the callback only
+    updates notifications. Request middleware retains the authentic coordinates
+    and normal policy/approval path without making telemetry an authorization gate.
+    Older hosts without request middleware retain their legacy hook integration.
+    """
+    register_middleware = getattr(ctx, "register_middleware", None)
+    if hook != "pre_tool_call" or not callable(register_middleware):
+        ctx.register_hook(hook, callback)
+        return
+
+    def observe_tool_request(**payload: Any) -> None:
+        try:
+            callback(**payload)
+        except Exception:
+            # Never reflect notification state, payloads, or exception bodies.
+            logger.warning("Loopdy tool-start notification observation unavailable")
+        # None preserves the tool name, arguments, result, and policy decisions.
+        return None
+
+    register_middleware("tool_request", observe_tool_request)
 
 
 def _pre_llm_call(

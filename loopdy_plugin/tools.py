@@ -509,6 +509,44 @@ def _template_tool_description(action: str) -> str:
     )
 
 
+def _provider_discovery_parameters() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "include_usage": {
+                "type": "boolean",
+                "default": True,
+                "description": "Include local token-usage totals where the provider keeps a host-local ledger.",
+            },
+            "usage_days": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 30,
+                "default": 7,
+                "description": "Lookback window in days for local usage ledgers.",
+            },
+        },
+        "additionalProperties": False,
+    }
+
+
+def _provider_discovery_handler(payload: Any, **_kwargs: Any) -> str:
+    from .provider_usage import discover_providers
+
+    if not isinstance(payload, dict):
+        raise ValueError("provider discovery arguments must be an object")
+    include_usage = payload.get("include_usage", True)
+    if not isinstance(include_usage, bool):
+        raise ValueError("include_usage must be a boolean")
+    usage_days = payload.get("usage_days", 7)
+    if isinstance(usage_days, bool) or not isinstance(usage_days, int):
+        raise ValueError("usage_days must be an integer")
+    if not 1 <= usage_days <= 30:
+        raise ValueError("usage_days must be between 1 and 30")
+    result = discover_providers(include_usage=include_usage, usage_days=usage_days)
+    return json.dumps(result, ensure_ascii=False)
+
+
 def register(
     ctx,
     *,
@@ -595,6 +633,26 @@ def register(
             ),
         },
         handler=_await_handler(store=store, profile=selected_profile, now=clock),
+    )
+    ctx.register_tool(
+        name="loopdy_provider_discovery",
+        toolset="loopdy",
+        schema={
+            "name": "loopdy_provider_discovery",
+            "description": (
+                "Discover AI coding tools installed on the Hermes host (Claude Code, Codex CLI, "
+                "GitHub Copilot CLI, OpenCode, Gemini CLI, Cursor, Aider) and report each tool's "
+                "installed, authenticated, and local token-usage state. Usage is reported only "
+                "when the tool keeps a host-local ledger; otherwise the result states that usage "
+                "is unavailable and why. Auth material is never read. This is a direct callable "
+                "native Loopdy tool. Call it directly when it is visible in the current tool "
+                "list. When Hermes has progressively disclosed it and it is absent, use the "
+                "official tool_search, tool_describe, and tool_call bridge to invoke this exact "
+                "tool; do not substitute or wrap another tool."
+            ),
+            "parameters": _provider_discovery_parameters(),
+        },
+        handler=_provider_discovery_handler,
     )
     if store is not None and all(
         hasattr(store, name)

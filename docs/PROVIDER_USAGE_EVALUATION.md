@@ -50,3 +50,23 @@ Recommended next step: design a minimal backend contract that returns only
 bounded provider names, installed/configured status, usage source, last updated
 time, and optional numeric usage fields when a provider exposes an explicit
 supported source. Then build the native modal against that contract.
+
+## Build decision (2026-09-16)
+
+The "No Build" recommendation above is superseded for the host-side portion.
+This repository now ships the minimal backend contract the evaluation called
+for, as the `loopdy_provider_discovery` tool (`loopdy_plugin/provider_usage.py`).
+
+- Discovery covers an allowlisted set of tools: Claude Code, Codex CLI,
+  GitHub Copilot CLI, OpenCode, Gemini CLI, Cursor, and Aider. Detection uses
+  binary presence plus config/auth marker existence. Auth files are never
+  opened; only their existence is reported.
+- Usage is reported only from explicit host-local ledgers, per provider:
+  Claude Code transcripts (`~/.claude/projects/**/*.jsonl`), Codex session
+  rollouts (`~/.codex/sessions/**/rollout-*.jsonl`, delta token counts only),
+  and OpenCode session parts (`~/.local/share/opencode/.../part-*.json`).
+  Providers without a local ledger (Copilot CLI, Gemini CLI, Cursor, Aider)
+  return `available: false` with a reason instead of a guessed number.
+- Scans are bounded (400 files, 10 MB per file, 100 MB total) and a failure
+  in one provider never breaks discovery of the others.
+- The Liquid Glass modal itself remains app-side, built against this contract.

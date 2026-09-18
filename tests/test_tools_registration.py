@@ -2,6 +2,8 @@ import json
 import unittest
 from pathlib import Path
 
+import yaml
+
 from loopdy_plugin.registration import register
 
 
@@ -30,6 +32,14 @@ class _Context:
 
 
 class ToolRegistrationTests(unittest.TestCase):
+    def test_manifest_declares_every_registered_tool(self):
+        root = Path(__file__).resolve().parents[1]
+        manifest = yaml.safe_load((root / "plugin.yaml").read_text(encoding="utf-8"))
+        context = _Context()
+        register(context, service=_Service())
+
+        self.assertTrue(set(context.tools).issubset(set(manifest["provides_tools"])))
+
     def test_generative_ui_skill_supports_hermes_progressive_tool_disclosure(self):
         skill = (
             Path(__file__).resolve().parents[1]

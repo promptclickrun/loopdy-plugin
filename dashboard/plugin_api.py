@@ -52,6 +52,7 @@ from loopdy_plugin.native_api import router as native_router  # noqa: E402
 from loopdy_plugin.room_activity_api import router as room_activity_router  # noqa: E402
 from loopdy_plugin.native_wiki_api import router as native_wiki_router  # noqa: E402
 from loopdy_plugin.native_project_git import router as native_project_git_router  # noqa: E402
+from loopdy_plugin.native_threads import router as native_threads_router  # noqa: E402
 from loopdy_plugin.agent_templates import (  # noqa: E402
     capability as agent_templates_capability,
     router as agent_templates_router,
@@ -64,6 +65,7 @@ router.include_router(native_router)
 router.include_router(room_activity_router, prefix="/native")
 router.include_router(native_wiki_router)
 router.include_router(native_project_git_router)
+router.include_router(native_threads_router)
 router.include_router(agent_templates_router)
 from loopdy_plugin.managed_notifications_api import router as managed_notifications_router
 router.include_router(managed_notifications_router)

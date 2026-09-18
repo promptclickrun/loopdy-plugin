@@ -424,6 +424,17 @@ class PreLlmCallInjectionTests(unittest.TestCase):
         self.assertIn("never ask a worker to assemble", context)
         self.assertIn("ONLY you write durable profile memory", context)
 
+    def test_coordinator_turn_makes_chat_the_primary_orchestration_surface(self):
+        record = thread_mode._ensure_coordinator(self.ctx.state, COORD)
+        self.ctx.state.set(thread_mode.coordinator_key(COORD), record)
+
+        context = self._inject(session_id=COORD, parent_session_id="")["context"]
+
+        self.assertIn("automatically decide", context)
+        self.assertIn("without asking the user to create or name threads", context)
+        self.assertIn("current coordinator chat", context)
+        self.assertIn("manual thread creation", context)
+
     def test_non_thread_session_injects_nothing(self):
         self.assertIsNone(self._inject(session_id="plain", parent_session_id=""))
 

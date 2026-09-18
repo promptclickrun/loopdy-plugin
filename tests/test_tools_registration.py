@@ -121,6 +121,13 @@ class ToolRegistrationTests(unittest.TestCase):
                 self.assertIn("cannot submit or publish", description)
                 self.assertTrue(renderer_schema["parameters"]["properties"]["validateOnly"])
                 continue
+            if tool_name.startswith("thread_"):
+                # Thread-mode coordinator/worker tools (PROTOCOL.md): not renderers.
+                self.assertIn(
+                    tool_name, ("thread_spawn", "thread_status", "thread_collect", "thread_note"))
+                self.assertFalse(renderer_schema["parameters"]["additionalProperties"])
+                self.assertIn("thread", description.lower())
+                continue
             self.assertIn("direct callable native Loopdy renderer", description)
             self.assertIn("visible in the current tool list", description)
             self.assertIn("tool_search", description)

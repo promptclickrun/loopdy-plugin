@@ -211,6 +211,11 @@ def register(
             bridge=device_tool_bridge if legacy_device_tools else None,
         )
     register_marketplace_publish_skill(ctx)
+    # Thread mode (coordinator/worker threads): four loopdy tools plus additive
+    # pre_llm_call / subagent_start / subagent_stop hooks. Registered next to
+    # the existing tool registration; never alters the existing hooks.
+    from .thread_mode import register as register_thread_mode
+    register_thread_mode(ctx)
 
     ctx.register_platform(
         name="loopdy",

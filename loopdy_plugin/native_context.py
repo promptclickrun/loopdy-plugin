@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import logging
 import re
 import time
 import unicodedata
@@ -14,8 +15,10 @@ from fastapi import Request
 from .link_contracts import PLUGIN_VERSION
 
 
+logger = logging.getLogger("hermes.plugins.loopdy")
 RUNTIME_ID = uuid.uuid4().hex
 PROFILE_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
+_startup_advertisement_logged = False
 
 
 class NativeAPIError(Exception):
@@ -62,6 +65,78 @@ class NativeContext:
         encoded = json.dumps(self.payload(), ensure_ascii=False, sort_keys=True,
                              separators=(",", ":"), allow_nan=False).encode("utf-8")
         return '"sha256:' + hashlib.sha256(encoded).hexdigest() + '"'
+
+
+def log_native_feature_startup(profile: str | None = None) -> None:
+    """Log once which native features this process advertised at startup.
+
+    This mirrors the skip conditions in ``native_context()`` so a failed
+    advertisement shows up as a WARNING in the host log instead of a silent
+    iOS capability-probe miss.  Call from the plugin ``register()`` path once
+    the native middleware registration has run.  Subsequent calls are no-ops
+    (reloads re-run ``register()`` but the advertisement outcome only matters
+    at process startup).
+    """
+    global _startup_advertisement_logged
+    if _startup_advertisement_logged:
+        return
+    _startup_advertisement_logged = True
+    advertised: list[str] = ["native-context-v1"]
+    try:
+        from hermes_constants import get_process_hermes_home, profile_name_for_home
+    except ImportError as exc:
+        logger.warning(
+            "Loopdy native feature 'serving-profile-v1' NOT advertised: "
+            "hermes_constants profile helpers are unimportable (%s). Older "
+            "hosts cannot prove the process profile, so the iOS capability "
+            "probe will not see this feature.", exc)
+    else:
+        advertised.append("serving-profile-v1")
+    try:
+        from hermes_cli.profiles import profile_exists
+        from hermes_constants import (
+            get_process_hermes_home, set_hermes_home_override, reset_hermes_home_override,
+        )
+    except ImportError as exc:
+        logger.warning(
+            "Loopdy native features 'native-voice-v1' and "
+            "'native-card-templates-v1' NOT advertised: profile-helper import "
+            "failure (%s). The iOS capability probe will miss them even "
+            "though the plugin is installed.", exc)
+    else:
+        helpers = (profile_exists, get_process_hermes_home,
+                   set_hermes_home_override, reset_hermes_home_override)
+        if all(callable(function) for function in helpers):
+            advertised.extend(("native-card-templates-v1", "native-voice-v1"))
+        else:
+            logger.warning(
+                "Loopdy native features 'native-voice-v1' and "
+                "'native-card-templates-v1' NOT advertised: one or more "
+                "profile helpers are not callable on this host.")
+    try:
+        from .native_device_tools import (
+            CAPABILITY as device_tools_capability,
+            available as device_tools_available,
+        )
+    except ImportError as exc:
+        logger.warning(
+            "Loopdy native feature 'native-device-tools-v1' NOT advertised: "
+            "the native_device_tools module failed to import (%s).", exc)
+    else:
+        if profile is not None and device_tools_available(profile):
+            advertised.append(device_tools_capability)
+        else:
+            logger.warning(
+                "Loopdy native feature 'native-device-tools-v1' NOT advertised "
+                "for profile %r: no middleware registration matched this "
+                "process's profile-scoped namespace (namespace/profile "
+                "mismatch, register_middleware was skipped, or multiple stale "
+                "generations are still loaded). Restart `hermes serve` and "
+                "check for Loopdy middleware registration warnings above.",
+                profile)
+    logger.info(
+        "Loopdy native features advertised at startup: %s",
+        ", ".join(advertised))
 
 
 def native_context(request: Request) -> NativeContext:

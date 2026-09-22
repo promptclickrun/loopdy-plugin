@@ -728,7 +728,12 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(status.loopdy_link_action, "status")
 
     def test_retired_link_pairing_never_pairs_or_activates_gateway(self) -> None:
+        from loopdy_plugin import registration
         from loopdy_plugin.registration import _handle_link_cli
+
+        # The dead gateway-activation hook was removed entirely: pairing is
+        # retired and nothing in the plugin may restart the gateway on its own.
+        self.assertFalse(hasattr(registration, "_request_gateway_activation"))
 
         paired = {
             "state": "paired",
@@ -740,10 +745,6 @@ class RegistrationTests(unittest.TestCase):
 
         with (
             patch("loopdy_plugin.registration.pair_host", return_value=paired) as pair,
-            patch(
-                "loopdy_plugin.registration._request_gateway_activation",
-                return_value=True,
-            ) as activate,
             contextlib.redirect_stdout(output),
         ):
             _handle_link_cli(
@@ -755,7 +756,6 @@ class RegistrationTests(unittest.TestCase):
                 identity_state=_Context().state,
             )
 
-        activate.assert_not_called()
         pair.assert_not_called()
         result = json.loads(output.getvalue())
         self.assertEqual(result["state"], "retired")

@@ -6,7 +6,6 @@ import hashlib
 import json
 import logging
 import os
-import subprocess
 import sqlite3
 import sys
 import time
@@ -357,7 +356,6 @@ def register(
         release_service(active_service)
 
     ctx.on_unload(unload)
-
 
 def _register_notification_observer(ctx: Any, hook: str, callback: Any) -> None:
     """Keep tool-start telemetry out of Hermes's fail-closed policy hooks.
@@ -995,29 +993,6 @@ def _handle_link_cli(args: Any, *, identity_state: Any | None = None) -> None:
         _print_json({"configured": False, "state": "unpaired", "removed": removed})
         return
     raise ValueError("Unknown Loopdy Link command")
-
-
-def _request_gateway_activation() -> bool:
-    """Ask the official Hermes lifecycle command to load the new pairing."""
-    command = [sys.executable, "-m", "hermes_cli.main", "gateway", "restart"]
-    options: dict[str, Any] = {
-        "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
-    }
-    if os.name == "nt":
-        options["creationflags"] = (
-            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            | getattr(subprocess, "DETACHED_PROCESS", 0)
-        )
-    else:
-        options["start_new_session"] = True
-    try:
-        subprocess.Popen(command, **options)
-        return True
-    except OSError as exc:
-        logger.warning("Loopdy Link could not request gateway activation: %s", exc)
-        return False
 
 
 def _link_status_value(config: Any | None, identity_state: Any | None) -> dict[str, Any]:

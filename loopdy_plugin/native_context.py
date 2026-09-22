@@ -68,8 +68,10 @@ class NativeContext:
 
 
 def log_native_feature_startup(profile: str | None = None) -> None:
-    """Log the context API's process inventory once, after all registration.
+    """Log the context API's inventory once from its own router lifespan.
 
+    The host may load registration and HTTP code in different namespaces;
+    only the API namespace can describe what HTTP clients will actually see.
     Wiki features require a request principal and are explicitly excluded.
     The registration profile is diagnostic only: the API's verified process
     profile, not a caller-supplied fallback, determines device availability.

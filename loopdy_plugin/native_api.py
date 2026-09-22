@@ -1,6 +1,7 @@
 """Finite stock-serve HTTP adapters for existing Loopdy domain services."""
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import json
 import logging
 import re
@@ -14,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect
 
-from .native_context import NativeAPIError, NativeContext, PROFILE_ID, native_context
+from .native_context import NativeAPIError, NativeContext, PROFILE_ID, log_native_feature_startup, native_context
 from .store import CardTemplateConflict, CardTemplateLimit
 from .workspace_control import card_template_projection
 
@@ -58,7 +59,15 @@ class _NativeRoute(APIRoute):
         return guarded
 
 
-router = APIRouter(prefix="/native", route_class=_NativeRoute)
+@asynccontextmanager
+async def _native_lifespan(app):
+    # Hermes mounts this router separately from its profile-scoped plugin
+    # registration module. Log the inventory from the namespace serving HTTP.
+    log_native_feature_startup()
+    yield
+
+
+router = APIRouter(prefix="/native", route_class=_NativeRoute, lifespan=_native_lifespan)
 
 
 @router.post("/voice/{operation}")

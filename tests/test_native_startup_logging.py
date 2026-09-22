@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
+import asyncio
 import sys
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -10,7 +11,7 @@ from unittest.mock import Mock, patch
 
 from fastapi import Request
 
-from loopdy_plugin import native_context, registration
+from loopdy_plugin import native_api, native_context, registration
 
 
 LOG = "hermes.plugins.loopdy"
@@ -229,7 +230,22 @@ class NativeStartupLoggingTests(unittest.TestCase):
         self.constants.get_process_hermes_home.assert_not_called()
         self.device.available.assert_not_called()
 
-    def test_registration_logs_after_room_registration_without_promising_device_advertisement(self):
+    def test_router_lifespan_logs_http_namespace_inventory_once(self):
+        self.hub.available = False
+
+        async def start():
+            async with native_api.router.lifespan_context(None):
+                pass
+            async with native_api.router.lifespan_context(None):
+                pass
+
+        with self.assertLogs(LOG, level="INFO") as logs:
+            asyncio.run(start())
+        self.assertEqual(self.logged_features(logs.records),
+                         native_context.native_context(self.request()).features)
+        self.assertNotIn("native-room-activity-v1", self.logged_features(logs.records))
+
+    def test_registration_does_not_claim_http_namespace_inventory(self):
         self.hub.available = False
         self.device.available.return_value = False  # callback accepted, no lifecycle ownership
 
@@ -251,15 +267,13 @@ class NativeStartupLoggingTests(unittest.TestCase):
             self.stack.enter_context(patch.object(registration, name))
         self.stack.enter_context(patch.object(registration, "_device_tools_supported", return_value=False))
         ctx = Mock(profile_name="research", state=None)
-        with self.assertLogs(LOG, level="INFO") as logs:
+        with patch.object(native_context.logger, "info") as info:
             registration.register(ctx, service=SimpleNamespace(store=object()), activity_broker=Mock(),
                                   attachment_store=object(), marketplace_gateway_client=object())
         self.room.register_room_activity.assert_called_once_with(ctx)
         self.device.register_middleware.assert_called_once_with(ctx)
-        self.assertEqual(self.logged_features(logs.records),
-                         tuple(feature for feature in PROCESS_FEATURES if feature != "native-device-tools-v1"))
-        self.assertNotIn("will be advertised", " ".join(logs.output))
-        self.assert_warning(logs.records, "native-device-tools-v1")
+        info.assert_not_called()
+        self.assertFalse(native_context._startup_advertisement_logged)
 
 
 if __name__ == "__main__":

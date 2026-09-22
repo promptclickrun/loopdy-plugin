@@ -357,12 +357,6 @@ def register(
 
     ctx.on_unload(unload)
 
-    # Availability includes room registration and lifecycle ownership, not just
-    # accepted middleware callbacks. Use the same predicates as the context API.
-    from .native_context import log_native_feature_startup
-    log_native_feature_startup(profile)
-
-
 def _register_notification_observer(ctx: Any, hook: str, callback: Any) -> None:
     """Keep tool-start telemetry out of Hermes's fail-closed policy hooks.
 

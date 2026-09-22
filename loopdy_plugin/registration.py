@@ -204,27 +204,11 @@ def register(
     legacy_device_tools = _device_tools_supported()
     from .native_device_tools import register_middleware as register_native_device_tools
     native_device_tools = register_native_device_tools(ctx)
-    if native_device_tools:
-        logger.info(
-            "Loopdy native tool execution middleware registered for profile %r; "
-            "'native-device-tools-v1' will be advertised to the iOS capability "
-            "probe.", profile)
-    else:
-        logger.warning(
-            "Loopdy native tool execution middleware NOT registered for "
-            "profile %r; 'native-device-tools-v1' will be missing from the iOS "
-            "capability probe. The detailed reason was logged by the "
-            "middleware registration just above.", profile)
     if legacy_device_tools or native_device_tools:
         register_device_tools(
             ctx,
             bridge=device_tool_bridge if legacy_device_tools else None,
         )
-    # Log which native features this process can advertise, and warn loudly
-    # for every skip condition, so a silent advertisement miss shows up in the
-    # host log instead of looking identical to "plugin never activated".
-    from .native_context import log_native_feature_startup
-    log_native_feature_startup(profile)
     register_marketplace_publish_skill(ctx)
 
     ctx.register_platform(
@@ -372,6 +356,11 @@ def register(
         release_service(active_service)
 
     ctx.on_unload(unload)
+
+    # Availability includes room registration and lifecycle ownership, not just
+    # accepted middleware callbacks. Use the same predicates as the context API.
+    from .native_context import log_native_feature_startup
+    log_native_feature_startup(profile)
 
 
 def _register_notification_observer(ctx: Any, hook: str, callback: Any) -> None:

@@ -68,72 +68,42 @@ class NativeContext:
 
 
 def log_native_feature_startup(profile: str | None = None) -> None:
-    """Log once which native features this process advertised at startup.
+    """Log the context API's process inventory once, after all registration.
 
-    This mirrors the skip conditions in ``native_context()`` so a failed
-    advertisement shows up as a WARNING in the host log instead of a silent
-    iOS capability-probe miss.  Call from the plugin ``register()`` path once
-    the native middleware registration has run.  Subsequent calls are no-ops
-    (reloads re-run ``register()`` but the advertisement outcome only matters
-    at process startup).
+    Wiki features require a request principal and are explicitly excluded.
+    The registration profile is diagnostic only: the API's verified process
+    profile, not a caller-supplied fallback, determines device availability.
     """
     global _startup_advertisement_logged
     if _startup_advertisement_logged:
         return
     _startup_advertisement_logged = True
-    advertised: list[str] = ["native-context-v1"]
+    logger.info(
+        "Loopdy request-dependent features excluded from the startup inventory: "
+        "native-wiki-v1, native-wiki-disconnect-v1 (require a verified request "
+        "principal, profile helpers, and available wiki operations).")
+    skipped: list[tuple[str, str]] = []
     try:
-        from hermes_constants import get_process_hermes_home, profile_name_for_home
-    except ImportError as exc:
+        serving_profile, advertised = _native_features(None, skipped=skipped)
+    except NativeAPIError as exc:
         logger.warning(
-            "Loopdy native feature 'serving-profile-v1' NOT advertised: "
-            "hermes_constants profile helpers are unimportable (%s). Older "
-            "hosts cannot prove the process profile, so the iOS capability "
-            "probe will not see this feature.", exc)
-    else:
-        advertised.append("serving-profile-v1")
-    try:
-        from hermes_cli.profiles import profile_exists
-        from hermes_constants import (
-            get_process_hermes_home, set_hermes_home_override, reset_hermes_home_override,
-        )
-    except ImportError as exc:
+            "Loopdy native startup inventory unavailable: %s; "
+            "the context API cannot advertise features.", exc.code)
+        return
+    except Exception as exc:
+        # Diagnostics must not turn a failing capability probe into a plugin
+        # registration failure. The request path retains its original errors.
         logger.warning(
-            "Loopdy native features 'native-voice-v1' and "
-            "'native-card-templates-v1' NOT advertised: profile-helper import "
-            "failure (%s). The iOS capability probe will miss them even "
-            "though the plugin is installed.", exc)
-    else:
-        helpers = (profile_exists, get_process_hermes_home,
-                   set_hermes_home_override, reset_hermes_home_override)
-        if all(callable(function) for function in helpers):
-            advertised.extend(("native-card-templates-v1", "native-voice-v1"))
-        else:
-            logger.warning(
-                "Loopdy native features 'native-voice-v1' and "
-                "'native-card-templates-v1' NOT advertised: one or more "
-                "profile helpers are not callable on this host.")
-    try:
-        from .native_device_tools import (
-            CAPABILITY as device_tools_capability,
-            available as device_tools_available,
-        )
-    except ImportError as exc:
+            "Loopdy native startup inventory unavailable: capability probe "
+            "failed (%s); no advertisement claimed.", type(exc).__name__)
+        return
+    if profile is not None and profile != serving_profile:
         logger.warning(
-            "Loopdy native feature 'native-device-tools-v1' NOT advertised: "
-            "the native_device_tools module failed to import (%s).", exc)
-    else:
-        if profile is not None and device_tools_available(profile):
-            advertised.append(device_tools_capability)
-        else:
-            logger.warning(
-                "Loopdy native feature 'native-device-tools-v1' NOT advertised "
-                "for profile %r: no middleware registration matched this "
-                "process's profile-scoped namespace (namespace/profile "
-                "mismatch, register_middleware was skipped, or multiple stale "
-                "generations are still loaded). Restart `hermes serve` and "
-                "check for Loopdy middleware registration warnings above.",
-                profile)
+            "Loopdy registration profile %r differs from verified serving "
+            "profile %r; startup inventory uses the serving profile.",
+            profile, serving_profile)
+    for feature, reason in skipped:
+        logger.warning("Loopdy native feature %r NOT advertised: %s", feature, reason)
     logger.info(
         "Loopdy native features advertised at startup: %s",
         ", ".join(advertised))
@@ -168,12 +138,25 @@ def native_context(request: Request) -> NativeContext:
             raise NativeAPIError(401, "native_identity_invalid",
                                  "The Hermes identity is invalid or expired.") from None
 
+    profile, features = _native_features(provider)
+    return NativeContext(provider, user_id, display_name, profile, features, RUNTIME_ID)
+
+
+def _native_features(
+    provider: str | None, *, skipped: list[tuple[str, str]] | None = None,
+) -> tuple[str | None, tuple[str, ...]]:
+    """Single source for API predicates/order and optional startup diagnostics."""
+    def skip(feature: str, reason: str) -> None:
+        if skipped is not None:
+            skipped.append((feature, reason))
+
     profile = None
     features = ["native-context-v1"]
     try:
         from hermes_constants import get_process_hermes_home, profile_name_for_home
     except ImportError:
-        pass  # Older hosts cannot prove process profile; never infer "default".
+        # Older hosts cannot prove process profile; never infer "default".
+        skip("serving-profile-v1", "process profile helpers are unimportable.")
     else:
         profile = profile_name_for_home(get_process_hermes_home())
         if profile is not None:
@@ -181,19 +164,26 @@ def native_context(request: Request) -> NativeContext:
                 raise NativeAPIError(503, "native_context_unavailable",
                                      "The serving profile could not be verified.")
             features.append("serving-profile-v1")
+        else:
+            skip("serving-profile-v1", "the process home has no verified serving profile.")
     try:
         from hermes_cli.profiles import profile_exists
         from hermes_constants import (
             get_process_hermes_home, set_hermes_home_override, reset_hermes_home_override,
         )
     except ImportError:
-        pass  # The routes fail closed when their public profile helpers are absent.
+        # The routes fail closed when their public profile helpers are absent.
+        skip("native-card-templates-v1", "public profile helpers are unimportable.")
+        skip("native-voice-v1", "public profile helpers are unimportable.")
     else:
         if all(callable(function) for function in (
             profile_exists, get_process_hermes_home,
             set_hermes_home_override, reset_hermes_home_override,
         )):
             features.extend(("native-card-templates-v1", "native-voice-v1"))
+        else:
+            skip("native-card-templates-v1", "one or more public profile helpers are not callable.")
+            skip("native-voice-v1", "one or more public profile helpers are not callable.")
     try:
         from .native_device_tools import (
             CAPABILITY as device_tools_capability,
@@ -201,29 +191,43 @@ def native_context(request: Request) -> NativeContext:
         )
         if profile is not None and device_tools_available(profile):
             features.append(device_tools_capability)
+        else:
+            skip(device_tools_capability,
+                 "no unique lifecycle-owned middleware registration matches the "
+                 "verified serving profile (missing profile/registration, "
+                 "namespace/profile mismatch, or stale generations). "
+                 "Restart `hermes serve` and check the middleware registration warnings.")
     except ImportError:
-        pass
+        skip("native-device-tools-v1", "native device-tool support is unimportable.")
     from .room_activity import CAPABILITY, activity_hub
     if activity_hub().available:
         features.append(CAPABILITY)
+    else:
+        skip(CAPABILITY, "the room activity hub is unavailable after registration.")
     from .wiki_contract import available_wiki_operations
     if provider is not None and "native-card-templates-v1" in features and available_wiki_operations():
         features.extend(("native-wiki-v1", "native-wiki-disconnect-v1"))
     from .native_project_git import CAPABILITY as project_git_capability, supported as project_git_supported
     if project_git_supported():
         features.append(project_git_capability)
+    else:
+        skip(project_git_capability, "the host does not support native project Git reads.")
     try:
         from .agent_templates import CAPABILITY as agent_templates_capability
         from .agent_templates import available as agent_templates_available
         if agent_templates_available():
             features.append(agent_templates_capability)
+        else:
+            skip(agent_templates_capability, "agent template availability checks failed.")
     except ImportError:
-        pass
+        skip("native-agent-templates-v1", "agent template support is unimportable.")
     try:
         from .workspace_artifacts import CAPABILITY as workspace_files_capability
         from .workspace_artifacts import available as workspace_files_available
         if workspace_files_available():
             features.append(workspace_files_capability)
+        else:
+            skip(workspace_files_capability, "workspace file availability checks failed.")
     except ImportError:
-        pass
-    return NativeContext(provider, user_id, display_name, profile, tuple(features), RUNTIME_ID)
+        skip("native-workspace-files-v1", "workspace file support is unimportable.")
+    return profile, tuple(features)

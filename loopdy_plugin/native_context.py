@@ -232,4 +232,13 @@ def _native_features(
             skip(workspace_files_capability, "workspace file availability checks failed.")
     except ImportError:
         skip("native-workspace-files-v1", "workspace file support is unimportable.")
+    try:
+        from .native_attachments import CAPABILITY as attachments_capability
+        from .native_attachments import available as attachments_available
+        if profile is not None and attachments_available():
+            features.append(attachments_capability)
+        else:
+            skip(attachments_capability, "gateway media policy or profile helpers are unavailable.")
+    except ImportError:
+        skip("native-agent-attachments-v1", "native attachment support is unimportable.")
     return profile, tuple(features)

@@ -96,6 +96,12 @@ async def device_tools(operation: str, request: Request) -> Response:
     return await native_device_tools.request(operation, request)
 
 
+@router.post("/attachments/{operation}")
+async def agent_attachments(operation: str, request: Request) -> Response:
+    from .native_attachments import request as attachments_request
+    return await attachments_request(operation, request, auth_module=sys.modules[__name__])
+
+
 @router.post("/workspace-files/{operation}")
 async def workspace_files(operation: str, request: Request) -> Response:
     from .workspace_artifacts import request as workspace_files_request

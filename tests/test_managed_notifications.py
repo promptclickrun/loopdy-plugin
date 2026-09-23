@@ -133,8 +133,11 @@ class ManagedNotificationTests(unittest.TestCase):
         self.assertEqual(snapshot["work"]["sessionId"],"native-session")
         self.assertEqual(snapshot["work"]["phase"],"thinking")
         self.assertNotIn("private",repr(snapshot).lower())
+        # A profile grant covers every session in that profile, including ones
+        # never opened in the app (scheduled runs, background chats).
+        self.assertIsNone(self.service.work_snapshot(self.grant_id,"default","unsubscribed")["work"])
         with self.assertRaises(ManagedNotificationError):
-            self.service.work_snapshot(self.grant_id,"default","unsubscribed")
+            self.service.work_snapshot(self.grant_id,"other","native-session")
 
     def test_one_native_terminal_event_persists_and_retries_identical_rich_payload(self):
         payload=dict(profile="default",session_id="native-session",turn_id="turn-a",completed=True,platform="desktop")
@@ -158,11 +161,45 @@ class ManagedNotificationTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT state FROM pending").fetchone()[0],"accepted")
 
     def test_unsubscribed_other_profile_children_and_cancellation_do_not_alert(self):
-        for change in [dict(session_id="other-session"),dict(profile="other"),dict(platform="subagent"),dict(interrupted=True)]:
+        for change in [dict(profile="other"),dict(platform="subagent"),dict(interrupted=True)]:
             payload=dict(profile="default",session_id="native-session",turn_id="turn-a",completed=True,platform="desktop")|change
             self.service.observe("on_session_end",**payload)
         self.service.drain_pending()
         self.assertEqual(self.calls,[])
+
+    def events_sent(self):
+        return [json.loads(raw) for _, path, raw, _ in self.calls if path.endswith("/events")]
+
+    def test_profile_grant_alerts_for_a_chat_never_opened_on_the_phone(self):
+        # Regression: alerts previously required a per-session row written only
+        # when the phone opened that exact chat, so replies to chats started
+        # elsewhere, scheduled runs and subagents were silently dropped.
+        self.service.observe("post_llm_call",profile="default",session_id="desktop-chat",turn_id="turn-a",assistant_response="Done from the desktop.")
+        self.service.observe("on_session_end",profile="default",session_id="desktop-chat",turn_id="turn-a",completed=True,platform="desktop")
+        self.service.drain_pending()
+        sent=self.events_sent()
+        self.assertEqual([e["eventType"] for e in sent],["session.completed"])
+        self.assertEqual(sent[0]["content"]["text"],"Done from the desktop.")
+
+    def test_scheduled_run_alerts_without_a_session_subscription(self):
+        self.grant["eventTypes"]=["scheduled.completed","scheduled.failed","session.completed","session.failed"]
+        grant_id=str(uuid.uuid4()); self.grant["grantId"]=grant_id; self.grant_id=grant_id
+        self.service.enroll(grant_id,str(uuid.uuid4())); self.calls.clear()
+        cron="cron_d2b364c4a34d_20260923_093038"
+        self.service.observe("post_llm_call",profile="default",session_id=cron,turn_id="turn-c",assistant_response="Briefing delivered.")
+        self.service.observe("on_session_end",profile="default",session_id=cron,turn_id="turn-c",completed=True,platform="cron")
+        self.service.drain_pending()
+        self.assertIn("scheduled.completed",[e["eventType"] for e in self.events_sent()])
+
+    def test_subagent_completion_alerts_for_an_unopened_parent_session(self):
+        self.grant["eventTypes"]=["session.completed","session.failed","subagent.completed","subagent.failed"]
+        grant_id=str(uuid.uuid4()); self.grant["grantId"]=grant_id; self.grant_id=grant_id
+        self.service.enroll(grant_id,str(uuid.uuid4())); self.calls.clear()
+        self.service.observe("pre_llm_call",profile="default",session_id="parent-chat",turn_id="turn-p",platform="desktop")
+        self.service.observe("subagent_start",profile="default",parent_session_id="parent-chat",parent_turn_id="turn-p",child_session_id="child-1",child_goal="Audit the build")
+        self.service.observe("subagent_stop",profile="default",parent_session_id="parent-chat",child_session_id="child-1",child_status="completed")
+        self.service.drain_pending()
+        self.assertEqual([e["eventType"] for e in self.events_sent()],["subagent.completed"])
 
     def test_local_revocation_cancels_pending_and_retains_identity_after_reopen(self):
         self.service.observe("on_session_end",profile="default",session_id="native-session",turn_id="turn-a",failed=True,platform="desktop")

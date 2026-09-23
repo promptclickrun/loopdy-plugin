@@ -379,10 +379,11 @@ class ManagedNotifications:
     def _require_subscription(self, db, grant_id: str, profile: str, session_id: str):
         # Recheck local authority after cloud/SessionDB awaits, in the transaction
         # used by the read/write. A concurrent removal cannot resurrect authority.
-        if not db.execute("SELECT 1 FROM subscriptions s JOIN grants g USING(grant_id) "
-                          "WHERE s.grant_id=? AND s.profile=? AND s.session_id=? "
-                          "AND g.state='active' AND g.expires>?",
-                          (grant_id, profile, session_id, int(self.clock()))).fetchone():
+        # An active grant covers every session in its profile; per-session
+        # rows remain as explicit opt-ins but are no longer required.
+        if not db.execute("SELECT 1 FROM grants g WHERE g.grant_id=? AND g.state='active' "
+                          "AND g.expires>? AND json_extract(g.public_json,'$.profile')=?",
+                          (grant_id, int(self.clock()), profile)).fetchone():
             raise ManagedNotificationError("notification_session_not_subscribed")
 
     @staticmethod
@@ -457,7 +458,7 @@ class ManagedNotifications:
         # Native observer attention never steals the legacy approval transport.
         if getattr(event, "type", None) not in {"session.completed", "session.failed"}: return False
         with self._db() as db:
-            rows = db.execute("SELECT g.public_json FROM grants g JOIN subscriptions s USING(grant_id) WHERE g.state='active' AND g.expires>? AND s.profile=? AND s.session_id=?", (int(self.clock()), event.profile, event.session_id)).fetchall()
+            rows = db.execute("SELECT g.public_json FROM grants g WHERE g.state='active' AND g.expires>? AND json_extract(g.public_json,'$.profile')=?", (int(self.clock()), event.profile)).fetchall()
         return any(event.type in json.loads(row["public_json"])["eventTypes"] for row in rows)
 
     @staticmethod
@@ -473,7 +474,7 @@ class ManagedNotifications:
         now = int(self.clock())
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            rows = db.execute("SELECT g.* FROM grants g JOIN subscriptions s USING(grant_id) WHERE g.state='active' AND g.expires>? AND s.profile=? AND s.session_id=?", (now, profile, session_id)).fetchall()
+            rows = db.execute("SELECT g.* FROM grants g WHERE g.state='active' AND g.expires>? AND json_extract(g.public_json,'$.profile')=?", (now, profile)).fetchall()
             for row in rows:
                 grant = json.loads(row["public_json"])
                 if _APPROVAL_EVENT not in grant["eventTypes"]: continue
@@ -606,7 +607,7 @@ class ManagedNotifications:
         now = int(self.clock())
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            rows = db.execute("SELECT g.* FROM grants g JOIN subscriptions s USING(grant_id) WHERE g.state='active' AND g.expires>? AND s.profile=? AND s.session_id=?", (now, profile, session_id)).fetchall()
+            rows = db.execute("SELECT g.* FROM grants g WHERE g.state='active' AND g.expires>? AND json_extract(g.public_json,'$.profile')=?", (now, profile)).fetchall()
             for row in rows:
                 grant = json.loads(row["public_json"])
                 if event_type not in grant["eventTypes"]: continue
@@ -667,7 +668,7 @@ class ManagedNotifications:
         if not isinstance(session_id, str) or not _ID.fullmatch(session_id): return
         if not child_hook and (payload.get("parent_session_id") or payload.get("platform") == "subagent"): return
         with self._db() as db:
-            if not db.execute("SELECT 1 FROM subscriptions s JOIN grants g USING(grant_id) WHERE s.profile=? AND s.session_id=? AND g.state='active' AND g.expires>?", (profile, session_id, int(self.clock()))).fetchone(): return
+            if not db.execute("SELECT 1 FROM grants g WHERE g.state='active' AND g.expires>? AND json_extract(g.public_json,'$.profile')=?", (int(self.clock()), profile)).fetchone(): return
         turn = payload.get("turn_id")
         if hook == "post_llm_call" and isinstance(turn, str) and _ID.fullmatch(turn):
             coordinate = (profile, session_id, turn)

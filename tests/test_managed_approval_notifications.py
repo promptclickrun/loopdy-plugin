@@ -66,8 +66,7 @@ class ManagedApprovalNotificationTests(unittest.TestCase):
 
     def test_smart_coalesced_or_unowned_approval_never_queues(self):
         self.enroll_approval()
-        for change in ({"surface": "smart"}, {"coalesced": True}, {"session_id": "other"},
-                       {"profile": "other"}, {"session_id": ""}, {"tool_call_id": ""},
+        for change in ({"surface": "smart"}, {"coalesced": True}, {"profile": "other"}, {"session_id": ""}, {"tool_call_id": ""},
                        {"turn_id": ""}, {"surface": "cli"}):
             with self.subTest(change=change):
                 self.approval(**dict[str, Any](change))

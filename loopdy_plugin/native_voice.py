@@ -10,7 +10,9 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 import json
+import logging
 import os
+import re
 import time
 from typing import Literal
 
@@ -20,14 +22,27 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt
 from .native_context import NativeAPIError, NativeContext, native_context
 from .live_voice_provider import (
     MAX_PROVIDER_EVENT_NAME_BYTES, MAX_PROVIDER_EVENT_TYPES,
-    make_live_provider, validate_audio_sdp,
+    LiveProviderError, make_live_provider, validate_audio_sdp,
 )
 
 CAPABILITY = "native-voice-v1"
+logger = logging.getLogger(__name__)
+_FIXED_NAME = re.compile(r"[a-z_]{1,48}")
 
 
 def _reject(code="voice_unavailable", status=409):
     return NativeAPIError(status, code, "This native voice operation is unavailable. Reconnect explicitly when ready.")
+
+
+def _provider_rejection(error: LiveProviderError) -> NativeAPIError:
+    """Report the provider's fixed, payload-free reason (for example
+    ``voice_provider_rate_limited``) instead of a generic outage, so the app and
+    the host log can say what went wrong. Unknown shapes collapse to ``failed``."""
+    code = error.code if isinstance(error.code, str) and _FIXED_NAME.fullmatch(error.code) else "failed"
+    stage = error.stage if isinstance(error.stage, str) and _FIXED_NAME.fullmatch(error.stage) else "unknown"
+    status = error.http_status if type(error.http_status) is int else None
+    logger.warning("Loopdy native voice provider failed: code=%s stage=%s http_status=%s", code, stage, status)
+    return NativeAPIError(409, "voice_provider_" + code, "The live voice provider could not complete this call.")
 
 
 @dataclass
@@ -50,9 +65,10 @@ class _Call:
 
 
 class NativeVoiceHub:
-    def __init__(self, *, provider_factory=make_live_provider, lease_seconds=60):
+    def __init__(self, *, provider_factory=make_live_provider, lease_seconds=60, setup_seconds=40):
         self.factory = provider_factory
         self.lease_seconds = lease_seconds
+        self.setup_seconds = setup_seconds
         self.calls: dict[str, _Call] = {}
 
     def _claim(self, owner, fields):
@@ -70,7 +86,10 @@ class NativeVoiceHub:
         return call
 
     async def offer(self, owner, fields):
-        validate_audio_sdp(fields["sdp"])
+        try:
+            validate_audio_sdp(fields["sdp"])
+        except LiveProviderError as error:
+            raise _provider_rejection(error) from None
         if sum(not call.closed for call in self.calls.values()) >= 4:
             raise _reject("voice_capacity", 503)
         if any(not call.closed and call.owner == owner for call in self.calls.values()):
@@ -82,14 +101,20 @@ class NativeVoiceHub:
                 kwargs["api_key"] = lambda: os.environ.get("OPENAI_API_KEY", "")
             call.provider = self.factory(**kwargs)
             call.watch = asyncio.create_task(self._watch(call))
-            async with asyncio.timeout(40):
-                answer = await call.provider.create(fields["sdp"], voice=fields["voice"])
+            try:
+                async with asyncio.timeout(self.setup_seconds):
+                    answer = await call.provider.create(fields["sdp"], voice=fields["voice"])
+            except TimeoutError:
+                raise LiveProviderError("setup_timeout") from None
             if call.closed:
                 raise _reject("voice_closed_during_setup")
             validate_audio_sdp(answer)
             if len(answer.encode("utf-8")) > 180_000:
                 raise _reject("voice_answer_too_large")
             return {"voiceId": fields["voiceId"], "sdp": answer}
+        except LiveProviderError as error:
+            await self._close(call)
+            raise _provider_rejection(error) from None
         except BaseException:
             await self._close(call)
             raise
@@ -145,7 +170,10 @@ class NativeVoiceHub:
         if call.closed or identifier not in call.delegations or identifier in call.appended:
             raise _reject("voice_result_unavailable")
         call.appended.add(identifier)  # A lost provider receipt never permits replay.
-        await call.provider.append_result(identifier, fields["text"])
+        try:
+            await call.provider.append_result(identifier, fields["text"])
+        except LiveProviderError as error:
+            raise _provider_rejection(error) from None
         call.appended_results = min(call.appended_results + 1, 2147483647)
         self._refresh_diagnostics(call)
         return {"voiceId": fields["voiceId"], "appended": True}

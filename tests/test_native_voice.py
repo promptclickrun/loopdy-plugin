@@ -4,6 +4,7 @@ from dataclasses import replace
 import json
 import unittest
 
+from loopdy_plugin.live_voice_provider import LiveProviderError
 from loopdy_plugin.native_context import NativeContext, NativeAPIError
 from loopdy_plugin.native_voice import NativeVoiceHub
 
@@ -140,3 +141,61 @@ class NativeVoiceTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.03)
         self.assertTrue(self.providers[0].closed)
         self.assertTrue(self.hub.poll(self.owner, self.fields, after=0)["closed"])
+
+
+class NativeVoiceProviderFailureTests(unittest.IsolatedAsyncioTestCase):
+    """Setup failures carry the provider's fixed reason, never a generic outage."""
+
+    async def asyncSetUp(self):
+        self.providers = []
+        self.failure = None
+        outer = self
+
+        class Failing(Provider):
+            async def create(self, sdp, **kwargs):
+                self.creates += 1
+                if outer.failure == "hang":
+                    await asyncio.sleep(1)
+                raise outer.failure
+
+        def factory(**kwargs):
+            provider = Failing(**kwargs)
+            self.providers.append(provider)
+            return provider
+        self.hub = NativeVoiceHub(provider_factory=factory, lease_seconds=30, setup_seconds=0.05)
+        self.owner = NativeContext("fixture", "alice", None, "default", ("native-voice-v1",), "runtime")
+        self.fields = {"agentId": "default", "sessionId": "stored", "voiceId": "voice_fixture",
+                       "provider": "codex_subscription", "voice": "cove", "sdp": SDP}
+
+    async def asyncTearDown(self):
+        await self.hub.shutdown()
+
+    async def test_provider_refusal_reports_its_code_and_closes_the_call(self):
+        self.failure = LiveProviderError("rate_limited", stage="create", allocation_state="rejected", http_status=429)
+        with self.assertLogs("loopdy_plugin.native_voice", level="WARNING") as logs:
+            with self.assertRaises(NativeAPIError) as caught:
+                await self.hub.offer(self.owner, self.fields)
+        self.assertEqual((caught.exception.status, caught.exception.code), (409, "voice_provider_rate_limited"))
+        self.assertTrue(self.providers[0].closed)
+        self.assertTrue(self.hub.calls["voice_fixture"].closed)
+        self.assertIn("code=rate_limited stage=create http_status=429", logs.output[0])
+
+    async def test_setup_timeout_is_named(self):
+        self.failure = "hang"
+        with self.assertRaises(NativeAPIError) as caught:
+            await self.hub.offer(self.owner, self.fields)
+        self.assertEqual(caught.exception.code, "voice_provider_setup_timeout")
+        self.assertTrue(self.providers[0].closed)
+
+    async def test_invalid_offer_is_rejected_before_any_allocation(self):
+        with self.assertRaises(NativeAPIError) as caught:
+            await self.hub.offer(self.owner, dict(self.fields, sdp="v=0\r\nm=video 9 RTP/AVP 96\r\n"))
+        self.assertEqual(caught.exception.code, "voice_provider_audio_only_required")
+        self.assertEqual(self.providers, [])
+
+    async def test_unexpected_code_shape_never_leaves_the_host(self):
+        self.failure = LiveProviderError("Bearer sk-secret/leak", stage="create")
+        with self.assertRaises(NativeAPIError) as caught:
+            await self.hub.offer(self.owner, self.fields)
+        self.assertEqual(caught.exception.code, "voice_provider_failed")
+        self.assertNotIn("secret", caught.exception.message)

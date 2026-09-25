@@ -18,6 +18,8 @@ Every delegated task has its own Hermes conversation, durable job identity and o
 
 An explicitly selected API-key mode uses the distinct public `gpt-live-1` protocol and the host's configured `OPENAI_API_KEY`. It may incur separate usage charges. Subscription errors never select it automatically. Turn-based voice remains an explicit alternative.
 
+When a call can't be set up, the native route returns `409` with `voice_provider_<reason>`, where the reason is the provider's fixed, payload-free code (for example `voice_provider_authentication_failed`, `voice_provider_rate_limited` or `voice_provider_setup_timeout`). The host logs the same reason with its stage and HTTP status. Unknown shapes become `voice_provider_failed`; any other unexpected error stays `native_service_unavailable`, and the host logs only the exception class.
+
 ## Security and compatibility
 
 The plugin does not modify Hermes core or start a second model-execution service. All jobs use supported platform-adapter ingress and lifecycle/approval/clarification callbacks. iPhone device tools remain opt-in and require the existing verified host-context capability; unsupported hosts do not gain authority from a voice transcript or device identifier.

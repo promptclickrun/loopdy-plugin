@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+import os
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -103,6 +104,28 @@ class ManagedNotificationTests(unittest.TestCase):
         self.assertEqual(self.service.work_snapshot(self.grant_id,"default","native-session")["work"]["turnId"],"newer")
         with self.assertRaises(ManagedNotificationError):
             self.service.subscribe_activity(*args[:-1],"invented")
+
+    def test_long_tool_run_refreshes_unchanged_state_inside_the_stale_window(self):
+        self.service.observe("pre_llm_call",profile="default",session_id="native-session",turn_id="turn-long",platform="tui")
+        with sqlite3.connect(self.service.db_path) as db:
+            db.execute("INSERT INTO activities(activity_id,grant_id,profile,session_id,session_ref,lease_expires,work_turn,state) VALUES(?,?,?,?,?,?,?,'active')",
+                ("activity-long",self.grant_id,"default","native-session","x"*43,self.now+3600,"turn-long"))
+        def pending():
+            with sqlite3.connect(self.service.db_path) as db:
+                return [json.loads(raw) for (raw,) in db.execute("SELECT raw FROM pending WHERE activity_id='activity-long'")]
+        self.service.observe("pre_tool_call",profile="default",session_id="native-session",turn_id="turn-long",platform="tui")
+        first=pending()
+        self.assertEqual([update["phase"] for update in first],["using_tool"])
+        self.now+=30
+        self.service.observe("post_tool_call",profile="default",session_id="native-session",turn_id="turn-long",platform="tui")
+        self.assertEqual(pending(),first)  # unchanged and still fresh: no extra push
+        self.now+=31
+        self.service.observe("pre_tool_call",profile="default",session_id="native-session",turn_id="turn-long",platform="tui")
+        refreshed=pending()
+        self.assertEqual(len(refreshed),1)
+        self.assertEqual(refreshed[0]["phase"],"using_tool")
+        self.assertEqual(refreshed[0]["timestamp"],self.now)
+        self.assertEqual(refreshed[0]["expires"],self.now+120)
 
     def test_cancelled_parent_waits_for_owned_child_before_neutral_terminal(self):
         self.service.observe("pre_llm_call",profile="default",session_id="native-session",turn_id="parent")
@@ -227,3 +250,76 @@ class ManagedNotificationTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT COUNT(*) FROM pending WHERE state='accepted'").fetchone()[0],1)
 
 if __name__ == "__main__": unittest.main()
+
+
+class DashboardDoubleImportTests(unittest.TestCase):
+    """Hermes' hook loader and the dashboard router import this package under
+    different module names in one process. Both must share the live turn."""
+
+    def setUp(self):
+        import importlib
+        import sys
+        import types
+        from loopdy_plugin import managed_notifications as router_copy
+        self.name = "hermes_plugins_fixture_loopdy"
+        package = types.ModuleType(self.name)
+        package.__path__ = [str(Path(router_copy.__file__).parent)]
+        sys.modules[self.name] = package
+        self.router_module = router_copy
+        self.hook_module = importlib.import_module(self.name + ".managed_notifications")
+        self.temp = tempfile.TemporaryDirectory()
+        home = patch("hermes_constants.get_hermes_home", return_value=Path(self.temp.name))
+        home.start()
+        self.addCleanup(home.stop)
+        self.now = 1_800_000_000
+        self.grant_id = str(uuid.uuid4())
+
+    def tearDown(self):
+        import sys
+        directory = str(Path(self.temp.name) / "plugin-data" / "loopdy" / "managed-notifications")
+        for module in (self.hook_module, self.router_module):
+            instance = module._instances.pop(directory, None)
+            if instance is not None: instance.close()
+        sys.modules[self.router_module._SHARED_OBSERVATIONS].directories.pop(os.path.realpath(directory), None)
+        for name in [name for name in sys.modules if name == self.name or name.startswith(self.name + ".")]:
+            sys.modules.pop(name)
+        self.temp.cleanup()
+
+    def get_session(self, sid):
+        return {"id": sid, "profile_name": "default"}
+
+    def test_router_copy_reads_the_turn_the_hook_copy_observed(self):
+        hooks = self.hook_module.get_managed_notifications()
+        router = self.router_module.get_managed_notifications()
+        self.assertIsNot(type(hooks), type(router))  # two real module copies
+        reference = self.router_module.session_reference("default", "native-session")
+        grant = dict(grantId=self.grant_id, hostKeyId=router.key_id, hostPublicKey=router.public_key,
+            authorizationEpoch=1, profile="default", eventTypes=["session.completed"],
+            createdAt=self.now - 10, expiresAt=self.now + 3600, revision=1, provider="buzzkit",
+            subscriberScope="account", state="active")
+        def transport(method, path, raw, headers):
+            if method == "GET" and "/live-activities/" in path:
+                return {"version": 1, "activity": {"grantId": self.grant_id, "activityId": "phone-activity",
+                    "sessionReference": reference, "status": "active", "leaseExpires": self.now + 600}}
+            return {"version": 1, "grant": grant}
+        for instance in (hooks, router):
+            instance.transport, instance.clock = transport, (lambda: self.now)
+            instance.session_opener = lambda profile, read, read_only: read(self)
+        router.enroll(self.grant_id, str(uuid.uuid4()))
+        hooks.producer_loaded("default", start_worker=False)
+        self.assertTrue(router.capabilities()["producerCapabilities"]["richLiveActivity"])
+
+        hooks.observe("pre_llm_call", profile="default", session_id="native-session", turn_id="live-turn", platform="tui")
+        work = router.work_snapshot(self.grant_id, "default", "native-session")["work"]
+        self.assertEqual((work["turnId"], work["phase"], work["terminal"]), ("live-turn", "thinking", False))
+
+        # The phone's registration lands on the router copy; the hook copy's
+        # terminal must still reach that activity through the cloud relay.
+        router.subscribe_activity(self.grant_id, "phone-activity", "default", "native-session",
+                                  reference, self.now + 600, "live-turn")
+        hooks.observe("on_session_end", profile="default", session_id="native-session", turn_id="live-turn",
+                      completed=True, platform="tui")
+        with sqlite3.connect(router.db_path) as db:
+            raw = db.execute("SELECT raw FROM pending WHERE activity_id='phone-activity'").fetchone()[0]
+            self.assertEqual(db.execute("SELECT state FROM activities").fetchone()[0], "terminal_pending")
+        self.assertEqual(json.loads(raw)["phase"], "completed")

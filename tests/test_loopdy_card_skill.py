@@ -12,7 +12,7 @@ class LoopdyCardSkillTests(unittest.TestCase):
     def test_skill_routes_new_compositions_to_the_card_reference(self) -> None:
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
 
-        self.assertIn("Loopdy Cards", skill)
+        self.assertIn("bighelp Cards", skill)
         self.assertIn("`loopdy_render_card`", skill)
         self.assertIn("references/loopdy-cards.md", skill)
         self.assertIn("typed v2", skill)

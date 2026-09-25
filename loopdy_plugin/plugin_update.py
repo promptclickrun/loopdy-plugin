@@ -23,7 +23,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-SOURCE_URL = "https://github.com/promptclickrun/loopdy-plugin"
+SOURCE_URL = "https://github.com/promptclickrun/bighelp-plugin"
+# The repositories were renamed from loopdy-plugin/loopdy-ios. GitHub redirects
+# the old names, and installs recorded under them stay recognized. The plugin's
+# name, directory and API paths remain `loopdy`.
+PLUGIN_REPOSITORIES = ("promptclickrun/bighelp-plugin", "promptclickrun/loopdy-plugin")
+APP_REPOSITORIES = ("promptclickrun/bighelp-ios", "promptclickrun/loopdy-ios")
+APP_SOURCE_URL = "https://github.com/promptclickrun/bighelp-ios"
 SOURCE_BRANCH = "main"
 PLUGIN_NAME = "loopdy"
 _OPERATION_ID = re.compile(r"^[A-Za-z0-9_-]{16,128}$")

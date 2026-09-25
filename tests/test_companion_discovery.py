@@ -1,6 +1,7 @@
 """Read-only discovery never imports a gateway or treats disk metadata as activation."""
 import importlib.util
 import json
+import shutil
 from pathlib import Path
 import tempfile
 import unittest
@@ -23,6 +24,14 @@ class CompanionDiscoveryTests(unittest.TestCase):
         self.assertIsNone(result["activeRevision"])
         self.assertFalse(self.home.exists())
         self.assertNotIn("runtimeID", result)
+
+    def test_installs_recorded_under_the_former_repository_name_stay_canonical(self):
+        for source in ("https://github.com/promptclickrun/loopdy-plugin", "https://github.com/promptclickrun/loopdy-plugin.git"):
+            with self.subTest(source=source):
+                self.make_install(source=source)
+                result = discovery.inspect_profile(str(self.home))
+                self.assertEqual((result["installation"], result["sourceKind"]), ("metadataPresent", "canonical"))
+                shutil.rmtree(self.home)
 
     def test_metadata_is_only_evidence_not_gateway_activation(self):
         self.make_install()
@@ -48,7 +57,7 @@ class CompanionDiscoveryTests(unittest.TestCase):
     def test_initial_plan_is_pinned_and_revalidated_before_use(self):
         result = discovery.inspect_profile(str(self.home))
         plan = discovery.prepare_initial_install(str(self.home), "b" * 40, result["fingerprint"])
-        self.assertEqual(plan["arguments"], ["plugins", "install", "https://github.com/promptclickrun/loopdy-plugin", "--ref", "b" * 40, "--no-enable"])
+        self.assertEqual(plan["arguments"], ["plugins", "install", "https://github.com/promptclickrun/bighelp-plugin", "--ref", "b" * 40, "--no-enable"])
         self.assertEqual(plan["activationOwner"], "hermes")
         self.assertFalse(self.home.exists())
         self.make_install()
@@ -79,7 +88,7 @@ class CompanionDiscoveryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "existing"):
                 discovery.prepare_initial_install(str(self.home), "b" * 40, result["fingerprint"])
 
-    def make_install(self, source="https://github.com/promptclickrun/loopdy-plugin"):
+    def make_install(self, source="https://github.com/promptclickrun/bighelp-plugin"):
         plugin = self.home / "plugins" / "loopdy"
         plugin.mkdir(parents=True)
         (plugin / "plugin.yaml").write_text("name: loopdy\nversion: 2.8.0\n")

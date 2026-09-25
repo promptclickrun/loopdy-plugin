@@ -17,7 +17,10 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from plugin_update import (
+    APP_REPOSITORIES,
+    APP_SOURCE_URL,
     PLUGIN_NAME,
+    PLUGIN_REPOSITORIES,
     SOURCE_BRANCH,
     SOURCE_URL,
     PluginUpdateError,
@@ -257,7 +260,7 @@ def _recognized_installation(manager: PluginUpdateManager) -> tuple[str, str, st
             or dirty.returncode != 0
             or dirty.stdout.strip()
             or not _REVISION.fullmatch(revision)
-            or not _is_github_repository(remote_value, "promptclickrun/loopdy-plugin")
+            or not _is_github_repository(remote_value, PLUGIN_REPOSITORIES)
         ):
             raise UpdateBlocked("Installed Git checkout is dirty or unrecognized")
         return revision, SOURCE_URL, ""
@@ -278,32 +281,32 @@ def _recognized_installation(manager: PluginUpdateManager) -> tuple[str, str, st
     source_without_fragment, separator, subdir = source.partition("#")
     parsed = urlsplit(source_without_fragment)
     if (
-        _is_github_repository(source_without_fragment, "promptclickrun/loopdy-plugin")
+        _is_github_repository(source_without_fragment, PLUGIN_REPOSITORIES)
         and not separator
     ):
         return revision, SOURCE_URL, ""
     if (
-        _is_github_repository(source_without_fragment, "promptclickrun/loopdy-ios")
+        _is_github_repository(source_without_fragment, APP_REPOSITORIES)
         and subdir == "plugins/loopdy"
     ):
-        return revision, "https://github.com/promptclickrun/loopdy-ios", subdir
+        return revision, APP_SOURCE_URL, subdir
     # The coordinated app release installs from a committed file:// checkout.
     # Its metadata still names the canonical plugin subdirectory; verify bytes
     # against the authoritative app repository at the recorded commit.
     if parsed.scheme == "file" and subdir == "plugins/loopdy":
-        return revision, "https://github.com/promptclickrun/loopdy-ios", subdir
+        return revision, APP_SOURCE_URL, subdir
     raise UpdateBlocked("Installed Loopdy source is unrecognized")
 
 
-def _is_github_repository(value: str, repository: str) -> bool:
+def _is_github_repository(value: str, repositories: tuple[str, ...]) -> bool:
+    """True when ``value`` names one of ``repositories`` (canonical name or a
+    recognized former name) on github.com."""
     normalized = value.strip().rstrip("/").removesuffix(".git")
     parsed = urlsplit(normalized)
     if parsed.scheme in {"https", "ssh"}:
-        return parsed.hostname == "github.com" and parsed.path.strip("/") == repository
-    return normalized in {
-        f"git@github.com:{repository}",
-        f"github.com:{repository}",
-    }
+        return parsed.hostname == "github.com" and parsed.path.strip("/") in repositories
+    return any(normalized in {f"git@github.com:{repository}", f"github.com:{repository}"}
+               for repository in repositories)
 
 
 def _verify_installed_tree(

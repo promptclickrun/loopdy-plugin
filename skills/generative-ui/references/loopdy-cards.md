@@ -1,6 +1,6 @@
-# Loopdy Cards v1
+# bighelp Cards v1
 
-Loopdy Cards are a bounded, display-only native card language for new static compositions. Call the direct `loopdy_render_card` tool when it is visible; use the official progressive-disclosure bridge only when it is not. Typed v2 cards remain preferred for already-supported polished use cases until the generic renderer reaches visual parity.
+bighelp Cards are a bounded, display-only native card language for new static compositions. Call the direct `loopdy_render_card` tool when it is visible; use the official progressive-disclosure bridge only when it is not. Typed v2 cards remain preferred for already-supported polished use cases until the generic renderer reaches visual parity.
 
 ## Safety and lifecycle
 

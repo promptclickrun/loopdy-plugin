@@ -85,11 +85,11 @@ def _device_tools_supported() -> bool:
 
 
 def register_marketplace_publish_skill(ctx: Any) -> None:
-    """Register Loopdy's read-only publishing guidance with Hermes."""
+    """Register bighelp's read-only publishing guidance with Hermes."""
 
     description = (
-        "Use when publishing Loopdy themes, cards, or skills. "
-        "Prepare a private draft for review in Loopdy."
+        "Use when publishing bighelp themes, cards, or skills. "
+        "Prepare a private draft for review in bighelp."
     )
     ctx.register_skill(
         "loopdy-marketplace-publish",

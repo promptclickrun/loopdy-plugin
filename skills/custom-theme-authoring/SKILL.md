@@ -1,15 +1,15 @@
 ---
 name: custom-theme-authoring
-description: Create importable Loopdy custom-theme JSON files from a user's visual direction.
+description: Create importable bighelp custom-theme JSON files from a user's visual direction.
 ---
 
-# Loopdy Custom Theme Authoring
+# bighelp Custom Theme Authoring
 
-Use this skill when a user asks you to design, generate, revise, or package a custom Loopdy theme.
+Use this skill when a user asks you to design, generate, revise, or package a custom bighelp theme.
 
 ## Deliverable
 
-Create a UTF-8 JSON file that Loopdy can import from **Settings > Themes > Import**. Deliver the file as an attachment in the active Loopdy chat. Do not paste JSON as the only deliverable when file delivery is available.
+Create a UTF-8 JSON file that bighelp can import from **Settings > Themes > Import**. Deliver the file as an attachment in the active bighelp chat. Do not paste JSON as the only deliverable when file delivery is available.
 
 The file must use this envelope:
 
@@ -44,7 +44,7 @@ The file must use this envelope:
 - Generate a fresh UUID for each new theme. Preserve the UUID when revising an exported theme.
 - Allowed `font` values: `system`, `rounded`, `serif`, `monospaced`, `notoSans`.
 - Every color is exactly six hexadecimal digits, without `#` or alpha.
-- Keep primary, secondary, and tertiary text readable against that mode's background. Loopdy enforces at least a 4.5:1 contrast ratio for every text color.
+- Keep primary, secondary, and tertiary text readable against that mode's background. bighelp enforces at least a 4.5:1 contrast ratio for every text color.
 - Keep `schemaVersion` at `1`.
 - A catalog can contain up to 24 unique themes.
 - Do not include `logo`, `lightLogo`, or `darkLogo` metadata. Logo image files remain device-local and are selected separately in the theme editor for light and dark mode.
@@ -57,4 +57,4 @@ The file must use this envelope:
 2. Calculate WCAG contrast for every text/background pair and adjust any result below 4.5:1.
 3. Write the exact import envelope to a `.json` file.
 4. Parse the completed file once to verify valid JSON, unique UUIDs, allowed fonts, six-digit colors, and the 24-theme limit.
-5. Deliver the JSON file in Loopdy and tell the user to import it from **Settings > Themes > Import**.
+5. Deliver the JSON file in bighelp and tell the user to import it from **Settings > Themes > Import**.

@@ -1,15 +1,15 @@
 ---
 name: generative-ui
-description: Render bounded v1 or v2 native Loopdy cards when structured presentation is clearer than prose.
+description: Render bounded v1 or v2 native bighelp cards when structured presentation is clearer than prose.
 ---
 
-# Loopdy Generative UI
+# bighelp Generative UI
 
-Use a Loopdy renderer when the user asks for a card, dashboard-like result, metrics, a bounded list, or a sequence of events. Keep normal prose when structured presentation adds no value.
+Use a bighelp renderer when the user asks for a card, dashboard-like result, metrics, a bounded list, or a sequence of events. Keep normal prose when structured presentation adds no value.
 
-## Loopdy Cards
+## bighelp Cards
 
-Use the generic `loopdy_render_card` tool, documented in `references/loopdy-cards.md`, for new static compositions that do not match a typed renderer. These are called **Loopdy Cards**. Use typed v2 for existing polished use cases until generic rendering reaches visual parity. In this release, `data_sources` must be empty and all displayed values must be embedded in the card payload; live device refresh is not available. Cards allow no downloaded code, HTML, WebViews, authenticated requests, or secrets.
+Use the generic `loopdy_render_card` tool, documented in `references/loopdy-cards.md`, for new static compositions that do not match a typed renderer. These are called **bighelp Cards**. Use typed v2 for existing polished use cases until generic rendering reaches visual parity. In this release, `data_sources` must be empty and all displayed values must be embedded in the card payload; live device refresh is not available. Cards allow no downloaded code, HTML, WebViews, authenticated requests, or secrets.
 
 The renderers are first-class model tools in the `loopdy` toolset. If the exact
 renderer is visible in the current tool list, call it directly. If Hermes has
@@ -23,7 +23,7 @@ wrap it in another tool, or invent a replacement.
 ### A. Inline card in the active chat
 
 Use this path when the card answers the message in the conversation currently
-open in Loopdy. Call the renderer on the active conversation response path. Its
+open in bighelp. Call the renderer on the active conversation response path. Its
 validated result is published back to that chat and remains part of that turn.
 Do not use the notification channel just to answer the current chat. Do not
 address `loopdy:all`, a device, or a group unless the user separately asked for
@@ -32,7 +32,7 @@ a proactive notification.
 Example instruction for an active weather chat:
 
 > Fetch the forecast and call `loopdy_render_weather_forecast` for this response.
-> Keep the card in this active conversation; do not send a Loopdy notification.
+> Keep the card in this active conversation; do not send a bighelp notification.
 
 ### B. Proactive or scheduled card in Agent Inbox/Home
 
@@ -40,10 +40,10 @@ No script or separate notification API is required. For an ordinary channel
 message or a scheduled task delivered to `loopdy`, call exactly one registered
 `loopdy_render_*` tool and use its validated returned envelope as the complete final channel-delivery payload. Return the envelope verbatim: no Markdown fence,
 introductory sentence, trailing explanation, or second prose response. Hermes'
-official platform boundary gives the Loopdy adapter only that final text plus
+official platform boundary gives the bighelp adapter only that final text plus
 ordinary delivery metadata such as a cron `job_id`; it does not separately pass
 the earlier tool result. An inline renderer result does not auto-forward to
-Agent Inbox/Home. Loopdy validates the delivered envelope again before storing
+Agent Inbox/Home. bighelp validates the delivered envelope again before storing
 or pushing a native card. Invalid or mixed content safely remains a text update.
 
 Never script or reconstruct a renderer envelope. Call the official renderer

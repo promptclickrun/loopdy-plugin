@@ -18,8 +18,10 @@ import os
 import re
 import sqlite3
 import stat
+import sys
 import threading
 import time
+import types
 import uuid
 from collections import OrderedDict
 from contextlib import contextmanager
@@ -52,6 +54,7 @@ _APPROVAL_GRACE_SECONDS = 3
 _APPROVAL_TTL_SECONDS = 60
 _APPROVAL_LIMIT = 4096
 _APPROVAL_HOOKS = ("pre_approval_request", "post_approval_response")
+_ACTIVITY_REFRESH_SECONDS = 60
 _ACTIONS = {
     "thinking": "Your agent is working", "waiting": "Your agent needs attention",
     "using_tool": "Your agent is working", "delegating": "Agents are working",
@@ -122,7 +125,8 @@ def _private_file(path: Path) -> None:
 class ManagedNotifications:
     """One process-owned observer/worker; SQLite serializes other API processes."""
     def __init__(self, directory: Path, *, transport: Callable = _https_request,
-                 clock: Callable = time.time, session_opener: Callable = open_profile_store):
+                 clock: Callable = time.time, session_opener: Callable = open_profile_store,
+                 observations: dict[str, Any] | None = None):
         if fcntl is None:
             raise ManagedNotificationError("notification_platform_unavailable", 503)
         self._fcntl = fcntl
@@ -130,19 +134,22 @@ class ManagedNotifications:
         self.directory, self.transport, self.clock = directory, transport, clock
         self.session_opener = session_opener
         self.preference_policy: Callable | None = None
-        self._lock = threading.RLock()
-        self._wake, self._stop = threading.Event(), threading.Event()
+        # Live hook state. A fresh process starts empty; get_managed_notifications
+        # passes the process-wide store so every import of this module shares it.
+        state = observations if observations is not None else _new_observations()
+        self._lock = state["lock"]
+        self._wake, self._stop = state["wake"], threading.Event()
         self._worker: threading.Thread | None = None
         self._worker_lock = None
-        self._loaded_profiles: set[str] = set()
-        self._approval_profiles: set[str] = set()
-        self._clarification_profiles: set[str] = set()
+        self._loaded_profiles: set[str] = state["loaded_profiles"]
+        self._approval_profiles: set[str] = state["approval_profiles"]
+        self._clarification_profiles: set[str] = state["clarification_profiles"]
         # An observation belongs to this producer lifetime, never a recovered prompt.
         self._approval_owner = str(uuid.uuid4())
-        self._work: OrderedDict[tuple[str, str, str], dict[str, Any]] = OrderedDict()
-        self._responses: OrderedDict[tuple[str, str, str], str] = OrderedDict()
-        self._child_owners: dict[tuple[str, str, str], str] = {}
-        self._child_goals: dict[tuple[str, str, str], str] = {}
+        self._work: OrderedDict[tuple[str, str, str], dict[str, Any]] = state["work"]
+        self._responses: OrderedDict[tuple[str, str, str], str] = state["responses"]
+        self._child_owners: dict[tuple[str, str, str], str] = state["child_owners"]
+        self._child_goals: dict[tuple[str, str, str], str] = state["child_goals"]
         self._key = self._identity()
         self.public_key = b64url_encode(public_key_bytes(self._key.public_key()))
         self.key_id = key_id(public_key_bytes(self._key.public_key()))
@@ -801,7 +808,9 @@ class ManagedNotifications:
                 if row["work_turn"] not in (None, turn) or (row["work_turn"] is None and not allow_bind): continue
                 action = "Stopped" if stopped and terminal and phase == "completed" else _ACTIONS[phase]
                 signature = json.dumps([turn, phase, count, action])
-                if row["last_signature"] == signature: continue
+                # A real hook re-sends an unchanged state once a minute, inside the
+                # 120-second stale window, so a long run of tool calls stays current.
+                if row["last_signature"] == signature and row["last_queued_at"] > now - _ACTIVITY_REFRESH_SECONDS: continue
                 # Queue latest significant state, with relay's existing 30s budget.
                 pending = db.execute("SELECT raw,next_attempt FROM pending WHERE activity_id=? AND state='pending' ORDER BY next_attempt LIMIT 1", (row["activity_id"],)).fetchone()
                 timestamp = max(now, json.loads(bytes(pending["raw"]))["timestamp"]) if pending else max(now, row["last_timestamp"] + 1)
@@ -934,6 +943,32 @@ class ManagedNotifications:
 
 _instances: dict[str, ManagedNotifications] = {}
 _instances_lock = threading.Lock()
+_SHARED_OBSERVATIONS = "_loopdy_managed_notification_observations"
+
+
+def _new_observations() -> dict[str, Any]:
+    return {"lock": threading.RLock(), "wake": threading.Event(),
+            "work": OrderedDict(), "responses": OrderedDict(), "child_owners": {}, "child_goals": {},
+            "loaded_profiles": set(), "approval_profiles": set(), "clarification_profiles": set()}
+
+
+def _shared_observations(directory: Path) -> dict[str, Any]:
+    """Live hook state for ``directory``, shared by every copy of this module.
+
+    A dashboard imports this package twice: Hermes' plugin loader as
+    ``hermes_plugins.<slug>.loopdy_plugin`` (lifecycle hooks) and the dashboard
+    router loader as top-level ``loopdy_plugin`` (the /notifications routes).
+    Each copy has its own ``_instances``, so the router's /work read never saw
+    the running turn and phones kept their Live Activity local-only. Only plain
+    containers, locks and events live here; neither copy sees the other's classes.
+    """
+    registry = sys.modules.get(_SHARED_OBSERVATIONS)
+    if registry is None:
+        candidate = types.ModuleType(_SHARED_OBSERVATIONS)
+        candidate.lock, candidate.directories = threading.Lock(), {}
+        registry = sys.modules.setdefault(_SHARED_OBSERVATIONS, candidate)
+    with registry.lock:
+        return registry.directories.setdefault(os.path.realpath(directory), _new_observations())
 
 
 def get_managed_notifications() -> ManagedNotifications:
@@ -942,5 +977,5 @@ def get_managed_notifications() -> ManagedNotifications:
     with _instances_lock:
         key = str(directory)
         if key not in _instances:
-            _instances[key] = ManagedNotifications(directory)
+            _instances[key] = ManagedNotifications(directory, observations=_shared_observations(directory))
         return _instances[key]

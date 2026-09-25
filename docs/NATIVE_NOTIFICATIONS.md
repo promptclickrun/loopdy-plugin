@@ -188,9 +188,13 @@ Child membership is deduplicated and tied to its original parent turn. A failed
 child does not fail the parent. Parent completion retains outstanding children;
 terminal is emitted only for the bound work cohort. Current rosters are in-process
 facts, not restored from old durable starts. Restart can therefore produce a stale
-activity, never fabricated running progress.
+activity, never fabricated running progress. Every copy of this module loaded in one
+process (the dashboard imports it for routes and again for hooks) shares those facts,
+so the work readback and activity subscription see the turn the hooks observed.
 
 Ordinary updates are latest-state coalesced to the existing 30-second relay budget.
+An unchanged state is re-sent at most once a minute, and only when a real hook for
+that live work fires, so a long run of tool calls stays inside the stale window.
 Terminal updates bypass that delay and are durably retained until accepted or their
 120-second rich-v1 expiry. Completion/failure alerts expire within 900 seconds;
 approval attention expires within 60 seconds. An accepted/duplicate
@@ -212,7 +216,7 @@ Rich v1 retains its existing terminal transport phase for cancellation, with exa
 fixed `Stopped` copy and no completion/failure alert. The canonical work readback
 keeps `outcome:cancelled`; outstanding children delay the terminal until settled.
 The native presentation distinguishes Stopped from Finished. There is no
-push-to-start implementation, synthetic liveness heartbeat, or claim of physical
+push-to-start implementation, timer-driven liveness heartbeat, or claim of physical
 APNs verification.
 
 ## Wire proof

@@ -51,9 +51,11 @@ class _NativeRoute(APIRoute):
             except ClientDisconnect:
                 return _error_response(NativeAPIError(400, "request_disconnected",
                                                      "The request was disconnected."))
-            except Exception:
-                # Auth providers and storage may include secrets/paths in exceptions.
-                logger.error("Loopdy native request failed: native_service_unavailable")
+            except Exception as error:
+                # Auth providers and storage may include secrets/paths in exception
+                # text; the class name is fixed and safe to log.
+                logger.error("Loopdy native request failed: native_service_unavailable (%s)",
+                             type(error).__name__)
                 return _error_response(NativeAPIError(503, "native_service_unavailable",
                                                      "The native plugin service is unavailable."))
         return guarded

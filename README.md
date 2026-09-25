@@ -255,7 +255,7 @@ This optional update flow needs macOS launchd or Linux user systemd. Windows and
 Install and enable the plugin in the active Hermes profile:
 
 ```bash
-hermes plugins install promptclickrun/loopdy-plugin --enable
+hermes plugins install promptclickrun/bighelp-plugin --enable
 hermes gateway restart
 ```
 

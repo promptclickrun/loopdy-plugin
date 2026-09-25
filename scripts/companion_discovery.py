@@ -11,7 +11,9 @@ from pathlib import Path
 import re
 import stat
 
-SOURCE = "https://github.com/promptclickrun/loopdy-plugin"
+SOURCE = "https://github.com/promptclickrun/bighelp-plugin"
+# Installs recorded before the repository rename stay canonical.
+FORMER_SOURCES = ("https://github.com/promptclickrun/loopdy-plugin",)
 REVISION = re.compile(r"[0-9a-f]{40}")
 
 
@@ -79,7 +81,7 @@ def inspect_profile(home):
             result["installation"] = "unrecognized"
             if isinstance(entry, dict) and evidence["pluginIdentity"] is not None:
                 revision, source = entry.get("revision"), entry.get("source")
-                if isinstance(revision, str) and REVISION.fullmatch(revision) and source in (SOURCE, SOURCE + ".git"):
+                if isinstance(revision, str) and REVISION.fullmatch(revision) and source in {url + suffix for url in (SOURCE, *FORMER_SOURCES) for suffix in ("", ".git")}:
                     result.update(installation="metadataPresent", sourceKind="canonical", recordedRevision=revision)
     except (OSError, ValueError, TypeError, RecursionError):
         result["installation"] = "unrecognized"

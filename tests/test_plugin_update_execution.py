@@ -14,6 +14,27 @@ with patch.dict(sys.modules, {"plugin_update": api}):
     worker = importlib.import_module("loopdy_plugin.plugin_update_worker")
 
 
+class RepositoryRenameTests(unittest.TestCase):
+    """The repositories were renamed to bighelp-*; former names stay recognized."""
+
+    def test_canonical_source_is_the_renamed_repository(self):
+        self.assertEqual(api.SOURCE_URL, "https://github.com/promptclickrun/bighelp-plugin")
+        self.assertEqual(api.APP_SOURCE_URL, "https://github.com/promptclickrun/bighelp-ios")
+
+    def test_current_and_former_names_are_recognized_in_every_spelling(self):
+        for name in ("bighelp-plugin", "loopdy-plugin"):
+            for value in (f"https://github.com/promptclickrun/{name}", f"https://github.com/promptclickrun/{name}.git",
+                          f"git@github.com:promptclickrun/{name}.git", f"ssh://git@github.com/promptclickrun/{name}"):
+                self.assertTrue(worker._is_github_repository(value, api.PLUGIN_REPOSITORIES), value)
+        for name in ("bighelp-ios", "loopdy-ios"):
+            self.assertTrue(worker._is_github_repository(f"https://github.com/promptclickrun/{name}", api.APP_REPOSITORIES))
+
+    def test_unrelated_repositories_are_not_recognized(self):
+        for value in ("https://github.com/someone/bighelp-plugin", "https://gitlab.com/promptclickrun/bighelp-plugin",
+                      "https://github.com/promptclickrun/bighelp-ios"):
+            self.assertFalse(worker._is_github_repository(value, api.PLUGIN_REPOSITORIES), value)
+
+
 class PluginUpdateExecutionTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()

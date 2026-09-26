@@ -33,3 +33,4 @@ All take `agentId` and follow the native context/ETag/request-ID contract.
 | `board/media` | `itemId`, `index` | `mimeType`, base64 `data` |
 | `board/activity` | `limit` | `activity` with Hermes' session `title` |
 | `board/approvals` | `limit` | `approvals` with `sessionTitle` |
+| `board/identity` | — | `soul`, `memory`, `user`: `text` (64 KiB max), `updatedAt`, `truncated` |

@@ -336,7 +336,7 @@ def _board(request: Request, owner: NativeContext, body: _Body, operation: str) 
     if native_context(request) != owner:
         raise NativeAPIError(412, "context_changed", "The native context changed; refresh before retrying.")
     from hermes_cli.profiles import profile_exists
-    from .agent_board import BoardError, media_payload, session_titles, store_for_profile
+    from .agent_board import BoardError, identity, media_payload, session_titles, store_for_profile
 
     if not profile_exists(body.agentId):
         raise NativeAPIError(404, "profile_not_found", "The selected profile no longer exists.")
@@ -355,6 +355,8 @@ def _board(request: Request, owner: NativeContext, body: _Body, operation: str) 
             rows = store.activity(body.limit)
             titles = session_titles(body.agentId, [row["sessionId"] for row in rows])
             result = {"activity": [{**row, "title": titles.get(row["sessionId"], "")} for row in rows]}
+        elif operation == "identity":
+            result = identity(body.agentId)
         elif operation == "approvals" and isinstance(body, _BoardLog):
             rows = store.approvals(body.limit)
             titles = session_titles(body.agentId, [row["sessionId"] for row in rows])
@@ -402,3 +404,8 @@ async def board_activity(request: Request) -> Response:
 @router.post("/board/approvals")
 async def board_approvals(request: Request) -> Response:
     return await _board_request(request, _BoardLog, "approvals", _BOARD_LIST_BYTES)
+
+
+@router.post("/board/identity")
+async def board_identity(request: Request) -> Response:
+    return await _board_request(request, _Body, "identity", _BOARD_LIST_BYTES)

@@ -253,6 +253,13 @@ class NativeAPITests(unittest.TestCase):
         approvals = board("approvals", {"agentId": "default"}).json()["approvals"]
         self.assertEqual((approvals[0]["description"], approvals[0]["choice"]),
                          ("HTTPS connection to example.com", "always"))
+        (self.home / "SOUL.md").write_text("You are Gus.")
+        (self.home / "memories").mkdir(exist_ok=True)
+        (self.home / "memories" / "MEMORY.md").write_text("Dog food is Fromm.")
+        identity = board("identity", {"agentId": "default"}).json()
+        self.assertEqual((identity["soul"]["text"], identity["memory"]["text"], identity["user"]["text"]),
+                         ("You are Gus.", "Dog food is Fromm.", ""))
+        self.assertGreater(identity["soul"]["updatedAt"], 0)
         self.assertEqual(board("list", {"agentId": "missing-profile"}).status_code, 404)
         self.assertEqual(board("list", {"agentId": "default", "kinds": ["secret"]}).status_code, 422)
 

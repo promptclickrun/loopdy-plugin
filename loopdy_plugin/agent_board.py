@@ -376,6 +376,30 @@ def available() -> bool:
     return True
 
 
+MAX_IDENTITY_TEXT = 64 * 1024
+
+
+def identity(profile: str) -> dict:
+    """SOUL and built-in memory for the app's Identity cards. Read-only, capped."""
+    from hermes_cli.profiles import get_profile_dir
+    home = get_profile_dir(profile)
+
+    def read(path: Path) -> dict:
+        try:
+            info = path.stat()
+        except OSError:
+            return {"text": "", "updatedAt": 0, "truncated": False}
+        if not path.is_file():
+            return {"text": "", "updatedAt": 0, "truncated": False}
+        with path.open("rb") as handle:
+            data = handle.read(MAX_IDENTITY_TEXT + 1)
+        text = data[:MAX_IDENTITY_TEXT].decode("utf-8", errors="replace")
+        return {"text": text, "updatedAt": int(info.st_mtime), "truncated": len(data) > MAX_IDENTITY_TEXT}
+
+    return {"soul": read(home / "SOUL.md"), "memory": read(home / "memories" / "MEMORY.md"),
+            "user": read(home / "memories" / "USER.md")}
+
+
 def session_titles(profile: str, session_ids: list[str]) -> dict[str, str]:
     """Hermes' own session titles, read-only, for activity rows."""
     if not session_ids:

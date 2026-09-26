@@ -53,6 +53,69 @@ class WorkspaceArtifactRouteTests(unittest.TestCase):
         self.assertEqual(read.headers["cache-control"], "no-store")
         self.assertIn("x-loopdy-request-id", read.headers)
 
+    def history(self, rows):
+        import sqlite3
+        with sqlite3.connect(self.home / "state.db") as connection:
+            connection.execute("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, session_id TEXT, "
+                               "role TEXT, content TEXT, tool_calls TEXT, timestamp REAL)")
+            connection.executemany("INSERT INTO messages (session_id, role, content, tool_calls, timestamp) "
+                                   "VALUES ('s', 'assistant', ?, ?, ?)", rows)
+
+    @staticmethod
+    def wrote(path, tool="write_file"):
+        return json.dumps([{"id": "c", "type": "function",
+                            "function": {"name": tool, "arguments": json.dumps({"path": str(path)})}}])
+
+    def test_recent_lists_what_the_agent_made_newest_first_inside_the_workspace_only(self):
+        root = self.configure()
+        (root / "deep" / "er" / "still").mkdir(parents=True)
+        made = root / "deep" / "er" / "still" / "report.md"
+        patched = root / "app.swift"
+        sent = root / "clip.mp4"
+        for path in (made, patched, sent):
+            path.write_text(path.name)
+        outside = self.home / "outside.txt"
+        outside.write_text("outside")
+        (root / "linked.txt").symlink_to(outside)
+        (root / ".secret").write_text("hidden")
+        self.history([
+            (None, self.wrote(made), 300.0),
+            (None, self.wrote(patched, "patch"), 200.0),
+            (f"Here it is\nMEDIA:{sent}", None, 250.0),
+            (None, self.wrote(outside), 400.0),
+            (None, self.wrote(root / "linked.txt"), 410.0),
+            (None, self.wrote(root / ".secret"), 420.0),
+            (None, self.wrote(root / "deleted.txt"), 430.0),
+            (None, self.wrote("relative.txt"), 440.0),
+        ])
+        response = self.request("recent")
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        agent_rows = [row["name"] for row in body["entries"] if row["name"] in {"report.md", "clip.mp4", "app.swift"}]
+        self.assertEqual(agent_rows, ["report.md", "clip.mp4", "app.swift"])
+        self.assertNotIn("outside", response.text)
+        self.assertNotIn(".secret", response.text)
+        self.assertEqual(body["workspace"]["root"], str(root))
+        self.assertEqual(self.request("recent", str(root)).status_code, 422)
+
+    def test_recent_adds_new_top_level_files_and_skips_housekeeping(self):
+        root = self.configure()
+        (root / "project" / "node_modules" / "pkg").mkdir(parents=True)
+        (root / "cloned" / ".git").mkdir(parents=True)
+        (root / "cloned" / "README.md").write_text("fresh clone")
+        files = {
+            root / "notes.md": 1_000,
+            root / "project" / "summary.pdf": 2_000,
+            root / "project" / "debug.log": 9_000,
+            root / "project" / "node_modules" / "pkg" / "index.js": 9_000,
+        }
+        for path, stamp in files.items():
+            path.write_text(path.name)
+            os.utime(path, (stamp, stamp))
+        response = self.request("recent")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual({row["name"] for row in response.json()["entries"]}, {"notes.md", "summary.pdf"})
+
     def test_missing_and_relative_config_never_fall_back_to_process_cwd(self):
         for cwd in [None, ".", "auto", "relative/folder"]:
             config = {} if cwd is None else {"terminal": {"cwd": cwd}}

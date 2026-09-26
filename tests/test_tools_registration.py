@@ -119,8 +119,9 @@ class ToolRegistrationTests(unittest.TestCase):
             if tool_name == "loopdy_react_to_message":
                 from loopdy_plugin.reactions import PARAMETERS
                 self.assertEqual(renderer_schema["parameters"], PARAMETERS)
-                self.assertIn("React to a human message", description)
-                self.assertIn("Never use reactions as processing status", description)
+                self.assertIn("tapback", description)
+                self.assertIn("never as a status signal", description)
+                self.assertIn("Never narrate", description)
                 continue
             if tool_name == "loopdy_await_form_response":
                 self.assertNotIn("renderer", description)

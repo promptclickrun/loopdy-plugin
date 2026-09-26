@@ -975,6 +975,10 @@ class LinkActivityBroker:
                 phase, action, progress = "thinking", "Reviewing the result", 0
         elif kind == "tool":
             state["latest_tool"] = title[:64]
+            # A fixed category ("coding", "web", "images"…), never the tool's
+            # arguments or output, lets the Dynamic Island show the kind of work.
+            state["latest_tool_category"] = _tool_category(
+                _coordinate(payload.get("toolName"), 80) or title)
             if lifecycle == "running":
                 waiting = title.lower().startswith("waiting")
                 phase = "waiting" if waiting else "using_tool"
@@ -1007,6 +1011,7 @@ class LinkActivityBroker:
             completed_steps=int(state["completed_steps"]),
             active_subagent_count=len(subagents),
             latest_tool=state.get("latest_tool"),
+            tool_category=state.get("latest_tool_category"),
             timestamp=timestamp,
         )
 
@@ -1733,6 +1738,17 @@ def _todo_snapshot(value: Any) -> dict[str, Any] | None:
     return {"todos": value["todos"], "revision": revision}
 
 
+_TOOL_CATEGORY_NAMES = frozenset({
+    "images", "coding", "web", "seeing", "memory", "scheduling", "delegating",
+    "files", "messaging", "publishing", "tools",
+})
+
+
+def _tool_category(name: str) -> str:
+    from .agent_board import tool_category
+    return tool_category(name)
+
+
 def _tool_title(tool_name: str) -> str:
     return _TOOL_TITLES.get(tool_name, "Using " + tool_name.replace("_", " "))
 
@@ -1810,6 +1826,7 @@ def _live_activity_wire(
     active_subagent_count: int,
     latest_tool: Any,
     timestamp: int,
+    tool_category: str | None = None,
 ) -> dict[str, Any]:
     session_reference = base64.urlsafe_b64encode(
         hashlib.sha256(session_id.encode("utf-8")).digest()
@@ -1833,7 +1850,7 @@ def _live_activity_wire(
         "progress": 100 if phase in {"completed", "failed"} else 0,
         "completedSteps": 0,
         "activeSubagentCount": min(max(int(active_subagent_count), 0), 99),
-        "latestTool": None,
+        "latestTool": tool_category if tool_category in _TOOL_CATEGORY_NAMES else None,
         "timestamp": timestamp,
         "expires": timestamp + 120,
     }

@@ -80,6 +80,13 @@ def react(emoji: Any, message_row_id: Any = None, messages_back: Any = None) -> 
         )
         if reactions is None:
             return _error("reaction_message_unavailable")
+        # Paint it live in app chats, as Hermes' own react tool does; without
+        # a UI bridge the stored reaction still shows on the next history read.
+        try:
+            from tools import desktop_ui
+            desktop_ui.emit("message.reaction", {"row_id": int(row_id), "reactions": reactions, "role": "user"})
+        except Exception:
+            pass
         return json.dumps({
             "schema": REACTION_SCHEMA,
             "version": 1,
@@ -131,11 +138,13 @@ def register(ctx: Any) -> bool:
         schema={
             "name": "loopdy_react_to_message",
             "description": (
-                "React to a human message in the current Loopdy conversation with one emoji. "
-                "Use occasionally when a reaction is more natural than redundant prose. "
-                "Omit message_row_id to target the latest human message; a different emoji "
-                "replaces the agent's prior reaction and an empty string removes it. Never "
-                "use reactions as processing status and never narrate the reaction."
+                "React to the person's message in the bighelp app with one emoji, the way "
+                "you'd tapback in iMessage: something funny gets a 😂, good news or warmth a "
+                "❤️, a plan you're on board with a 👍. If a reaction says it all it can be the "
+                "whole reply; otherwise react and carry on. Use it like a person would, now and "
+                "then when it's felt, not on every message and never as a status signal. Never "
+                "narrate or explain the reaction. Omit message_row_id for their latest message; "
+                "a different emoji replaces yours and an empty string removes it."
             ),
             "parameters": PARAMETERS,
         },

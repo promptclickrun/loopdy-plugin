@@ -6,12 +6,12 @@ import json
 import logging
 import re
 import sys
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.routing import APIRoute
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, ValidationError
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect
 
@@ -292,3 +292,113 @@ async def install_template(request: Request) -> Response:
 @router.post("/cards/templates/remove")
 async def remove_template(request: Request) -> Response:
     return await _template_request(request, _Remove, "remove")
+
+
+# MARK: Agent board (Feed, Ideas, Goals, Activity, Approvals history)
+
+_BOARD_LIST_BYTES = 2 * 1024 * 1024
+_BOARD_MEDIA_BYTES = 12 * 1024 * 1024
+_BOARD_ITEM_ID = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+
+
+class _BoardList(_Body):
+    kinds: list[Literal["feed", "idea", "goal"]] = Field(default_factory=lambda: ["feed", "idea", "goal"],
+                                                         min_length=1, max_length=3)
+    limit: StrictInt = Field(default=100, ge=1, le=200)
+    includeDismissed: StrictBool = False
+
+
+class _BoardUpdate(_Body):
+    itemId: str = Field(pattern=_BOARD_ITEM_ID)
+    liked: StrictBool | None = None
+    dismissed: StrictBool | None = None
+    status: Literal["active", "done"] | None = None
+
+
+class _BoardMedia(_Body):
+    itemId: str = Field(pattern=_BOARD_ITEM_ID)
+    index: StrictInt = Field(ge=0, le=5)
+
+
+class _BoardLog(_Body):
+    limit: StrictInt = Field(default=100, ge=1, le=200)
+
+
+def _board_response(value: dict, context: NativeContext, request_id: str, maximum: int) -> Response:
+    encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"),
+                         sort_keys=True, allow_nan=False).encode("utf-8")
+    if len(encoded) > maximum:
+        raise NativeAPIError(413, "payload_too_large", "The response exceeds the byte limit.")
+    return Response(encoded, media_type="application/json", headers=_headers(context, request_id))
+
+
+def _board(request: Request, owner: NativeContext, body: _Body, operation: str) -> dict:
+    if native_context(request) != owner:
+        raise NativeAPIError(412, "context_changed", "The native context changed; refresh before retrying.")
+    from hermes_cli.profiles import profile_exists
+    from .agent_board import BoardError, media_payload, session_titles, store_for_profile
+
+    if not profile_exists(body.agentId):
+        raise NativeAPIError(404, "profile_not_found", "The selected profile no longer exists.")
+    store = store_for_profile(body.agentId)
+    try:
+        if operation == "list" and isinstance(body, _BoardList):
+            result = {"items": store.items(tuple(body.kinds), limit=body.limit,
+                                           include_dismissed=body.includeDismissed)}
+        elif operation == "update" and isinstance(body, _BoardUpdate):
+            result = {"item": store.set_flags(body.itemId, liked=body.liked, dismissed=body.dismissed,
+                                              status=body.status)}
+        elif operation == "media" and isinstance(body, _BoardMedia):
+            mime, data = store.image(body.itemId, body.index)
+            result = media_payload(mime, data)
+        elif operation == "activity" and isinstance(body, _BoardLog):
+            rows = store.activity(body.limit)
+            titles = session_titles(body.agentId, [row["sessionId"] for row in rows])
+            result = {"activity": [{**row, "title": titles.get(row["sessionId"], "")} for row in rows]}
+        elif operation == "approvals" and isinstance(body, _BoardLog):
+            rows = store.approvals(body.limit)
+            titles = session_titles(body.agentId, [row["sessionId"] for row in rows])
+            result = {"approvals": [{**row, "sessionTitle": titles.get(row["sessionId"], "")} for row in rows]}
+        else:
+            raise NativeAPIError(422, "invalid_request", "The board request is invalid.")
+    except BoardError:
+        raise NativeAPIError(404, "board_item_unavailable", "That item is no longer available.") from None
+    if native_context(request) != owner:
+        raise NativeAPIError(412, "context_changed", "The native context changed; reconcile the outcome.")
+    return {"agentId": body.agentId, **result}
+
+
+async def _board_request(request: Request, model: type[_Body], operation: str, maximum: int) -> Response:
+    from .agent_board import CAPABILITY
+    owner = native_context(request)
+    request_id = _precondition(request, owner)
+    if CAPABILITY not in owner.features:
+        raise NativeAPIError(503, "board_unavailable", "The agent board is unavailable.")
+    body = await _body(request, model)
+    result = await run_in_threadpool(_board, request, owner, body, operation)
+    return _board_response(result, owner, request_id, maximum)
+
+
+@router.post("/board/list")
+async def board_list(request: Request) -> Response:
+    return await _board_request(request, _BoardList, "list", _BOARD_LIST_BYTES)
+
+
+@router.post("/board/update")
+async def board_update(request: Request) -> Response:
+    return await _board_request(request, _BoardUpdate, "update", MAX_BODY_BYTES)
+
+
+@router.post("/board/media")
+async def board_media(request: Request) -> Response:
+    return await _board_request(request, _BoardMedia, "media", _BOARD_MEDIA_BYTES)
+
+
+@router.post("/board/activity")
+async def board_activity(request: Request) -> Response:
+    return await _board_request(request, _BoardLog, "activity", _BOARD_LIST_BYTES)
+
+
+@router.post("/board/approvals")
+async def board_approvals(request: Request) -> Response:
+    return await _board_request(request, _BoardLog, "approvals", _BOARD_LIST_BYTES)

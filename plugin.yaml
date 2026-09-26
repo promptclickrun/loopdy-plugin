@@ -72,6 +72,7 @@ provides_tools:
   - loopdy_render_card_template
   - loopdy_marketplace_prepare_upload
   - loopdy_react_to_message
+  - bighelp_board
 platforms:
   - linux
   - macos

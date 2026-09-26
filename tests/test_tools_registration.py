@@ -126,6 +126,12 @@ class ToolRegistrationTests(unittest.TestCase):
                 self.assertNotIn("renderer", description)
                 self.assertIn("exact-session", description)
                 continue
+            if tool_name == "bighelp_board":
+                from loopdy_plugin.agent_board import TOOL_PARAMETERS
+                self.assertEqual(renderer_schema["parameters"], TOOL_PARAMETERS)
+                self.assertIn("Only publish what the user asked you to surface", description)
+                self.assertIn("Never create schedules or posts on your own initiative", description)
+                continue
             if tool_name == "loopdy_marketplace_prepare_upload":
                 self.assertIn("private marketplace", description)
                 self.assertIn("cannot submit or publish", description)

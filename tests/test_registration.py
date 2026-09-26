@@ -952,7 +952,8 @@ class RegistrationTests(unittest.TestCase):
                 "kanban_task_blocked",
             } | ({"on_room_member_activity"} if "on_room_member_activity" in VALID_HOOKS else set()),
         )
-        self.assertEqual(set(context.skills), {"loopdy-marketplace-publish"})
+        self.assertEqual(set(context.skills), {"loopdy-marketplace-publish", "bighelp-feed-and-ideas"})
+        self.assertTrue(context.skills["bighelp-feed-and-ideas"]["path"].is_file())
         self.assertTrue(context.skills["loopdy-marketplace-publish"]["path"].is_file())
 
         self.assertIsNone(

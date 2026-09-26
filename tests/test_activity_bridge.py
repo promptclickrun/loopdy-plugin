@@ -244,7 +244,8 @@ class ActivityBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(live[0]["type"], "live_activity.update")
         self.assertEqual(live[0]["phase"], "using_tool")
         self.assertEqual(live[0]["currentAction"], "Your agent is working")
-        self.assertIsNone(live[0]["latestTool"])
+        # Only a fixed category reaches the Dynamic Island, never the tool text.
+        self.assertEqual(live[0]["latestTool"], "tools")
         self.assertEqual(live[0]["progress"], 0)
         self.assertEqual(len(live[0]["sessionReference"]), 43)
         self.assertNotIn("private location", repr(live[0]))
@@ -810,6 +811,25 @@ class ActivityBridgeTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         self.assertEqual(snapshots[1]["subagents"], [])
+
+
+class IslandCategoryTests(unittest.TestCase):
+    def test_the_island_gets_only_a_fixed_tool_category(self):
+        from loopdy_plugin import activity_bridge as bridge
+
+        def wire(category):
+            return bridge._live_activity_wire(
+                session_id="session", identity="identity", phase="using_tool", current_action="x",
+                progress=0, completed_steps=0, active_subagent_count=0,
+                latest_tool="Run rm -rf ~/private", timestamp=5, tool_category=category)
+
+        self.assertEqual(wire("coding")["latestTool"], "coding")
+        self.assertIsNone(wire("Run rm -rf ~/private")["latestTool"])
+        self.assertIsNone(wire(None)["latestTool"])
+        self.assertNotIn("private", repr(wire("coding")))
+        self.assertEqual(bridge._tool_category("terminal"), "coding")
+        self.assertEqual(bridge._tool_category("image_generate"), "images")
+        self.assertEqual(bridge._tool_category("browser_navigate"), "web")
 
 
 if __name__ == "__main__":

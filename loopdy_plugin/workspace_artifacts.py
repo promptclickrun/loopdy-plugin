@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import base64
 import ctypes
+import heapq
 import json
 import math
 import mimetypes
 import os
 import stat
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -26,6 +28,31 @@ from .native_context import NativeAPIError, NativeContext, PROFILE_ID, native_co
 
 
 CAPABILITY = "native-workspace-files-v1"
+# Artifacts: the files the agent made or sent, newest first, in one request.
+# A workspace can hold millions of files, so this never walks the whole tree:
+# it reads the agent's own write_file/patch calls and MEDIA deliveries, then
+# adds a shallow look at the top folders for anything made another way.
+RECENT_CAPABILITY = "native-workspace-recent-v1"
+RECENT_LIMIT = 300
+RECENT_HISTORY_ROWS = 3_000
+RECENT_SHALLOW_DEPTH = 2
+RECENT_SHALLOW_DIRECTORIES = 400
+RECENT_SHALLOW_SECONDS = 1.5
+_RECENT_SKIPPED_NAMES = frozenset({
+    "node_modules", "bower_components", "Pods", "Carthage", "DerivedData", "SourcePackages",
+    "build", "dist", "target", "vendor", "venv", "env", "__pycache__", "site-packages",
+    "coverage", "xcuserdata",
+})
+_RECENT_SKIPPED_SUFFIXES = (
+    ".xcodeproj", ".xcworkspace", ".xcassets", ".xcarchive", ".xcresult", ".app", ".framework",
+    ".xcframework", ".bundle", ".dSYM", ".photoslibrary", ".lproj",
+)
+# Housekeeping files, not things anyone made.
+_RECENT_SKIPPED_EXTENSIONS = (
+    ".log", ".pyc", ".pyo", ".o", ".a", ".class", ".tmp", ".swp", ".lock", ".pid",
+    "-wal", "-shm", "-journal",
+)
+_WRITING_TOOLS = ("write_file", "patch")
 MAX_BODY_BYTES = 8_192
 MAX_LISTING_BYTES = 196_608
 MAX_FILE_BYTES = 25 * 1_024 * 1_024
@@ -280,6 +307,181 @@ def _scope(root: Path, profile_id: str) -> dict[str, Any]:
     }
 
 
+def _skip_recent_directory(name: str) -> bool:
+    return name in _RECENT_SKIPPED_NAMES or name.endswith(_RECENT_SKIPPED_SUFFIXES)
+
+
+def _skip_recent_file(name: str) -> bool:
+    return name.startswith(".") or name.endswith(_RECENT_SKIPPED_EXTENSIONS)
+
+
+def _agent_written_paths(profile_id: str) -> list[tuple[float, str]]:
+    """Absolute paths the agent wrote, patched or delivered, newest first."""
+    import re
+    import sqlite3
+    from hermes_cli.profiles import get_profile_dir
+    database = get_profile_dir(profile_id) / "state.db"
+    if not database.is_file():
+        return []
+    marks = " OR ".join("instr(tool_calls, ?) > 0" for _ in _WRITING_TOOLS)
+    try:
+        with sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True, timeout=5) as connection:
+            calls = connection.execute(
+                f"SELECT timestamp, tool_calls FROM messages WHERE role = 'assistant' "
+                f"AND tool_calls IS NOT NULL AND ({marks}) ORDER BY timestamp DESC LIMIT ?",
+                (*(f'"{name}"' for name in _WRITING_TOOLS), RECENT_HISTORY_ROWS),
+            ).fetchall()
+            deliveries = connection.execute(
+                "SELECT timestamp, content FROM messages WHERE role = 'assistant' "
+                "AND instr(content, 'MEDIA:') > 0 ORDER BY timestamp DESC LIMIT ?",
+                (RECENT_HISTORY_ROWS,),
+            ).fetchall()
+    except sqlite3.Error:
+        return []
+    found: list[tuple[float, str]] = []
+    for timestamp, raw in calls:
+        try:
+            values = json.loads(raw or "[]")
+        except ValueError:
+            continue
+        for call in values if isinstance(values, list) else []:
+            function = call.get("function") if isinstance(call, dict) else None
+            if not isinstance(function, dict) or function.get("name") not in _WRITING_TOOLS:
+                continue
+            try:
+                arguments = function.get("arguments")
+                arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
+            except ValueError:
+                continue
+            path = arguments.get("path") if isinstance(arguments, dict) else None
+            if isinstance(path, str):
+                found.append((float(timestamp), path))
+    directive = re.compile(r"MEDIA:(?://)?(/[^\n`]+)")
+    for timestamp, content in deliveries:
+        for match in directive.finditer(content or ""):
+            found.append((float(timestamp), "/" + match.group(1).strip().lstrip("/")))
+    found.sort(key=lambda row: row[0], reverse=True)
+    return found
+
+
+def _confined_entry(root: Path, raw_path: str) -> tuple[tuple[str, ...], dict[str, Any]] | None:
+    """A workspace entry for an absolute path that still resolves inside the root."""
+    try:
+        candidate = Path(raw_path).expanduser()
+        if not candidate.is_absolute():
+            return None
+        resolved = candidate.resolve(strict=True)
+        parts = resolved.relative_to(root).parts
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not parts or any(part.startswith(".") for part in parts) or _skip_recent_file(parts[-1]):
+        return None
+    try:
+        with _opened(root, parts, directory=False) as descriptor:
+            info = os.fstat(descriptor) if isinstance(descriptor, int) else descriptor.stat()
+            projected = _entry(root, parts[:-1], parts[-1], info,
+                               descriptor if isinstance(descriptor, int) else None)
+    except NativeAPIError:
+        return None
+    if projected is None or projected["is_directory"]:
+        return None
+    return parts, projected
+
+
+def _shallow_newest(root: Path, deadline: float) -> list[tuple[tuple[str, ...], dict[str, Any]]]:
+    """Files in the top folders, opened O_NOFOLLOW relative to their parent."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    found: list[tuple[tuple[str, ...], dict[str, Any]]] = []
+    directories = 0
+
+    def visit(descriptor: int, parts: tuple[str, ...]) -> None:
+        nonlocal directories
+        directories += 1
+        folders: list[str] = []
+        files: list[tuple[tuple[str, ...], dict[str, Any]]] = []
+        is_repository = False
+        try:
+            with os.scandir(descriptor) as iterator:
+                for item in iterator:
+                    name = item.name
+                    if name == ".git":
+                        is_repository = True
+                    if not name or name.startswith(".") or os.sep in name or (os.altsep and os.altsep in name):
+                        continue
+                    try:
+                        info = item.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if stat.S_ISDIR(info.st_mode):
+                        if not _skip_recent_directory(name):
+                            folders.append(name)
+                    elif not _skip_recent_file(name):
+                        projected = _entry(root, parts, name, info)
+                        if projected is not None and not projected["is_directory"]:
+                            files.append((parts + (name,), projected))
+        except OSError:
+            return
+        # A code repository's files are new whenever it is cloned. What the
+        # agent writes there still arrives through its own history above.
+        if is_repository and parts:
+            return
+        found.extend(files)
+        if len(parts) + 1 > RECENT_SHALLOW_DEPTH:
+            return
+        for name in sorted(folders):
+            if directories >= RECENT_SHALLOW_DIRECTORIES or time.monotonic() > deadline:
+                return
+            try:
+                child = os.open(name, flags, dir_fd=descriptor)
+            except OSError:
+                continue
+            try:
+                visit(child, parts + (name,))
+            finally:
+                os.close(child)
+
+    try:
+        top = os.open(root, flags)
+    except OSError:
+        raise NativeAPIError(409, "workspace_unreadable", "The workspace directory could not be read safely.") from None
+    try:
+        visit(top, ())
+    finally:
+        os.close(top)
+    return found
+
+
+def _recent(root: Path, profile_id: str) -> dict[str, Any]:
+    """Artifacts: files the agent wrote or delivered, plus new top-level files.
+
+    Agent files rank by when the agent wrote them; others by creation time.
+    Every entry is re-opened O_NOFOLLOW below the root, so history can never
+    point the app outside the configured workspace.
+    """
+    deadline = time.monotonic() + RECENT_SHALLOW_SECONDS
+    ranked: dict[tuple[str, ...], tuple[float, dict[str, Any]]] = {}
+    for timestamp, raw_path in _agent_written_paths(profile_id):
+        if len(ranked) >= RECENT_LIMIT:
+            break
+        confined = _confined_entry(root, raw_path)
+        if confined is not None and confined[0] not in ranked:
+            ranked[confined[0]] = (timestamp, confined[1])
+    for parts, projected in _shallow_newest(root, deadline):
+        if parts not in ranked:
+            ranked[parts] = (projected["created"] or projected["mtime"], projected)
+    newest = heapq.nlargest(RECENT_LIMIT, ranked.values(), key=lambda row: row[0])
+    entries = [row[1] for row in newest]
+    result = {
+        "workspace": {"root": str(root), "source": "terminal.cwd", "profileId": profile_id},
+        "path": str(root), "parent": None, "entries": entries,
+        "root": str(root), "locked_root": str(root), "can_change_path": False,
+    }
+    # Long paths can outgrow the listing budget; keep the newest that fit.
+    while entries and len(json.dumps(result, ensure_ascii=False, separators=(",", ":"))) > MAX_LISTING_BYTES - 1_024:
+        entries.pop()
+    return result
+
+
 def _read(root: Path, parts: tuple[str, ...], profile_id: str) -> dict[str, Any]:
     with _opened(root, parts, directory=False) as opened:
         try:
@@ -341,6 +543,11 @@ async def request(operation: str, request: Request) -> Response:
         parts = _relative(root, body.path)
         result = await run_in_threadpool(_read, root, parts, profile_id)
         maximum = MAX_READ_RESPONSE_BYTES
+    elif operation == "recent":
+        if body.path is not None:
+            raise NativeAPIError(422, "invalid_request", "Recent workspace files do not accept a path.")
+        result = await run_in_threadpool(_recent, root, profile_id)
+        maximum = MAX_LISTING_BYTES
     else:
         raise NativeAPIError(404, "unsupported_operation", "The workspace file operation is unsupported.")
     if native_context(request) != context:

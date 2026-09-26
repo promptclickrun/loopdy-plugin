@@ -20,7 +20,7 @@ PROCESS_FEATURES = (
     "native-context-v1", "serving-profile-v1", "native-card-templates-v1",
     "native-voice-v1", "native-device-tools-v1", "native-room-activity-v1",
     "native-project-git-read-v1", "native-agent-templates-v1",
-    "native-workspace-files-v1",
+    "native-workspace-files-v1", "native-workspace-recent-v1",
 )
 WIKI_FEATURES = ("native-wiki-v1", "native-wiki-disconnect-v1")
 
@@ -56,7 +56,7 @@ class NativeStartupLoggingTests(unittest.TestCase):
         self.templates = module("loopdy_plugin.agent_templates", CAPABILITY=PROCESS_FEATURES[7],
                                 available=Mock(return_value=True))
         self.files = module("loopdy_plugin.workspace_artifacts", CAPABILITY=PROCESS_FEATURES[8],
-                            available=Mock(return_value=True))
+                            RECENT_CAPABILITY=PROCESS_FEATURES[9], available=Mock(return_value=True))
         self.wiki = module("loopdy_plugin.wiki_contract", available_wiki_operations=Mock(return_value=True))
         modules = [self.constants, self.profiles, self.device, self.room, self.git,
                    self.templates, self.files, self.wiki,
@@ -113,7 +113,7 @@ class NativeStartupLoggingTests(unittest.TestCase):
             "hermes_cli.profiles": ("native-card-templates-v1", "native-voice-v1"),
             "loopdy_plugin.native_device_tools": ("native-device-tools-v1",),
             "loopdy_plugin.agent_templates": ("native-agent-templates-v1",),
-            "loopdy_plugin.workspace_artifacts": ("native-workspace-files-v1",),
+            "loopdy_plugin.workspace_artifacts": ("native-workspace-files-v1", "native-workspace-recent-v1"),
         }
         for name, omitted in missing.items():
             with self.subTest(module=name), patch.dict(sys.modules, {name: None}), \

@@ -225,13 +225,16 @@ def _native_features(
         skip("native-agent-templates-v1", "agent template support is unimportable.")
     try:
         from .workspace_artifacts import CAPABILITY as workspace_files_capability
+        from .workspace_artifacts import RECENT_CAPABILITY as workspace_recent_capability
         from .workspace_artifacts import available as workspace_files_available
         if workspace_files_available():
-            features.append(workspace_files_capability)
+            features.extend((workspace_files_capability, workspace_recent_capability))
         else:
             skip(workspace_files_capability, "workspace file availability checks failed.")
+            skip(workspace_recent_capability, "workspace file availability checks failed.")
     except ImportError:
         skip("native-workspace-files-v1", "workspace file support is unimportable.")
+        skip("native-workspace-recent-v1", "workspace file support is unimportable.")
     try:
         from .agent_board import CAPABILITY as board_capability
         from .agent_board import available as board_available
@@ -243,11 +246,14 @@ def _native_features(
         skip("native-agent-board-v1", "agent board support is unimportable.")
     try:
         from .native_attachments import CAPABILITY as attachments_capability
+        from .native_attachments import MEDIA_CAPABILITY as media_capability
         from .native_attachments import available as attachments_available
         if profile is not None and attachments_available():
-            features.append(attachments_capability)
+            features.extend((attachments_capability, media_capability))
         else:
             skip(attachments_capability, "gateway media policy or profile helpers are unavailable.")
+            skip(media_capability, "gateway media policy or profile helpers are unavailable.")
     except ImportError:
         skip("native-agent-attachments-v1", "native attachment support is unimportable.")
+        skip("native-agent-media-v1", "native attachment support is unimportable.")
     return profile, tuple(features)

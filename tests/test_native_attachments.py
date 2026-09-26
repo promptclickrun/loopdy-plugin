@@ -77,5 +77,53 @@ class NativeAttachmentTests(unittest.TestCase):
             na.fetch(na._Fetch(agentId="other", attachmentId=item["attachments"][0]["id"], offset=0))
 
 
+class RecentMediaTests(unittest.TestCase):
+    """The Media page: newest pictures and videos the agent sent or generated."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.old = root / "old.png"
+        self.new = root / "new.png"
+        self.clip = root / "clip.mp4"
+        self.doc = root / "notes.pdf"
+        self.generated = root / "generated.png"
+        for path in (self.old, self.new, self.clip, self.doc, self.generated):
+            path.write_bytes(b"fixture-" + path.name.encode())
+        self.db = root / "state.db"
+        with sqlite3.connect(self.db) as c:
+            c.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT)")
+            c.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, "
+                      "content TEXT, tool_name TEXT, timestamp REAL)")
+            c.executemany("INSERT INTO messages (session_id, role, content, tool_name, timestamp) VALUES (?, ?, ?, ?, ?)", [
+                ("s1", "assistant", f"Old one\nMEDIA:{self.old}", None, 100.0),
+                ("s1", "assistant", f"A doc\nMEDIA:{self.doc}", None, 200.0),
+                ("s2", "assistant", f"Two things\nMEDIA:{self.new}\nMEDIA:{self.clip}", None, 300.0),
+                ("s2", "tool", '{"success": true, "image": "%s"}' % self.generated, "image_generate", 400.0),
+                ("s2", "tool", '{"success": false, "image": "%s"}' % self.old, "image_generate", 500.0),
+                ("s3", "user", f"MEDIA:{self.old}", None, 600.0),
+            ])
+        na._store = AttachmentStore(root / "a.sqlite3")
+        self.addCleanup(setattr, na, "_store", None)
+        p = patch.object(na, "_state_db", return_value=self.db)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_lists_newest_delivered_and_generated_media_only(self):
+        items = na.recent(na._Recent(agentId="default", limit=10))["items"]
+        self.assertEqual([item["fileName"] for item in items], ["generated.png", "new.png", "clip.mp4", "old.png"])
+        self.assertEqual([item["storedId"] for item in items], ["s2", "s2", "s2", "s1"])
+        self.assertTrue(all(item["mimeType"].startswith(("image/", "video/")) for item in items))
+        self.assertNotIn(self.tmp.name, repr(items))
+        chunk = na.fetch(na._Fetch(agentId="default", attachmentId=items[1]["id"], offset=0))
+        self.assertEqual(base64.b64decode(chunk["data"]), self.new.read_bytes())
+
+    def test_limit_and_missing_database(self):
+        self.assertEqual(len(na.recent(na._Recent(agentId="default", limit=2))["items"]), 2)
+        self.db.unlink()
+        self.assertEqual(na.recent(na._Recent(agentId="default", limit=5)), {"items": []})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -26,6 +26,11 @@ from starlette.concurrency import run_in_threadpool
 from .native_context import NativeAPIError, NativeContext, PROFILE_ID, native_context
 
 CAPABILITY = "native-agent-attachments-v1"
+# The app's Media page: pictures and videos the agent sent or generated lately.
+MEDIA_CAPABILITY = "native-agent-media-v1"
+MAX_RECENT_MEDIA = 36
+_RECENT_SCAN_ROWS = 400
+_GENERATOR_TOOLS = ("image_generate", "video_generate")
 MAX_ITEMS = 50
 MAX_TEXT_BYTES = 100_000
 MAX_LINEAGE = 16
@@ -54,6 +59,12 @@ class _Fetch(BaseModel):
     agentId: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
     attachmentId: str = Field(min_length=16, max_length=128)
     offset: StrictInt = Field(ge=0, le=25 * 1024 * 1024)
+
+
+class _Recent(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    agentId: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    limit: StrictInt = Field(ge=1, le=MAX_RECENT_MEDIA)
 
 
 def available() -> bool:
@@ -179,6 +190,83 @@ def _only(text: str, allowed: list[str]) -> str:
     return MEDIA_TAG_CLEANUP_RE.sub(keep, text)
 
 
+def _is_media(path: str) -> bool:
+    import mimetypes
+    kind = mimetypes.guess_type(path)[0] or ""
+    return kind.startswith("image/") or kind.startswith("video/")
+
+
+def _generated_path(content: str | None) -> str | None:
+    """The host-deliverable file a stock image or video tool reported."""
+    try:
+        value = json.loads(content or "")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(value, dict) or value.get("success") is not True:
+        return None
+    for key in ("image", "video"):
+        path = value.get(key)
+        if isinstance(path, str) and path.startswith("/"):
+            return path
+    return None
+
+
+def recent(body: _Recent) -> dict[str, Any]:
+    """Newest pictures and videos this agent delivered (``MEDIA:``) or generated.
+
+    Every path comes from the agent's own stored messages and goes through the
+    same gateway delivery policy and attachment store as chat attachments, so
+    the phone still only receives opaque IDs.
+    """
+    db_path = _state_db(body.agentId)
+    if not db_path.is_file():
+        return {"items": []}
+    uri = db_path.resolve().as_uri() + "?mode=ro"
+    marks = ",".join("?" for _ in _GENERATOR_TOOLS)
+    with sqlite3.connect(uri, uri=True, timeout=5) as connection:
+        delivered = connection.execute(
+            "SELECT id, session_id, timestamp, content FROM messages WHERE role = 'assistant' "
+            "AND instr(content, 'MEDIA:') > 0 ORDER BY timestamp DESC LIMIT ?", (_RECENT_SCAN_ROWS,)
+        ).fetchall()
+        generated = connection.execute(
+            f"SELECT id, session_id, timestamp, content FROM messages WHERE role = 'tool' "
+            f"AND tool_name IN ({marks}) ORDER BY timestamp DESC LIMIT ?", (*_GENERATOR_TOOLS, _RECENT_SCAN_ROWS)
+        ).fetchall()
+    candidates: list[tuple[float, int, str, str]] = []
+    for row_id, session_id, timestamp, content in delivered:
+        for path in _media_paths(content or ""):
+            candidates.append((float(timestamp), int(row_id), str(session_id), path))
+    for row_id, session_id, timestamp, content in generated:
+        path = _generated_path(content)
+        if path is not None:
+            candidates.append((float(timestamp), int(row_id), str(session_id), path))
+    candidates.sort(key=lambda row: (row[0], row[1]), reverse=True)
+    store = attachment_store()
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for timestamp, row_id, session_id, path in candidates:
+        if len(items) >= body.limit:
+            break
+        if path in seen or not _is_media(path):
+            continue
+        seen.add(path)
+        try:
+            [result] = store.resolve(
+                profile=body.agentId, session_id=session_id,
+                items=[{"id": f"media-{row_id}", "text": "MEDIA:" + path}],
+            )
+        except ValueError:
+            continue
+        for attachment in result["attachments"]:
+            if not str(attachment["mime_type"]).startswith(("image/", "video/")):
+                continue
+            items.append({
+                "id": attachment["id"], "fileName": attachment["name"], "mimeType": attachment["mime_type"],
+                "byteCount": attachment["size"], "storedId": session_id, "createdAt": timestamp,
+            })
+    return {"items": items}
+
+
 def fetch(body: _Fetch) -> dict[str, Any]:
     attachment = attachment_store().read(profile=body.agentId, attachment_id=body.attachmentId)
     if attachment is None:
@@ -203,13 +291,15 @@ async def request(operation: str, http_request: Request, *, auth_module) -> Resp
     request_id = auth_module._precondition(http_request, owner)
     if CAPABILITY not in owner.features:
         raise NativeAPIError(503, "attachments_unavailable", "Native attachments are unavailable.")
-    model = {"resolve": _Resolve, "fetch": _Fetch}.get(operation)
+    model = {"resolve": _Resolve, "fetch": _Fetch, "recent": _Recent}.get(operation)
     if model is None:
         raise NativeAPIError(404, "unknown_operation", "The attachment operation is unknown.")
     body = await auth_module._body(http_request, model)
     if PROFILE_ID.fullmatch(body.agentId) is None:
         raise NativeAPIError(422, "invalid_request", "The profile is invalid.")
-    worker = resolve if operation == "resolve" else fetch
+    if operation == "recent" and MEDIA_CAPABILITY not in owner.features:
+        raise NativeAPIError(503, "media_unavailable", "Recent agent media is unavailable.")
+    worker = {"resolve": resolve, "fetch": fetch, "recent": recent}[operation]
     try:
         result = await run_in_threadpool(worker, body)
     except (ValueError, sqlite3.Error):

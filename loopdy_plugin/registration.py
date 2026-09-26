@@ -210,6 +210,13 @@ def register(
             bridge=device_tool_bridge if legacy_device_tools else None,
         )
     register_marketplace_publish_skill(ctx)
+    # Feed, Ideas, Goals, Activity and Approvals history for the bighelp app.
+    # The tool writes only when an agent is asked to; the observers only record.
+    try:
+        from .agent_board import register as register_agent_board
+        register_agent_board(ctx)
+    except (OSError, ImportError, sqlite3.Error):
+        logger.warning("bighelp agent board unavailable")
 
     ctx.register_platform(
         name="loopdy",

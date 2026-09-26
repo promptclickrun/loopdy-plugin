@@ -233,6 +233,15 @@ def _native_features(
     except ImportError:
         skip("native-workspace-files-v1", "workspace file support is unimportable.")
     try:
+        from .agent_board import CAPABILITY as board_capability
+        from .agent_board import available as board_available
+        if board_available():
+            features.append(board_capability)
+        else:
+            skip(board_capability, "public profile helpers are unimportable.")
+    except ImportError:
+        skip("native-agent-board-v1", "agent board support is unimportable.")
+    try:
         from .native_attachments import CAPABILITY as attachments_capability
         from .native_attachments import available as attachments_available
         if profile is not None and attachments_available():

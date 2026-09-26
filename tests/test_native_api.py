@@ -142,6 +142,9 @@ class NativeAPITests(unittest.TestCase):
             expected.append("native-agent-templates-v1")
         if files_available():
             expected.append("native-workspace-files-v1")
+        from loopdy_plugin.agent_board import available as board_available
+        if board_available():
+            expected.append("native-agent-board-v1")
         from loopdy_plugin.native_attachments import available as attachments_available
         if attachments_available():
             expected.append("native-agent-attachments-v1")
@@ -210,6 +213,48 @@ class NativeAPITests(unittest.TestCase):
             self.assertEqual(self.client.get(PREFIX + path, headers=self.headers()).status_code, 422)
         self.assertEqual(self.client.request("GET", PREFIX + "/context", headers=self.headers(),
                                             content=b"x" * 200_000).status_code, 422)
+
+    def test_agent_board_routes_list_update_media_and_logs(self):
+        from loopdy_plugin.agent_board import store_for_profile
+        png = self.home / "shot.png"
+        png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"fixture" * 10)
+        store = store_for_profile("default")
+        post = store.publish("feed", title="Evening AI news", body="Three stories.", icon="🗝️",
+                             images=[str(png), "https://example.com/a.jpg"], links=["https://example.com/story"])
+        store.publish("goal", title="Package watch", section="tracking", note="Out for delivery", item_id="pkg")
+        store.record_activity(session_id="s1", turn_id="t1", request="Check the porch", summary="Bag delivered.",
+                              category="seeing", tools=["vision_analyze"], outcome="done")
+        store.record_approval(session_id="s1", description="HTTPS connection to example.com",
+                              command="curl https://example.com", choice="always")
+
+        def board(operation, payload):
+            return self.client.post(PREFIX + "/board/" + operation, headers=self.headers(), json=payload)
+
+        listed = board("list", {"agentId": "default", "kinds": ["feed"]})
+        self.assertEqual(listed.status_code, 200, listed.text)
+        items = listed.json()["items"]
+        self.assertEqual([item["title"] for item in items], ["Evening AI news"])
+        self.assertEqual(items[0]["images"], [{"index": 0, "mimeType": "image/png"}, {"url": "https://example.com/a.jpg"}])
+        self.assertNotIn(str(self.home), listed.text)
+
+        liked = board("update", {"agentId": "default", "itemId": post["id"], "liked": True})
+        self.assertTrue(liked.json()["item"]["liked"])
+        done = board("update", {"agentId": "default", "itemId": "pkg", "status": "done"})
+        self.assertEqual(done.json()["item"]["status"], "done")
+        self.assertEqual(board("update", {"agentId": "default", "itemId": post["id"], "status": "done"}).status_code, 404)
+
+        media = board("media", {"agentId": "default", "itemId": post["id"], "index": 0})
+        self.assertEqual(media.json()["mimeType"], "image/png")
+        self.assertEqual(board("media", {"agentId": "default", "itemId": post["id"], "index": 1}).status_code, 404)
+
+        activity = board("activity", {"agentId": "default", "limit": 10}).json()["activity"]
+        self.assertEqual((activity[0]["request"], activity[0]["summary"], activity[0]["category"]),
+                         ("Check the porch", "Bag delivered.", "seeing"))
+        approvals = board("approvals", {"agentId": "default"}).json()["approvals"]
+        self.assertEqual((approvals[0]["description"], approvals[0]["choice"]),
+                         ("HTTPS connection to example.com", "always"))
+        self.assertEqual(board("list", {"agentId": "missing-profile"}).status_code, 404)
+        self.assertEqual(board("list", {"agentId": "default", "kinds": ["secret"]}).status_code, 422)
 
     def test_template_headers_are_required_exact_and_echoed(self):
         headers = self.headers()

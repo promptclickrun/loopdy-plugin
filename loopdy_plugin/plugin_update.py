@@ -60,6 +60,17 @@ def _hermes_home_for_plugin(plugin_root: Path) -> Path:
 
 
 def _metadata_revision(plugin_root: Path) -> str:
+    """Revision of the plugin bytes actually installed at ``plugin_root``.
+
+    A Git checkout identifies itself by HEAD. The installer's metadata record is
+    written only by ``hermes plugins install/update``, so it goes stale when the
+    checkout moves any other way (for example a fast-forward pull), and trusting
+    it would report and activate against a revision that is no longer on disk.
+    Archive-style installs carry no ``.git`` and rely on the metadata record.
+    """
+    head = _git_head_revision(plugin_root)
+    if head:
+        return head
     home = _hermes_home_for_plugin(plugin_root)
     metadata_path = home / "plugins" / ".install-metadata.json"
     try:
@@ -70,25 +81,27 @@ def _metadata_revision(plugin_root: Path) -> str:
             return revision
     except (OSError, ValueError, TypeError):
         pass
-    # A directly cloned standalone plugin can identify itself without metadata.
-    if (plugin_root / ".git").is_dir():
-        try:
-            result = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=str(plugin_root),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=5,
-                env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
-            )
-            revision = result.stdout.strip().lower()
-            if result.returncode == 0 and _REVISION.fullmatch(revision):
-                return revision
-        except (OSError, subprocess.TimeoutExpired):
-            pass
     return ""
+
+
+def _git_head_revision(plugin_root: Path) -> str:
+    if not (plugin_root / ".git").is_dir():
+        return ""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(plugin_root),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    revision = result.stdout.strip().lower()
+    return revision if result.returncode == 0 and _REVISION.fullmatch(revision) else ""
 
 
 # These values are intentionally fixed at module import. Reading newly installed
@@ -454,6 +467,29 @@ class PluginUpdateManager:
         ):
             operation["phase"] = "complete"
             operation["message"] = "The updated Loopdy plugin is active and Link responded."
+            operation["updated_at"] = int(time.time())
+            return True
+        active = str(runtime.get("revision") or "")
+        installed = _metadata_revision(self.plugin_root)
+        if (
+            _REVISION.fullmatch(target)
+            and fresh
+            and _REVISION.fullmatch(active)
+            and active != target
+            and _REVISION.fullmatch(installed)
+            and installed != target
+        ):
+            # A gateway lifecycle newer than this operation is running other
+            # bytes, and the installation is positively known to hold other
+            # bytes too, so this target can never activate and no restart is in
+            # flight. Without this, the non-terminal phase would refuse every
+            # later update on this host forever. An unknown installation stays
+            # held: absence of evidence is not supersession.
+            operation["phase"] = "failed"
+            operation["message"] = _bounded_message(
+                "Superseded: the gateway restarted onto a different installed revision. "
+                "Start a new update if one is still needed."
+            )
             operation["updated_at"] = int(time.time())
             return True
         return False

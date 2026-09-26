@@ -3,6 +3,7 @@ import importlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -71,6 +72,44 @@ class PluginUpdateExecutionTests(unittest.TestCase):
         self.manager._worker_transition(self.operation_id, "timed_out", "Waiting", restart_requested_at=1)
         with self.assertRaises(ValueError):
             self.manager.start("update_second_0123456789", self.device, True)
+
+    def test_git_checkout_revision_wins_over_a_stale_installer_record(self):
+        env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+        def git(*args):
+            return subprocess.run(["git", "-C", str(self.plugin), *args], check=True, capture_output=True, text=True, env=env).stdout.strip()
+        git("init", "-q")
+        git("add", ".")
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-m", "fixture")
+        head = git("rev-parse", "HEAD")
+        (self.root / "plugins" / ".install-metadata.json").write_text(json.dumps({"loopdy": {"pinned": True, "revision": "d" * 40, "source": "https://github.com/promptclickrun/loopdy-plugin"}}))
+        self.assertEqual(api._metadata_revision(self.plugin), head)
+        shutil.rmtree(self.plugin / ".git")
+        # Archive-style installs have no checkout and keep using the installer record.
+        self.assertEqual(api._metadata_revision(self.plugin), "d" * 40)
+
+    def test_timeout_superseded_by_a_newer_runtime_on_other_bytes_releases_the_host(self):
+        target, other = "a" * 40, "c" * 40
+        with patch.object(api, "LOADED_REVISION", "b" * 40), patch.object(api, "RUNTIME_ID", "runtime_started"):
+            self.manager.record_runtime_loaded()
+        self.begin()
+        self.manager._worker_transition(self.operation_id, "timed_out", "Waiting", target_revision=target, restart_requested_at=1)
+        with patch.object(api, "_metadata_revision", return_value=other):
+            # Same lifecycle that started the operation: still ambiguous, still held.
+            self.assertEqual(self.manager.status(self.operation_id, self.device)["phase"], "timed_out")
+            with patch.object(api, "LOADED_REVISION", other), patch.object(api, "RUNTIME_ID", "runtime_later"):
+                self.manager.record_runtime_loaded()
+            status = self.manager.status(self.operation_id, self.device)
+            self.assertEqual(status["phase"], "failed")
+            self.assertIn("Superseded", status["message"])
+            self.assertEqual(self.manager.start("update_second_0123456789", self.device, True)["phase"], "accepted")
+
+    def test_timeout_is_held_while_the_target_is_still_installed(self):
+        target = "a" * 40
+        self.begin()
+        self.manager._worker_transition(self.operation_id, "timed_out", "Waiting", target_revision=target, restart_requested_at=1)
+        with patch.object(api, "_metadata_revision", return_value=target), patch.object(api, "LOADED_REVISION", "c" * 40), patch.object(api, "RUNTIME_ID", "runtime_later"):
+            self.manager.record_runtime_loaded()
+            self.assertEqual(self.manager.status(self.operation_id, self.device)["phase"], "timed_out")
 
     def test_completion_requires_fresh_revision_and_authenticated_owner_response(self):
         revision = "a" * 40
